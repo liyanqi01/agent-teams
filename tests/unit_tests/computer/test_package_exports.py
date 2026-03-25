@@ -9,3 +9,10 @@ def test_computer_package_exports_action_models_lazily() -> None:
 
     exported = getattr(module, "ComputerActionClick", None)
     assert exported is not None
+
+
+def test_computer_package_exports_unavailable_executor_lazily() -> None:
+    module = import_module("agent_teams.computer")
+
+    exported = getattr(module, "UnavailableComputerExecutor", None)
+    assert exported is not None

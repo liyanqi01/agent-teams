@@ -15,6 +15,7 @@ from agent_teams.env import load_merged_env_vars
 from agent_teams.paths import get_app_config_dir
 from agent_teams.providers.model_config import (
     DEFAULT_LLM_CONNECT_TIMEOUT_SECONDS,
+    ComputerUseConfig,
     LlmRetryConfig,
     ModelEndpointConfig,
     ProviderType,
@@ -184,6 +185,10 @@ def load_llm_profile_state(
             "connect_timeout_seconds",
             DEFAULT_LLM_CONNECT_TIMEOUT_SECONDS,
         )
+        computer_use_raw = cfg.get("computer_use")
+        computer_use = None
+        if isinstance(computer_use_raw, dict):
+            computer_use = ComputerUseConfig.model_validate(computer_use_raw)
 
         profiles[name] = ModelEndpointConfig(
             provider=provider,
@@ -203,6 +208,7 @@ def load_llm_profile_state(
                 max_tokens=max_tokens,
                 top_k=top_k,
             ),
+            computer_use=computer_use,
         )
 
     return LoadedLlmProfiles(

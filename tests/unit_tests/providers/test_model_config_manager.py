@@ -231,3 +231,34 @@ def test_save_model_profile_can_switch_default_profile(tmp_path: Path) -> None:
 
     assert cast(dict[str, JsonValue], config["default"])["is_default"] is False
     assert cast(dict[str, JsonValue], config["kimi"])["is_default"] is True
+
+
+def test_get_model_profiles_includes_computer_use_config(tmp_path: Path) -> None:
+    manager = ModelConfigManager(config_dir=tmp_path)
+
+    manager.save_model_profile(
+        "computer",
+        {
+            "provider": "openai_responses_computer",
+            "model": "computer-use-preview",
+            "base_url": "https://api.openai.com/v1",
+            "api_key": "secret-key",
+            "computer_use": {
+                "display_width": 1440,
+                "display_height": 900,
+                "environment": "desktop",
+                "reasoning_summary": "concise",
+                "truncation": "auto",
+            },
+        },
+    )
+
+    profiles = manager.get_model_profiles()
+
+    assert profiles["computer"]["computer_use"] == {
+        "display_width": 1440,
+        "display_height": 900,
+        "environment": "desktop",
+        "reasoning_summary": "concise",
+        "truncation": "auto",
+    }

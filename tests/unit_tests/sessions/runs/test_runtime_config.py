@@ -358,3 +358,35 @@ def test_load_llm_configs_errors_when_api_key_env_placeholder_is_missing(
         "environment variable 'OPENAI_API_KEY' referenced by api_key is not set"
         in str(exc_info.value)
     )
+
+
+def test_load_llm_configs_reads_computer_use_config(tmp_path: Path) -> None:
+    model_file = tmp_path / "model.json"
+    model_file.write_text(
+        json.dumps(
+            {
+                "default": {
+                    "provider": "openai_responses_computer",
+                    "model": "computer-use-preview",
+                    "base_url": "https://api.openai.com/v1",
+                    "api_key": "plain-text-key",
+                    "computer_use": {
+                        "display_width": 1440,
+                        "display_height": 900,
+                        "environment": "desktop",
+                        "reasoning_summary": "concise",
+                        "truncation": "auto",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    profiles = runtime_config.load_llm_configs(tmp_path, {})
+
+    assert profiles["default"].computer_use is not None
+    assert profiles["default"].computer_use.display_width == 1440
+    assert profiles["default"].computer_use.display_height == 900
+    assert profiles["default"].computer_use.environment == "desktop"
+    assert profiles["default"].computer_use.reasoning_summary == "concise"

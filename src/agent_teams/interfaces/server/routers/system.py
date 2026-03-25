@@ -41,6 +41,7 @@ from agent_teams.notifications.notification_settings_service import (
     NotificationSettingsService,
 )
 from agent_teams.providers.model_config import (
+    ComputerUseConfig,
     DEFAULT_LLM_CONNECT_TIMEOUT_SECONDS,
     ProviderType,
 )
@@ -116,6 +117,7 @@ class ModelProfileRequest(BaseModel):
     max_tokens: int = 100000
     context_window: int | None = None
     connect_timeout_seconds: float = DEFAULT_LLM_CONNECT_TIMEOUT_SECONDS
+    computer_use: ComputerUseConfig | None = None
 
 
 @router.put("/configs/model/profiles/{name}")
@@ -141,6 +143,8 @@ def save_model_profile(
             profile["ssl_verify"] = req.ssl_verify
         if req.api_key is not None and req.api_key.strip():
             profile["api_key"] = req.api_key
+        if req.computer_use is not None:
+            profile["computer_use"] = req.computer_use.model_dump(mode="json")
         service.save_model_profile(name, profile, source_name=req.source_name)
         return {"status": "ok"}
     except Exception as exc:

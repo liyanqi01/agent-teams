@@ -24,6 +24,7 @@ if TYPE_CHECKING:
         MouseButton,
     )
     from agent_teams.computer.executor_contracts import ComputerExecutor
+    from agent_teams.computer.unavailable_executor import UnavailableComputerExecutor
 
 __all__ = [
     "ComputerAction",
@@ -38,6 +39,7 @@ __all__ = [
     "ComputerActionWait",
     "ComputerContext",
     "ComputerExecutor",
+    "UnavailableComputerExecutor",
     "ComputerPoint",
     "ComputerSafetyCheck",
     "ComputerScreenshot",
@@ -76,6 +78,10 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "ComputerActionWait": ("agent_teams.computer.action_models", "ComputerActionWait"),
     "ComputerContext": ("agent_teams.computer.action_models", "ComputerContext"),
     "ComputerExecutor": ("agent_teams.computer.executor_contracts", "ComputerExecutor"),
+    "UnavailableComputerExecutor": (
+        "agent_teams.computer.unavailable_executor",
+        "UnavailableComputerExecutor",
+    ),
     "ComputerPoint": ("agent_teams.computer.action_models", "ComputerPoint"),
     "ComputerSafetyCheck": (
         "agent_teams.computer.action_models",

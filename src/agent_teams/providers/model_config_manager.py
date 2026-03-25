@@ -48,6 +48,7 @@ class ModelConfigManager:
                     "connect_timeout_seconds",
                     DEFAULT_LLM_CONNECT_TIMEOUT_SECONDS,
                 ),
+                "computer_use": profile.get("computer_use"),
             }
         return result
 

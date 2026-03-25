@@ -818,3 +818,36 @@ def test_delete_environment_variable_returns_forbidden_on_permission_error() -> 
 
     assert response.status_code == 403
     assert "access denied" in response.json()["detail"].lower()
+
+
+def test_save_model_profile_includes_computer_use_config() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.put(
+        "/api/system/configs/model/profiles/computer",
+        json={
+            "provider": ProviderType.OPENAI_RESPONSES_COMPUTER.value,
+            "model": "computer-use-preview",
+            "base_url": "https://api.openai.com/v1",
+            "api_key": "secret",
+            "computer_use": {
+                "display_width": 1440,
+                "display_height": 900,
+                "environment": "desktop",
+                "reasoning_summary": "concise",
+                "truncation": "auto",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert service.saved_model_profile is not None
+    _, saved_profile, _ = service.saved_model_profile
+    assert saved_profile["computer_use"] == {
+        "display_width": 1440,
+        "display_height": 900,
+        "environment": "desktop",
+        "reasoning_summary": "concise",
+        "truncation": "auto",
+    }
