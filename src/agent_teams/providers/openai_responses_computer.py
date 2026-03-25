@@ -10,6 +10,9 @@ from agent_teams.providers.model_config import ModelEndpointConfig
 from agent_teams.providers.provider_contracts import LLMProvider, LLMRequest
 from agent_teams.sessions.runs.event_stream import RunEventHub
 from agent_teams.sessions.runs.run_control_manager import RunControlManager
+from agent_teams.sessions.runs.run_runtime_repo import RunRuntimeRepository
+from agent_teams.tools.runtime import ToolApprovalManager, ToolApprovalPolicy
+from agent_teams.tools.runtime.approval_ticket_repo import ApprovalTicketRepository
 
 
 @final
@@ -22,6 +25,10 @@ class OpenAIResponsesComputerProvider(LLMProvider):
         message_repo: MessageRepository,
         run_event_hub: RunEventHub,
         run_control_manager: RunControlManager,
+        approval_ticket_repo: ApprovalTicketRepository,
+        tool_approval_manager: ToolApprovalManager,
+        tool_approval_policy: ToolApprovalPolicy,
+        run_runtime_repo: RunRuntimeRepository,
     ) -> None:
         self._session = ComputerUseSession(
             config,
@@ -29,6 +36,10 @@ class OpenAIResponsesComputerProvider(LLMProvider):
             message_repo=message_repo,
             run_event_hub=run_event_hub,
             run_control_manager=run_control_manager,
+            approval_ticket_repo=approval_ticket_repo,
+            tool_approval_manager=tool_approval_manager,
+            tool_approval_policy=tool_approval_policy,
+            run_runtime_repo=run_runtime_repo,
         )
 
     @override

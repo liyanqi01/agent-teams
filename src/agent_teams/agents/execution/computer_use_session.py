@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Mapping, Sequence
 from typing import Protocol, cast
@@ -24,6 +25,16 @@ from agent_teams.sessions.runs.enums import RunEventType
 from agent_teams.sessions.runs.event_stream import RunEventHub
 from agent_teams.sessions.runs.run_control_manager import RunControlManager
 from agent_teams.sessions.runs.run_models import RunEvent
+from agent_teams.sessions.runs.run_runtime_repo import (
+    RunRuntimePhase,
+    RunRuntimeRepository,
+    RunRuntimeStatus,
+)
+from agent_teams.tools.runtime import ToolApprovalManager, ToolApprovalPolicy
+from agent_teams.tools.runtime.approval_ticket_repo import (
+    ApprovalTicketRepository,
+    ApprovalTicketStatus,
+)
 from agent_teams.workspace import build_conversation_id
 
 _COMPUTER_TOOL_NAME = "computer_use"
@@ -101,6 +112,17 @@ class _ResponsesComputerCall(BaseModel):
     status: str | None = None
 
 
+class _RuntimeSnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: RunRuntimeStatus
+    phase: RunRuntimePhase
+    active_instance_id: str | None = None
+    active_task_id: str | None = None
+    active_role_id: str | None = None
+    active_subagent_instance_id: str | None = None
+
+
 class ComputerUseSession:
     def __init__(
         self,
@@ -110,6 +132,10 @@ class ComputerUseSession:
         message_repo: MessageRepository,
         run_event_hub: RunEventHub,
         run_control_manager: RunControlManager,
+        approval_ticket_repo: ApprovalTicketRepository,
+        tool_approval_manager: ToolApprovalManager,
+        tool_approval_policy: ToolApprovalPolicy,
+        run_runtime_repo: RunRuntimeRepository,
         http_client: _AsyncHttpClient | None = None,
     ) -> None:
         self._config = config
@@ -118,6 +144,10 @@ class ComputerUseSession:
         self._message_repo = message_repo
         self._run_event_hub = run_event_hub
         self._run_control_manager = run_control_manager
+        self._approval_ticket_repo = approval_ticket_repo
+        self._tool_approval_manager = tool_approval_manager
+        self._tool_approval_policy = tool_approval_policy
+        self._run_runtime_repo = run_runtime_repo
         self._http_client: _AsyncHttpClient = http_client or build_llm_http_client(
             ssl_verify=config.ssl_verify,
             connect_timeout_seconds=config.connect_timeout_seconds,
@@ -153,16 +183,14 @@ class ComputerUseSession:
                     if text:
                         self._publish_text_delta_event(request=request, text=text)
                     return text
+                action = self._require_action(computer_call)
+                approval_ticket_id: str | None = None
                 if computer_call.pending_safety_checks:
-                    self._publish_awaiting_manual_action_event(
+                    approval_ticket_id = await self._await_safety_check_approval(
                         request=request,
                         computer_call=computer_call,
+                        action=action,
                     )
-                    raise RuntimeError(
-                        "Computer use returned pending safety checks that require "
-                        "manual acknowledgement before execution can continue."
-                    )
-                action = self._require_action(computer_call)
                 self._publish_tool_call_event(
                     request=request,
                     computer_call=computer_call,
@@ -185,6 +213,8 @@ class ComputerUseSession:
                     screenshot=screenshot,
                     context=context,
                 )
+                if approval_ticket_id is not None:
+                    self._approval_ticket_repo.mark_completed(approval_ticket_id)
                 response = await self._create_follow_up_response(
                     request=request,
                     previous_response_id=response.id,
@@ -194,6 +224,110 @@ class ComputerUseSession:
                 )
         finally:
             await self._computer_executor.stop_session(session_id=session_id)
+
+    async def _await_safety_check_approval(
+        self,
+        *,
+        request: LLMRequest,
+        computer_call: _ResponsesComputerCall,
+        action: ComputerAction,
+    ) -> str:
+        args_preview = self._approval_args_preview(
+            computer_call=computer_call,
+            action=action,
+        )
+        ticket = self._approval_ticket_repo.upsert_requested(
+            tool_call_id=computer_call.call_id,
+            run_id=request.run_id,
+            session_id=request.session_id,
+            task_id=request.task_id,
+            instance_id=request.instance_id,
+            role_id=request.role_id,
+            tool_name=_COMPUTER_TOOL_NAME,
+            args_preview=args_preview,
+        )
+        publish_request = False
+        existing_approval = self._tool_approval_manager.get_approval(
+            run_id=request.run_id,
+            tool_call_id=ticket.tool_call_id,
+        )
+        if existing_approval is None:
+            self._tool_approval_manager.open_approval(
+                run_id=request.run_id,
+                tool_call_id=ticket.tool_call_id,
+                instance_id=request.instance_id,
+                role_id=request.role_id,
+                tool_name=_COMPUTER_TOOL_NAME,
+                args_preview=args_preview,
+                risk_level="high",
+            )
+            publish_request = True
+        runtime_snapshot = self._pause_for_tool_approval(request)
+        if publish_request:
+            self._publish_tool_approval_requested_event(
+                request=request,
+                tool_call_id=ticket.tool_call_id,
+                args_preview=args_preview,
+            )
+        try:
+            action_decision, feedback = await asyncio.to_thread(
+                self._tool_approval_manager.wait_for_approval,
+                run_id=request.run_id,
+                tool_call_id=ticket.tool_call_id,
+                timeout=self._tool_approval_policy.timeout_seconds,
+            )
+        except TimeoutError as exc:
+            self._tool_approval_manager.close_approval(
+                run_id=request.run_id,
+                tool_call_id=ticket.tool_call_id,
+            )
+            self._approval_ticket_repo.resolve(
+                tool_call_id=ticket.tool_call_id,
+                status=ApprovalTicketStatus.TIMED_OUT,
+            )
+            self._update_runtime_after_approval_error(
+                request=request,
+                message="Computer use safety check timed out.",
+            )
+            self._publish_tool_approval_resolved_event(
+                request=request,
+                tool_call_id=ticket.tool_call_id,
+                action="timeout",
+                feedback="",
+            )
+            raise RuntimeError("Computer use safety check timed out.") from exc
+
+        self._tool_approval_manager.close_approval(
+            run_id=request.run_id,
+            tool_call_id=ticket.tool_call_id,
+        )
+        resolved_status = (
+            ApprovalTicketStatus.APPROVED
+            if action_decision == "approve"
+            else ApprovalTicketStatus.DENIED
+        )
+        self._approval_ticket_repo.resolve(
+            tool_call_id=ticket.tool_call_id,
+            status=resolved_status,
+            feedback=feedback,
+        )
+        self._publish_tool_approval_resolved_event(
+            request=request,
+            tool_call_id=ticket.tool_call_id,
+            action=action_decision,
+            feedback=feedback,
+        )
+        if action_decision == "deny":
+            self._update_runtime_after_approval_error(
+                request=request,
+                message="Computer use safety check was denied by user.",
+            )
+            raise RuntimeError("Computer use safety check was denied by user.")
+        self._restore_runtime_after_approval(
+            request=request,
+            snapshot=runtime_snapshot,
+        )
+        return ticket.tool_call_id
 
     async def _create_initial_response(
         self,
@@ -400,6 +534,90 @@ class ComputerUseSession:
     def _image_data_url(self, screenshot: ComputerScreenshot) -> str:
         return f"data:{screenshot.mime_type};base64,{screenshot.image_base64}"
 
+    def _approval_args_preview(
+        self,
+        *,
+        computer_call: _ResponsesComputerCall,
+        action: ComputerAction,
+    ) -> str:
+        return json.dumps(
+            {
+                "action": action.model_dump(mode="json"),
+                "pending_safety_checks": [
+                    item.model_dump(mode="json")
+                    for item in computer_call.pending_safety_checks
+                ],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+    def _pause_for_tool_approval(self, request: LLMRequest) -> _RuntimeSnapshot:
+        current = self._run_runtime_repo.ensure(
+            run_id=request.run_id,
+            session_id=request.session_id,
+            root_task_id=request.task_id,
+        )
+        snapshot = _RuntimeSnapshot(
+            status=current.status,
+            phase=current.phase,
+            active_instance_id=current.active_instance_id,
+            active_task_id=current.active_task_id,
+            active_role_id=current.active_role_id,
+            active_subagent_instance_id=current.active_subagent_instance_id,
+        )
+        self._run_runtime_repo.update(
+            request.run_id,
+            status=RunRuntimeStatus.PAUSED,
+            phase=RunRuntimePhase.AWAITING_TOOL_APPROVAL,
+            active_instance_id=request.instance_id,
+            active_task_id=request.task_id,
+            active_role_id=request.role_id,
+            active_subagent_instance_id=current.active_subagent_instance_id,
+            last_error=None,
+        )
+        return snapshot
+
+    def _restore_runtime_after_approval(
+        self,
+        *,
+        request: LLMRequest,
+        snapshot: _RuntimeSnapshot,
+    ) -> None:
+        restored_status = RunRuntimeStatus.RUNNING
+        restored_phase = (
+            snapshot.phase
+            if snapshot.phase != RunRuntimePhase.TERMINAL
+            else RunRuntimePhase.COORDINATOR_RUNNING
+        )
+        self._run_runtime_repo.update(
+            request.run_id,
+            status=restored_status,
+            phase=restored_phase,
+            active_instance_id=snapshot.active_instance_id or request.instance_id,
+            active_task_id=snapshot.active_task_id or request.task_id,
+            active_role_id=snapshot.active_role_id or request.role_id,
+            active_subagent_instance_id=snapshot.active_subagent_instance_id,
+            last_error=None,
+        )
+
+    def _update_runtime_after_approval_error(
+        self,
+        *,
+        request: LLMRequest,
+        message: str,
+    ) -> None:
+        self._run_runtime_repo.update(
+            request.run_id,
+            status=RunRuntimeStatus.PAUSED,
+            phase=RunRuntimePhase.AWAITING_TOOL_APPROVAL,
+            active_instance_id=request.instance_id,
+            active_task_id=request.task_id,
+            active_role_id=request.role_id,
+            active_subagent_instance_id=None,
+            last_error=message,
+        )
+
     def _raise_if_cancelled(self, request: LLMRequest) -> None:
         self._run_control_manager.raise_if_cancelled(
             run_id=request.run_id,
@@ -505,11 +723,12 @@ class ComputerUseSession:
             )
         )
 
-    def _publish_awaiting_manual_action_event(
+    def _publish_tool_approval_requested_event(
         self,
         *,
         request: LLMRequest,
-        computer_call: _ResponsesComputerCall,
+        tool_call_id: str,
+        args_preview: str,
     ) -> None:
         self._run_event_hub.publish(
             RunEvent(
@@ -519,15 +738,46 @@ class ComputerUseSession:
                 task_id=request.task_id,
                 instance_id=request.instance_id,
                 role_id=request.role_id,
-                event_type=RunEventType.AWAITING_MANUAL_ACTION,
+                event_type=RunEventType.TOOL_APPROVAL_REQUESTED,
                 payload_json=json.dumps(
                     {
+                        "tool_call_id": tool_call_id,
                         "tool_name": _COMPUTER_TOOL_NAME,
-                        "tool_call_id": computer_call.call_id,
-                        "pending_safety_checks": [
-                            item.model_dump(mode="json")
-                            for item in computer_call.pending_safety_checks
-                        ],
+                        "args_preview": args_preview,
+                        "instance_id": request.instance_id,
+                        "role_id": request.role_id,
+                        "risk_level": "high",
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        )
+
+    def _publish_tool_approval_resolved_event(
+        self,
+        *,
+        request: LLMRequest,
+        tool_call_id: str,
+        action: str,
+        feedback: str,
+    ) -> None:
+        self._run_event_hub.publish(
+            RunEvent(
+                session_id=request.session_id,
+                run_id=request.run_id,
+                trace_id=request.trace_id,
+                task_id=request.task_id,
+                instance_id=request.instance_id,
+                role_id=request.role_id,
+                event_type=RunEventType.TOOL_APPROVAL_RESOLVED,
+                payload_json=json.dumps(
+                    {
+                        "tool_call_id": tool_call_id,
+                        "tool_name": _COMPUTER_TOOL_NAME,
+                        "action": action,
+                        "feedback": feedback,
+                        "instance_id": request.instance_id,
+                        "role_id": request.role_id,
                     },
                     ensure_ascii=False,
                 ),

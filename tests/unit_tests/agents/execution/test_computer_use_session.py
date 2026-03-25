@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import cast
 
 import httpx
@@ -25,6 +26,17 @@ from agent_teams.sessions.runs.enums import RunEventType
 from agent_teams.sessions.runs.event_stream import RunEventHub
 from agent_teams.sessions.runs.run_control_manager import RunControlManager
 from agent_teams.sessions.runs.run_models import RunEvent
+from agent_teams.sessions.runs.run_runtime_repo import (
+    RunRuntimePhase,
+    RunRuntimeRecord,
+    RunRuntimeRepository,
+    RunRuntimeStatus,
+)
+from agent_teams.tools.runtime import ToolApprovalManager, ToolApprovalPolicy
+from agent_teams.tools.runtime.approval_ticket_repo import (
+    ApprovalTicketRepository,
+    ApprovalTicketStatus,
+)
 
 
 class _FakeHttpClient:
@@ -39,7 +51,7 @@ class _FakeHttpClient:
         headers: Mapping[str, str],
         json: object,
     ) -> httpx.Response:
-        self.calls.append({"url": url, "headers": headers, "json": json})
+        self.calls.append({"url": url, "headers": dict(headers), "json": json})
         if not self._responses:
             raise AssertionError("No more fake responses are available.")
         return self._responses.pop(0)
@@ -136,6 +148,104 @@ class _FakeRunControlManager:
         self.calls.append((run_id, instance_id))
 
 
+class _FakeToolApprovalManager:
+    def __init__(
+        self,
+        *,
+        wait_result: tuple[str, str] = ("approve", ""),
+        should_timeout: bool = False,
+    ) -> None:
+        self.wait_result = wait_result
+        self.should_timeout = should_timeout
+        self.last_open: dict[str, str] | None = None
+        self.closed: list[tuple[str, str]] = []
+        self._approvals: dict[str, dict[str, dict[str, str]]] = {}
+
+    def open_approval(
+        self,
+        *,
+        run_id: str,
+        tool_call_id: str,
+        instance_id: str,
+        role_id: str,
+        tool_name: str,
+        args_preview: str,
+        risk_level: str = "medium",
+    ) -> None:
+        entry = {
+            "tool_call_id": tool_call_id,
+            "instance_id": instance_id,
+            "role_id": role_id,
+            "tool_name": tool_name,
+            "args_preview": args_preview,
+            "risk_level": risk_level,
+            "feedback": "",
+        }
+        self._approvals.setdefault(run_id, {})[tool_call_id] = entry
+        self.last_open = entry
+
+    def get_approval(self, *, run_id: str, tool_call_id: str) -> dict[str, str] | None:
+        return self._approvals.get(run_id, {}).get(tool_call_id)
+
+    def wait_for_approval(
+        self,
+        *,
+        run_id: str,
+        tool_call_id: str,
+        timeout: float = 300.0,
+    ) -> tuple[str, str]:
+        _ = timeout
+        if self.should_timeout:
+            raise TimeoutError("timed out")
+        return self.wait_result
+
+    def close_approval(self, *, run_id: str, tool_call_id: str) -> None:
+        self.closed.append((run_id, tool_call_id))
+        run_approvals = self._approvals.get(run_id)
+        if run_approvals is None:
+            return
+        run_approvals.pop(tool_call_id, None)
+
+
+class _FakeRunRuntimeRepo:
+    def __init__(self) -> None:
+        self.records: dict[str, RunRuntimeRecord] = {}
+
+    def ensure(
+        self,
+        *,
+        run_id: str,
+        session_id: str,
+        root_task_id: str | None = None,
+        status: RunRuntimeStatus = RunRuntimeStatus.QUEUED,
+        phase: RunRuntimePhase = RunRuntimePhase.IDLE,
+    ) -> RunRuntimeRecord:
+        record = self.records.get(run_id)
+        if record is not None:
+            if root_task_id is not None and record.root_task_id is None:
+                record = record.model_copy(update={"root_task_id": root_task_id})
+                self.records[run_id] = record
+            return record
+        record = RunRuntimeRecord(
+            run_id=run_id,
+            session_id=session_id,
+            root_task_id=root_task_id,
+            status=status,
+            phase=phase,
+        )
+        self.records[run_id] = record
+        return record
+
+    def update(self, run_id: str, **changes: object) -> RunRuntimeRecord:
+        current = self.records[run_id]
+        next_record = current.model_copy(update=changes)
+        self.records[run_id] = next_record
+        return next_record
+
+    def get(self, run_id: str) -> RunRuntimeRecord | None:
+        return self.records.get(run_id)
+
+
 def _request(*, user_prompt: str | None = None) -> LLMRequest:
     return LLMRequest(
         run_id="run-1",
@@ -159,11 +269,43 @@ def _response(payload: dict[str, object]) -> httpx.Response:
     )
 
 
+def _session(
+    *,
+    http_client: _FakeHttpClient,
+    executor: _FakeComputerExecutor,
+    message_repo: _FakeMessageRepository,
+    hub: _FakeRunEventHub,
+    control_manager: _FakeRunControlManager,
+    approval_manager: _FakeToolApprovalManager,
+    approval_ticket_repo: ApprovalTicketRepository,
+    run_runtime_repo: _FakeRunRuntimeRepo,
+) -> ComputerUseSession:
+    return ComputerUseSession(
+        ModelEndpointConfig(
+            provider=ProviderType.OPENAI_RESPONSES_COMPUTER,
+            model="computer-use-preview",
+            base_url="https://api.openai.com/v1",
+            api_key="secret-key",
+        ),
+        computer_executor=executor,
+        message_repo=cast(MessageRepository, message_repo),
+        run_event_hub=cast(RunEventHub, hub),
+        run_control_manager=cast(RunControlManager, control_manager),
+        approval_ticket_repo=approval_ticket_repo,
+        tool_approval_manager=cast(ToolApprovalManager, approval_manager),
+        tool_approval_policy=ToolApprovalPolicy(timeout_seconds=0.01),
+        run_runtime_repo=cast(RunRuntimeRepository, run_runtime_repo),
+        http_client=http_client,
+    )
+
+
 @pytest.mark.asyncio
-async def test_computer_use_session_runs_loop_and_emits_events() -> None:
+async def test_computer_use_session_runs_loop_and_emits_events(tmp_path: Path) -> None:
     hub = _FakeRunEventHub()
     control_manager = _FakeRunControlManager()
+    approval_manager = _FakeToolApprovalManager()
     executor = _FakeComputerExecutor()
+    run_runtime_repo = _FakeRunRuntimeRepo()
     message_repo = _FakeMessageRepository(
         history=[ModelRequest(parts=[UserPromptPart(content="Open the settings app.")])]
     )
@@ -209,18 +351,15 @@ async def test_computer_use_session_runs_loop_and_emits_events() -> None:
             ),
         ]
     )
-    session = ComputerUseSession(
-        ModelEndpointConfig(
-            provider=ProviderType.OPENAI_RESPONSES_COMPUTER,
-            model="computer-use-preview",
-            base_url="https://api.openai.com/v1",
-            api_key="secret-key",
-        ),
-        computer_executor=executor,
-        message_repo=cast(MessageRepository, message_repo),
-        run_event_hub=cast(RunEventHub, hub),
-        run_control_manager=cast(RunControlManager, control_manager),
+    session = _session(
         http_client=http_client,
+        executor=executor,
+        message_repo=message_repo,
+        hub=hub,
+        control_manager=control_manager,
+        approval_manager=approval_manager,
+        approval_ticket_repo=ApprovalTicketRepository(tmp_path / "tickets.db"),
+        run_runtime_repo=run_runtime_repo,
     )
 
     result = await session.run(_request(user_prompt=None))
@@ -273,13 +412,109 @@ async def test_computer_use_session_runs_loop_and_emits_events() -> None:
 
 
 @pytest.mark.asyncio
-async def test_computer_use_session_blocks_on_pending_safety_checks() -> None:
+async def test_computer_use_session_uses_tool_approval_for_safety_checks(
+    tmp_path: Path,
+) -> None:
     hub = _FakeRunEventHub()
     control_manager = _FakeRunControlManager()
+    approval_manager = _FakeToolApprovalManager(wait_result=("approve", "looks good"))
     executor = _FakeComputerExecutor()
+    run_runtime_repo = _FakeRunRuntimeRepo()
     message_repo = _FakeMessageRepository(
         history=[ModelRequest(parts=[UserPromptPart(content="Open the browser.")])]
     )
+    ticket_repo = ApprovalTicketRepository(tmp_path / "tickets.db")
+    http_client = _FakeHttpClient(
+        responses=[
+            _response(
+                {
+                    "id": "resp-1",
+                    "output": [
+                        {
+                            "type": "computer_call",
+                            "id": "item-1",
+                            "call_id": "call-1",
+                            "action": {
+                                "type": "click",
+                                "x": 100,
+                                "y": 200,
+                                "button": "left",
+                            },
+                            "pending_safety_checks": [
+                                {
+                                    "id": "safety-1",
+                                    "code": "requires_confirmation",
+                                    "message": "Confirm desktop action.",
+                                }
+                            ],
+                            "status": "in_progress",
+                        }
+                    ],
+                }
+            ),
+            _response(
+                {
+                    "id": "resp-2",
+                    "output_text": "Approved and completed.",
+                }
+            ),
+        ]
+    )
+    session = _session(
+        http_client=http_client,
+        executor=executor,
+        message_repo=message_repo,
+        hub=hub,
+        control_manager=control_manager,
+        approval_manager=approval_manager,
+        approval_ticket_repo=ticket_repo,
+        run_runtime_repo=run_runtime_repo,
+    )
+
+    result = await session.run(_request(user_prompt=None))
+
+    assert result == "Approved and completed."
+    assert approval_manager.last_open is not None
+    assert approval_manager.last_open["tool_name"] == "computer_use"
+    assert "pending_safety_checks" in approval_manager.last_open["args_preview"]
+    assert executor.execute_calls
+    ticket = ticket_repo.get("call-1")
+    assert ticket is not None
+    assert ticket.status == ApprovalTicketStatus.COMPLETED
+    runtime = run_runtime_repo.get("run-1")
+    assert runtime is not None
+    assert runtime.status == RunRuntimeStatus.RUNNING
+
+    event_types = [event.event_type for event in hub.events]
+    assert event_types == [
+        RunEventType.MODEL_STEP_STARTED,
+        RunEventType.MODEL_STEP_FINISHED,
+        RunEventType.TOOL_APPROVAL_REQUESTED,
+        RunEventType.TOOL_APPROVAL_RESOLVED,
+        RunEventType.TOOL_CALL,
+        RunEventType.TOOL_RESULT,
+        RunEventType.MODEL_STEP_STARTED,
+        RunEventType.MODEL_STEP_FINISHED,
+        RunEventType.TEXT_DELTA,
+    ]
+    resolved_payload = json.loads(hub.events[3].payload_json)
+    assert resolved_payload["action"] == "approve"
+    assert resolved_payload["feedback"] == "looks good"
+
+
+@pytest.mark.asyncio
+async def test_computer_use_session_stops_when_safety_check_is_denied(
+    tmp_path: Path,
+) -> None:
+    hub = _FakeRunEventHub()
+    control_manager = _FakeRunControlManager()
+    approval_manager = _FakeToolApprovalManager(wait_result=("deny", "not safe"))
+    executor = _FakeComputerExecutor()
+    run_runtime_repo = _FakeRunRuntimeRepo()
+    message_repo = _FakeMessageRepository(
+        history=[ModelRequest(parts=[UserPromptPart(content="Open the browser.")])]
+    )
+    ticket_repo = ApprovalTicketRepository(tmp_path / "tickets.db")
     http_client = _FakeHttpClient(
         responses=[
             _response(
@@ -310,30 +545,38 @@ async def test_computer_use_session_blocks_on_pending_safety_checks() -> None:
             )
         ]
     )
-    session = ComputerUseSession(
-        ModelEndpointConfig(
-            provider=ProviderType.OPENAI_RESPONSES_COMPUTER,
-            model="computer-use-preview",
-            base_url="https://api.openai.com/v1",
-            api_key="secret-key",
-        ),
-        computer_executor=executor,
-        message_repo=cast(MessageRepository, message_repo),
-        run_event_hub=cast(RunEventHub, hub),
-        run_control_manager=cast(RunControlManager, control_manager),
+    session = _session(
         http_client=http_client,
+        executor=executor,
+        message_repo=message_repo,
+        hub=hub,
+        control_manager=control_manager,
+        approval_manager=approval_manager,
+        approval_ticket_repo=ticket_repo,
+        run_runtime_repo=run_runtime_repo,
     )
 
-    with pytest.raises(RuntimeError, match="pending safety checks"):
+    with pytest.raises(RuntimeError, match="denied by user"):
         await session.run(_request(user_prompt=None))
 
     assert executor.execute_calls == []
     assert executor.stop_calls == ["computer-session-1"]
+    ticket = ticket_repo.get("call-1")
+    assert ticket is not None
+    assert ticket.status == ApprovalTicketStatus.DENIED
+    runtime = run_runtime_repo.get("run-1")
+    assert runtime is not None
+    assert runtime.status == RunRuntimeStatus.PAUSED
+    assert runtime.phase == RunRuntimePhase.AWAITING_TOOL_APPROVAL
+    assert runtime.last_error == "Computer use safety check was denied by user."
+
     event_types = [event.event_type for event in hub.events]
     assert event_types == [
         RunEventType.MODEL_STEP_STARTED,
         RunEventType.MODEL_STEP_FINISHED,
-        RunEventType.AWAITING_MANUAL_ACTION,
+        RunEventType.TOOL_APPROVAL_REQUESTED,
+        RunEventType.TOOL_APPROVAL_RESOLVED,
     ]
-    awaiting_payload = json.loads(hub.events[2].payload_json)
-    assert awaiting_payload["pending_safety_checks"][0]["id"] == "safety-1"
+    resolved_payload = json.loads(hub.events[3].payload_json)
+    assert resolved_payload["action"] == "deny"
+    assert resolved_payload["feedback"] == "not safe"

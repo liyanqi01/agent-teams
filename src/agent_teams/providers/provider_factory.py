@@ -119,6 +119,10 @@ def create_provider_factory(
                     message_repo=message_repo,
                     run_event_hub=run_event_hub,
                     run_control_manager=run_control_manager,
+                    approval_ticket_repo=approval_ticket_repo,
+                    tool_approval_manager=tool_approval_manager,
+                    tool_approval_policy=tool_approval_policy,
+                    run_runtime_repo=run_runtime_repo,
                 )
             ),
         )
