@@ -21,6 +21,7 @@ from agent_teams.agents.orchestration.task_orchestration_service import (
 )
 from agent_teams.agents.orchestration.task_execution_service import TaskExecutionService
 from agent_teams.env.environment_variable_service import EnvironmentVariableService
+from agent_teams.computer import UnavailableComputerExecutor
 from agent_teams.env.proxy_config_service import ProxyConfigService
 from agent_teams.env.proxy_env import ProxyEnvConfig, sync_proxy_env_to_process_env
 from agent_teams.feishu import (
@@ -174,6 +175,7 @@ class ServerContainer:
             project_root=Path.cwd(),
             workspace_repo=self.workspace_repo,
         )
+        self.computer_executor = UnavailableComputerExecutor()
         self.event_log: EventLog = EventLog(runtime.paths.db_path)
         self.agent_repo: AgentInstanceRepository = AgentInstanceRepository(
             runtime.paths.db_path
@@ -411,6 +413,7 @@ class ServerContainer:
             run_runtime_repo=self.run_runtime_repo,
             run_intent_repo=self.run_intent_repo,
             workspace_manager=self.workspace_manager,
+            computer_executor=self.computer_executor,
             role_memory_service=self.role_memory_service,
             subagent_reflection_service=self.subagent_reflection_service,
             tool_registry=self.tool_registry,

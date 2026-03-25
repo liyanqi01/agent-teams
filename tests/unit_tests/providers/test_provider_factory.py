@@ -12,6 +12,7 @@ from agent_teams.agents.orchestration.task_orchestration_service import (
 )
 from agent_teams.agents.orchestration.task_execution_service import TaskExecutionService
 from agent_teams.mcp.mcp_registry import McpRegistry
+from agent_teams.computer import UnavailableComputerExecutor
 from agent_teams.notifications import NotificationService
 from agent_teams.providers.provider_contracts import EchoProvider
 from agent_teams.providers.model_config import ModelEndpointConfig, ProviderType
@@ -100,6 +101,7 @@ def _build_factory(
         run_runtime_repo=cast(RunRuntimeRepository, object()),
         run_intent_repo=cast(RunIntentRepository, object()),
         workspace_manager=cast(WorkspaceManager, object()),
+        computer_executor=UnavailableComputerExecutor(),
         tool_registry=cast(ToolRegistry, object()),
         mcp_registry=cast(McpRegistry, object()),
         skill_registry=cast(SkillRegistry, object()),
