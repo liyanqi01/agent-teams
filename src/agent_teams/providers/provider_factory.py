@@ -13,6 +13,9 @@ from agent_teams.notifications import NotificationService
 from agent_teams.providers.provider_contracts import EchoProvider, LLMProvider
 from agent_teams.providers.model_config import ModelEndpointConfig
 from agent_teams.providers.openai_compatible import OpenAICompatibleProvider
+from agent_teams.providers.openai_responses_computer import (
+    OpenAIResponsesComputerProvider,
+)
 from agent_teams.providers.provider_registry import create_default_provider_registry
 from agent_teams.roles.memory_service import RoleMemoryService
 from agent_teams.agents.execution.subagent_reflection import SubagentReflectionService
@@ -106,6 +109,9 @@ def create_provider_factory(
                 token_usage_repo=token_usage_repo,
                 metric_recorder=metric_recorder,
                 retry_config=runtime.llm_retry,
+            ),
+            openai_responses_computer_builder=lambda config: (
+                OpenAIResponsesComputerProvider(config)
             ),
         )
         return provider_registry.create(config_to_use)

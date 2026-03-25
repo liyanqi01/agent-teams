@@ -1,0 +1,11 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+from importlib import import_module
+
+
+def test_computer_package_exports_action_models_lazily() -> None:
+    module = import_module("agent_teams.computer")
+
+    exported = getattr(module, "ComputerActionClick", None)
+    assert exported is not None

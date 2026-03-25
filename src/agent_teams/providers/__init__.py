@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from agent_teams.providers.provider_contracts import EchoProvider, LLMProvider
     from agent_teams.providers.model_config import (
+        ComputerUseConfig,
         LlmRetryConfig,
         ModelEndpointConfig,
         ProviderModelInfo,
@@ -21,6 +22,9 @@ if TYPE_CHECKING:
         run_with_llm_retry,
     )
     from agent_teams.providers.openai_compatible import OpenAICompatibleProvider
+    from agent_teams.providers.openai_responses_computer import (
+        OpenAIResponsesComputerProvider,
+    )
     from agent_teams.providers.model_config_manager import ModelConfigManager
     from agent_teams.providers.model_config_service import ModelConfigService
     from agent_teams.providers.model_connectivity import (
@@ -46,6 +50,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AgentTokenSummary",
+    "ComputerUseConfig",
     "EchoProvider",
     "LLMProvider",
     "LlmRetryConfig",
@@ -61,6 +66,7 @@ __all__ = [
     "ModelConnectivityProbeService",
     "ModelConnectivityTokenUsage",
     "OpenAICompatibleProvider",
+    "OpenAIResponsesComputerProvider",
     "ProviderModelInfo",
     "ProviderRegistry",
     "ProviderType",
@@ -80,6 +86,10 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "AgentTokenSummary": (
         "agent_teams.providers.token_usage_repo",
         "AgentTokenSummary",
+    ),
+    "ComputerUseConfig": (
+        "agent_teams.providers.model_config",
+        "ComputerUseConfig",
     ),
     "EchoProvider": ("agent_teams.providers.provider_contracts", "EchoProvider"),
     "LLMProvider": ("agent_teams.providers.provider_contracts", "LLMProvider"),
@@ -128,6 +138,10 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "OpenAICompatibleProvider": (
         "agent_teams.providers.openai_compatible",
         "OpenAICompatibleProvider",
+    ),
+    "OpenAIResponsesComputerProvider": (
+        "agent_teams.providers.openai_responses_computer",
+        "OpenAIResponsesComputerProvider",
     ),
     "ProviderModelInfo": (
         "agent_teams.providers.model_config",

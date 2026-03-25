@@ -261,6 +261,36 @@ def test_probe_accepts_editor_default_timeout(monkeypatch) -> None:
     assert captured["timeout_seconds"] == pytest.approx(15.0)
 
 
+def test_probe_supports_openai_responses_computer_provider(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    service = ModelConnectivityProbeService(get_runtime=lambda: _runtime_config())
+
+    monkeypatch.setattr(
+        "agent_teams.providers.model_connectivity.create_sync_http_client",
+        lambda **kwargs: (
+            captured.update(kwargs)
+            or _FakeHttpClient(
+                captured=captured, response=httpx.Response(200, json={"usage": {}})
+            )
+        ),
+    )
+
+    result = service.probe(
+        ModelConnectivityProbeRequest(
+            override=ModelConnectivityProbeOverride(
+                provider=ProviderType.OPENAI_RESPONSES_COMPUTER,
+                model="computer-use-preview",
+                base_url="https://api.openai.com/v1",
+                api_key="draft-api-key",
+            )
+        )
+    )
+
+    assert result.ok is True
+    assert result.provider == ProviderType.OPENAI_RESPONSES_COMPUTER
+    assert captured["url"] == "https://api.openai.com/v1/chat/completions"
+
+
 def test_discover_models_uses_saved_profile_and_parses_catalog(monkeypatch) -> None:
     captured: dict[str, object] = {}
     service = ModelConnectivityProbeService(get_runtime=lambda: _runtime_config())

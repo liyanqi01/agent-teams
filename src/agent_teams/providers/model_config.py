@@ -15,6 +15,7 @@ DEFAULT_LLM_RETRY_BACKOFF_MULTIPLIER = 2.0
 
 class ProviderType(StrEnum):
     OPENAI_COMPATIBLE = "openai_compatible"
+    OPENAI_RESPONSES_COMPUTER = "openai_responses_computer"
     ECHO = "echo"
 
 
@@ -25,6 +26,23 @@ class SamplingConfig(BaseModel):
     top_p: float = Field(default=1.0, ge=0.0, le=1.0)
     max_tokens: int = Field(default=1024, ge=1)
     top_k: int | None = Field(default=None, ge=1)
+
+
+class ComputerUseConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    display_width: int = Field(default=1280, ge=1)
+    display_height: int = Field(default=800, ge=1)
+    environment: str = Field(default="computer", min_length=1)
+    reasoning_summary: str | None = Field(default=None, min_length=1)
+    truncation: str = Field(default="auto", min_length=1)
+
+    @field_validator("environment", "reasoning_summary", "truncation", mode="before")
+    @classmethod
+    def _normalize_optional_string_fields(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip()
+        return value
 
 
 class ModelEndpointConfig(BaseModel):
@@ -42,6 +60,7 @@ class ModelEndpointConfig(BaseModel):
         le=300.0,
     )
     sampling: SamplingConfig = Field(default_factory=SamplingConfig)
+    computer_use: ComputerUseConfig | None = None
 
     @field_validator("model", "base_url", "api_key", mode="before")
     @classmethod

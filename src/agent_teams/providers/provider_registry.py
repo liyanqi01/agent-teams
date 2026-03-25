@@ -50,8 +50,13 @@ def list_provider_models(
 def create_default_provider_registry(
     *,
     openai_compatible_builder: ProviderBuilder,
+    openai_responses_computer_builder: ProviderBuilder,
 ) -> ProviderRegistry:
     registry = ProviderRegistry()
     registry.register(ProviderType.OPENAI_COMPATIBLE, openai_compatible_builder)
+    registry.register(
+        ProviderType.OPENAI_RESPONSES_COMPUTER,
+        openai_responses_computer_builder,
+    )
     registry.register(ProviderType.ECHO, lambda _config: EchoProvider())
     return registry

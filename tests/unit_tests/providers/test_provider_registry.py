@@ -2,7 +2,11 @@
 from __future__ import annotations
 
 from agent_teams.providers.provider_contracts import EchoProvider
-from agent_teams.providers.model_config import ModelEndpointConfig, ProviderType
+from agent_teams.providers.model_config import (
+    ComputerUseConfig,
+    ModelEndpointConfig,
+    ProviderType,
+)
 from agent_teams.providers.provider_registry import (
     ProviderRegistry,
     create_default_provider_registry,
@@ -28,7 +32,8 @@ def test_provider_registry_creates_registered_provider() -> None:
 
 def test_create_default_provider_registry_has_echo_support() -> None:
     registry = create_default_provider_registry(
-        openai_compatible_builder=lambda _config: EchoProvider()
+        openai_compatible_builder=lambda _config: EchoProvider(),
+        openai_responses_computer_builder=lambda _config: EchoProvider(),
     )
 
     provider = registry.create(
@@ -37,6 +42,25 @@ def test_create_default_provider_registry_has_echo_support() -> None:
             model="echo",
             base_url="http://localhost",
             api_key="unused",
+        )
+    )
+
+    assert isinstance(provider, EchoProvider)
+
+
+def test_create_default_provider_registry_has_computer_use_support() -> None:
+    registry = create_default_provider_registry(
+        openai_compatible_builder=lambda _config: EchoProvider(),
+        openai_responses_computer_builder=lambda _config: EchoProvider(),
+    )
+
+    provider = registry.create(
+        ModelEndpointConfig(
+            provider=ProviderType.OPENAI_RESPONSES_COMPUTER,
+            model="computer-use-preview",
+            base_url="https://api.openai.com/v1",
+            api_key="key-openai",
+            computer_use=ComputerUseConfig(),
         )
     )
 
@@ -80,3 +104,22 @@ def test_model_endpoint_config_normalizes_string_fields() -> None:
     assert config.model == "gpt-4o-mini"
     assert config.base_url == "https://openai-compatible.local/v1"
     assert config.api_key == "key-openai"
+
+
+def test_model_endpoint_config_normalizes_computer_use_string_fields() -> None:
+    config = ModelEndpointConfig(
+        provider=ProviderType.OPENAI_RESPONSES_COMPUTER,
+        model="computer-use-preview",
+        base_url="https://api.openai.com/v1",
+        api_key="key-openai",
+        computer_use=ComputerUseConfig(
+            environment="  desktop  ",
+            reasoning_summary="  concise  ",
+            truncation="  auto  ",
+        ),
+    )
+
+    assert config.computer_use is not None
+    assert config.computer_use.environment == "desktop"
+    assert config.computer_use.reasoning_summary == "concise"
+    assert config.computer_use.truncation == "auto"

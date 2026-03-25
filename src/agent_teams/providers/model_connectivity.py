@@ -124,7 +124,10 @@ class ModelConnectivityProbeService:
         timeout_ms = self._resolve_timeout_ms(request=request, config=resolved_config)
         if resolved_config.provider == ProviderType.ECHO:
             return self._build_echo_result(resolved_config)
-        if resolved_config.provider == ProviderType.OPENAI_COMPATIBLE:
+        if resolved_config.provider in {
+            ProviderType.OPENAI_COMPATIBLE,
+            ProviderType.OPENAI_RESPONSES_COMPUTER,
+        }:
             return self._probe_openai_compatible(
                 config=resolved_config,
                 timeout_ms=timeout_ms,
@@ -156,7 +159,10 @@ class ModelConnectivityProbeService:
                 ),
                 models=("echo",),
             )
-        if resolved_config.provider == ProviderType.OPENAI_COMPATIBLE:
+        if resolved_config.provider in {
+            ProviderType.OPENAI_COMPATIBLE,
+            ProviderType.OPENAI_RESPONSES_COMPUTER,
+        }:
             return self._discover_openai_compatible_models(
                 config=resolved_config,
                 timeout_ms=timeout_ms,
