@@ -368,6 +368,16 @@ Lists persisted business events in the session.
 
 Lists persisted messages in the session.
 
+### `GET /sessions/{session_id}/artifacts/{artifact_path}`
+
+Streams one session-scoped artifact file, including computer-use screenshots persisted under the session artifact root.
+
+Rules:
+- `artifact_path` is resolved relative to the session artifact directory only. Path traversal outside that directory is rejected with `400`.
+- Missing sessions return `404`.
+- Missing artifact files return `404`.
+- The response `Content-Type` is inferred from the file extension when possible.
+
 ### `GET /sessions/{session_id}/agents/{instance_id}/messages`
 
 Lists messages for one agent instance.

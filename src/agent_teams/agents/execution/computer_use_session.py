@@ -180,7 +180,7 @@ class ComputerUseSession:
             screenshot = await self._computer_executor.capture_screenshot(
                 session_id=session_id
             )
-            _ = self._store_screenshot(
+            _, _ = self._store_screenshot(
                 request=request,
                 screenshot=screenshot,
                 step_index=step_index,
@@ -226,7 +226,10 @@ class ComputerUseSession:
                 screenshot = await self._computer_executor.capture_screenshot(
                     session_id=session_id
                 )
-                screenshot_artifact_path = self._store_screenshot(
+                (
+                    screenshot_artifact_path,
+                    screenshot_artifact_url,
+                ) = self._store_screenshot(
                     request=request,
                     screenshot=screenshot,
                     step_index=step_index,
@@ -239,6 +242,7 @@ class ComputerUseSession:
                     screenshot=screenshot,
                     context=context,
                     screenshot_artifact_path=screenshot_artifact_path,
+                    screenshot_artifact_url=screenshot_artifact_url,
                 )
                 if approval_ticket_id is not None:
                     self._approval_ticket_repo.mark_completed(approval_ticket_id)
@@ -721,6 +725,7 @@ class ComputerUseSession:
         screenshot: ComputerScreenshot,
         context: ComputerContext,
         screenshot_artifact_path: str | None,
+        screenshot_artifact_url: str | None,
     ) -> None:
         action_result_payload = cast(
             dict[str, object],
@@ -734,6 +739,7 @@ class ComputerUseSession:
                 "active_window_title": context.active_window_title,
                 "screenshot": {
                     "artifact_path": screenshot_artifact_path,
+                    "artifact_url": screenshot_artifact_url,
                     "mime_type": screenshot.mime_type,
                     "width": screenshot.width,
                     "height": screenshot.height,
@@ -769,9 +775,9 @@ class ComputerUseSession:
         request: LLMRequest,
         screenshot: ComputerScreenshot,
         step_index: int,
-    ) -> str | None:
+    ) -> tuple[str | None, str | None]:
         if self._computer_artifact_store is None:
-            return None
+            return None, None
         artifact_path = self._computer_artifact_store.save_screenshot(
             workspace_id=request.workspace_id,
             session_id=request.session_id,
@@ -780,7 +786,18 @@ class ComputerUseSession:
             step_index=step_index,
             screenshot=screenshot,
         )
-        return str(artifact_path)
+        relative_path = self._computer_artifact_store.relative_artifact_path(
+            workspace_id=request.workspace_id,
+            session_id=request.session_id,
+            artifact_path=artifact_path,
+        )
+        return relative_path, self._artifact_url(
+            session_id=request.session_id,
+            artifact_path=relative_path,
+        )
+
+    def _artifact_url(self, *, session_id: str, artifact_path: str) -> str:
+        return f"/api/sessions/{session_id}/artifacts/{artifact_path}"
 
     def _publish_tool_approval_notification(
         self,

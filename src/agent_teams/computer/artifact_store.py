@@ -27,7 +27,7 @@ class ComputerArtifactStore(BaseModel):
         screenshot: ComputerScreenshot,
     ) -> Path:
         artifact_dir = (
-            self.workspace_manager.session_artifact_dir(
+            self.session_artifact_root(
                 workspace_id=workspace_id,
                 session_id=session_id,
             )
@@ -48,6 +48,49 @@ class ComputerArtifactStore(BaseModel):
             ) from exc
         artifact_path.write_bytes(image_bytes)
         return artifact_path
+
+    def session_artifact_root(
+        self,
+        *,
+        workspace_id: str,
+        session_id: str,
+    ) -> Path:
+        return self.workspace_manager.session_artifact_dir(
+            workspace_id=workspace_id,
+            session_id=session_id,
+        ).resolve()
+
+    def relative_artifact_path(
+        self,
+        *,
+        workspace_id: str,
+        session_id: str,
+        artifact_path: Path,
+    ) -> str:
+        root = self.session_artifact_root(
+            workspace_id=workspace_id,
+            session_id=session_id,
+        )
+        resolved_artifact = artifact_path.resolve()
+        if resolved_artifact != root and root not in resolved_artifact.parents:
+            raise ValueError("Artifact path escapes the session artifact root.")
+        return resolved_artifact.relative_to(root).as_posix()
+
+    def resolve_artifact_path(
+        self,
+        *,
+        workspace_id: str,
+        session_id: str,
+        relative_path: str,
+    ) -> Path:
+        root = self.session_artifact_root(
+            workspace_id=workspace_id,
+            session_id=session_id,
+        )
+        candidate = (root / relative_path).resolve()
+        if candidate != root and root not in candidate.parents:
+            raise ValueError("Artifact path escapes the session artifact root.")
+        return candidate
 
 
 def _mime_type_suffix(mime_type: str) -> str:

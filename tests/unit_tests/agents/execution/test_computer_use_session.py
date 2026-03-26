@@ -450,9 +450,13 @@ async def test_computer_use_session_runs_loop_and_emits_events(
         tool_result_payload["result"]["data"]["current_url"]
         == "https://example.test/done"
     )
-    artifact_path = tool_result_payload["result"]["data"]["screenshot"]["artifact_path"]
-    assert artifact_path is not None
-    assert Path(artifact_path).exists()
+    screenshot_payload = tool_result_payload["result"]["data"]["screenshot"]
+    artifact_path = screenshot_payload["artifact_path"]
+    assert artifact_path == "computer/run-1/instance-1/step-0001.png"
+    assert (
+        screenshot_payload["artifact_url"]
+        == "/api/sessions/session-1/artifacts/computer/run-1/instance-1/step-0001.png"
+    )
     assert (
         tmp_path
         / ".agent_teams"

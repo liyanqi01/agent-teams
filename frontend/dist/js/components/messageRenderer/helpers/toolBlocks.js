@@ -105,6 +105,9 @@ function formatComputerUseReturn(content) {
     if (Number.isFinite(Number(screenshot?.width)) && Number.isFinite(Number(screenshot?.height))) {
         lines.push(`Viewport: ${Number(screenshot.width)}x${Number(screenshot.height)}`);
     }
+    if (typeof screenshot?.artifact_url === 'string' && screenshot.artifact_url.trim()) {
+        lines.push('', `![Screenshot](${screenshot.artifact_url.trim()})`);
+    }
 
     return lines.join('\n');
 }

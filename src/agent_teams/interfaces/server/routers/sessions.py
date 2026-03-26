@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import mimetypes
+
 from pydantic import BaseModel, ConfigDict
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
 
 from agent_teams.interfaces.server.deps import get_session_service
 from agent_teams.sessions import SessionService
@@ -230,6 +233,30 @@ def get_session_messages(
     service: SessionService = Depends(get_session_service),
 ) -> list[dict[str, object]]:
     return service.get_session_messages(session_id)
+
+
+@router.get("/{session_id}/artifacts/{artifact_path:path}")
+def get_session_artifact(
+    session_id: str,
+    artifact_path: str,
+    service: SessionService = Depends(get_session_service),
+) -> FileResponse:
+    try:
+        resolved_path = service.get_session_artifact_path(session_id, artifact_path)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Session not found") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Artifact not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    media_type = mimetypes.guess_type(str(resolved_path.name))[0]
+    return FileResponse(
+        path=resolved_path,
+        media_type=media_type or "application/octet-stream",
+    )
 
 
 @router.get("/{session_id}/agents/{instance_id}/messages")

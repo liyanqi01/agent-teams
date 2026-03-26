@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -17,6 +19,8 @@ class _FakeSessionService:
         self.reflection_update_calls: list[tuple[str, str, str]] = []
         self.reflection_delete_calls: list[tuple[str, str]] = []
         self.raise_missing = False
+        self.artifact_path: Path | None = None
+        self.artifact_error: Exception | None = None
 
     def update_session(self, session_id: str, metadata: dict[str, str]) -> None:
         if self.raise_missing:
@@ -162,6 +166,19 @@ class _FakeSessionService:
             "updated_at": None,
             "source": "manual_delete",
         }
+
+    def get_session_artifact_path(
+        self,
+        session_id: str,
+        artifact_path: str,
+    ) -> Path:
+        if self.raise_missing:
+            raise KeyError(session_id)
+        if self.artifact_error is not None:
+            raise self.artifact_error
+        if self.artifact_path is None:
+            raise AssertionError(f"artifact path not configured: {artifact_path}")
+        return self.artifact_path
 
 
 def _create_client(fake_service: _FakeSessionService) -> TestClient:
@@ -330,3 +347,51 @@ def test_delete_agent_reflection_route_returns_projection() -> None:
     assert response.status_code == 200
     assert response.json()["source"] == "manual_delete"
     assert fake_service.reflection_delete_calls == [("session-1", "inst-1")]
+
+
+def test_get_session_artifact_route_returns_file_response(tmp_path: Path) -> None:
+    fake_service = _FakeSessionService()
+    fake_service.artifact_path = tmp_path / "preview.png"
+    fake_service.artifact_path.write_bytes(b"png-bytes")
+    client = _create_client(fake_service)
+
+    response = client.get(
+        "/api/sessions/session-1/artifacts/computer/run-1/instance-1/step-0001.png"
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"png-bytes"
+    assert response.headers["content-type"].startswith("image/png")
+
+
+def test_get_session_artifact_route_returns_not_found_for_missing_session() -> None:
+    fake_service = _FakeSessionService()
+    fake_service.raise_missing = True
+    client = _create_client(fake_service)
+
+    response = client.get("/api/sessions/session-1/artifacts/computer/step-0001.png")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Session not found"}
+
+
+def test_get_session_artifact_route_rejects_escape_paths() -> None:
+    fake_service = _FakeSessionService()
+    fake_service.artifact_error = ValueError("Artifact path escapes the session scope.")
+    client = _create_client(fake_service)
+
+    response = client.get("/api/sessions/session-1/artifacts/..%2Fsecrets.txt")
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Artifact path escapes the session scope."}
+
+
+def test_get_session_artifact_route_returns_not_found_for_missing_artifact() -> None:
+    fake_service = _FakeSessionService()
+    fake_service.artifact_error = FileNotFoundError("missing")
+    client = _create_client(fake_service)
+
+    response = client.get("/api/sessions/session-1/artifacts/computer/step-0001.png")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Artifact not found"}

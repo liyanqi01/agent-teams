@@ -4,6 +4,7 @@ from __future__ import annotations
 import shutil
 import uuid
 from collections.abc import Callable
+from pathlib import Path
 from typing import cast
 
 from agent_teams.agents.instances.models import AgentRuntimeRecord
@@ -244,6 +245,25 @@ class SessionService:
 
     def get_session(self, session_id: str) -> SessionRecord:
         return self._session_repo.get(session_id)
+
+    def get_session_artifact_path(
+        self,
+        session_id: str,
+        artifact_path: str,
+    ) -> Path:
+        if self._workspace_manager is None:
+            raise RuntimeError("Workspace manager is not available")
+        session = self._session_repo.get(session_id)
+        session_root = self._workspace_manager.session_artifact_dir(
+            workspace_id=session.workspace_id,
+            session_id=session_id,
+        ).resolve()
+        candidate = (session_root / artifact_path).resolve()
+        if candidate != session_root and session_root not in candidate.parents:
+            raise ValueError("Artifact path escapes the session scope.")
+        if not candidate.exists() or not candidate.is_file():
+            raise FileNotFoundError(str(candidate))
+        return candidate
 
     def list_sessions(self) -> tuple[SessionRecord, ...]:
         sessions = self._session_repo.list_all()
