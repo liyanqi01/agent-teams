@@ -1216,6 +1216,10 @@ function approvalTitle(approval) {
     if (toolName === 'dispatch_task') {
         return 'Dispatch task';
     }
+    if (toolName === 'computer_use') {
+        const actionType = String(args?.action?.type || 'action').replaceAll('_', ' ');
+        return `Approve computer ${actionType}`;
+    }
     return `Run ${humanizeToolName(toolName || 'tool')}`;
 }
 

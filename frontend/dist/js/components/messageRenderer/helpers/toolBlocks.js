@@ -63,9 +63,50 @@ export function applyToolReturn(toolBlock, content) {
         resultEl.classList.remove('warning-text');
     }
 
-    const val = typeof content === 'object' ? JSON.stringify(content, null, 2) : String(content);
+    const toolName = String(toolBlock?.dataset?.toolName || '');
+    const val = formatToolReturn(toolName, content);
     resultEl.innerHTML = parseMarkdown(val);
     syncApprovalStateFromEnvelope(toolBlock, content);
+}
+
+function formatToolReturn(toolName, content) {
+    if (toolName === 'computer_use' && content && typeof content === 'object') {
+        return formatComputerUseReturn(content);
+    }
+    return typeof content === 'object' ? JSON.stringify(content, null, 2) : String(content);
+}
+
+function formatComputerUseReturn(content) {
+    const data = content?.data && typeof content.data === 'object' ? content.data : {};
+    const actionResult = data?.action_result && typeof data.action_result === 'object'
+        ? data.action_result
+        : {};
+    const screenshot = data?.screenshot && typeof data.screenshot === 'object'
+        ? data.screenshot
+        : {};
+
+    const lines = [
+        `Action: ${String(actionResult?.action_type || 'unknown').replaceAll('_', ' ')}`,
+        `Status: ${content?.ok === false ? 'failed' : 'completed'}`,
+    ];
+
+    if (typeof actionResult?.message === 'string' && actionResult.message.trim()) {
+        lines.push(`Message: ${actionResult.message.trim()}`);
+    }
+    if (typeof data?.current_url === 'string' && data.current_url.trim()) {
+        lines.push(`URL: ${data.current_url.trim()}`);
+    }
+    if (typeof data?.active_window_title === 'string' && data.active_window_title.trim()) {
+        lines.push(`Window: ${data.active_window_title.trim()}`);
+    }
+    if (typeof screenshot?.artifact_path === 'string' && screenshot.artifact_path.trim()) {
+        lines.push(`Screenshot: ${screenshot.artifact_path.trim()}`);
+    }
+    if (Number.isFinite(Number(screenshot?.width)) && Number.isFinite(Number(screenshot?.height))) {
+        lines.push(`Viewport: ${Number(screenshot.width)}x${Number(screenshot.height)}`);
+    }
+
+    return lines.join('\n');
 }
 
 export function indexPendingToolBlock(pendingToolBlocks, toolBlock, toolName, toolCallId) {

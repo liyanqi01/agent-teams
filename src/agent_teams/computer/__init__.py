@@ -23,8 +23,15 @@ if TYPE_CHECKING:
         ComputerSessionRecord,
         MouseButton,
     )
+    from agent_teams.computer.artifact_store import ComputerArtifactStore
+    from agent_teams.computer.executor_config import (
+        ComputerExecutorBackend,
+        ComputerExecutorConfig,
+        VmHttpExecutorConfig,
+    )
     from agent_teams.computer.executor_contracts import ComputerExecutor
     from agent_teams.computer.unavailable_executor import UnavailableComputerExecutor
+    from agent_teams.computer.vm_executor import VmComputerExecutor
 
 __all__ = [
     "ComputerAction",
@@ -37,14 +44,19 @@ __all__ = [
     "ComputerActionScroll",
     "ComputerActionType",
     "ComputerActionWait",
+    "ComputerArtifactStore",
     "ComputerContext",
     "ComputerExecutor",
-    "UnavailableComputerExecutor",
+    "ComputerExecutorBackend",
+    "ComputerExecutorConfig",
     "ComputerPoint",
     "ComputerSafetyCheck",
     "ComputerScreenshot",
     "ComputerSessionRecord",
     "MouseButton",
+    "UnavailableComputerExecutor",
+    "VmComputerExecutor",
+    "VmHttpExecutorConfig",
 ]
 
 _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
@@ -76,11 +88,19 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     ),
     "ComputerActionType": ("agent_teams.computer.action_models", "ComputerActionType"),
     "ComputerActionWait": ("agent_teams.computer.action_models", "ComputerActionWait"),
+    "ComputerArtifactStore": (
+        "agent_teams.computer.artifact_store",
+        "ComputerArtifactStore",
+    ),
     "ComputerContext": ("agent_teams.computer.action_models", "ComputerContext"),
     "ComputerExecutor": ("agent_teams.computer.executor_contracts", "ComputerExecutor"),
-    "UnavailableComputerExecutor": (
-        "agent_teams.computer.unavailable_executor",
-        "UnavailableComputerExecutor",
+    "ComputerExecutorBackend": (
+        "agent_teams.computer.executor_config",
+        "ComputerExecutorBackend",
+    ),
+    "ComputerExecutorConfig": (
+        "agent_teams.computer.executor_config",
+        "ComputerExecutorConfig",
     ),
     "ComputerPoint": ("agent_teams.computer.action_models", "ComputerPoint"),
     "ComputerSafetyCheck": (
@@ -93,6 +113,15 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
         "ComputerSessionRecord",
     ),
     "MouseButton": ("agent_teams.computer.action_models", "MouseButton"),
+    "UnavailableComputerExecutor": (
+        "agent_teams.computer.unavailable_executor",
+        "UnavailableComputerExecutor",
+    ),
+    "VmComputerExecutor": ("agent_teams.computer.vm_executor", "VmComputerExecutor"),
+    "VmHttpExecutorConfig": (
+        "agent_teams.computer.executor_config",
+        "VmHttpExecutorConfig",
+    ),
 }
 
 

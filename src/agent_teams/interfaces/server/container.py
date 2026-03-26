@@ -21,7 +21,14 @@ from agent_teams.agents.orchestration.task_orchestration_service import (
 )
 from agent_teams.agents.orchestration.task_execution_service import TaskExecutionService
 from agent_teams.env.environment_variable_service import EnvironmentVariableService
-from agent_teams.computer import UnavailableComputerExecutor
+from agent_teams.computer import (
+    ComputerArtifactStore,
+    ComputerExecutor,
+    ComputerExecutorBackend,
+    UnavailableComputerExecutor,
+    VmComputerExecutor,
+)
+from agent_teams.computer.executor_config import load_computer_executor_config
 from agent_teams.env.proxy_config_service import ProxyConfigService
 from agent_teams.env.proxy_env import ProxyEnvConfig, sync_proxy_env_to_process_env
 from agent_teams.feishu import (
@@ -175,7 +182,13 @@ class ServerContainer:
             project_root=Path.cwd(),
             workspace_repo=self.workspace_repo,
         )
-        self.computer_executor = UnavailableComputerExecutor()
+        self.computer_artifact_store = ComputerArtifactStore(
+            workspace_manager=self.workspace_manager
+        )
+        self.computer_executor_config = load_computer_executor_config(
+            config_dir=config_dir
+        )
+        self.computer_executor: ComputerExecutor = self._build_computer_executor()
         self.event_log: EventLog = EventLog(runtime.paths.db_path)
         self.agent_repo: AgentInstanceRepository = AgentInstanceRepository(
             runtime.paths.db_path
@@ -394,6 +407,14 @@ class ServerContainer:
             )
         )
 
+    def _build_computer_executor(self) -> ComputerExecutor:
+        if self.computer_executor_config.backend == ComputerExecutorBackend.VM_HTTP:
+            vm_http = self.computer_executor_config.vm_http
+            if vm_http is None:
+                raise ValueError("vm_http backend requires vm_http configuration.")
+            return VmComputerExecutor(vm_http)
+        return UnavailableComputerExecutor()
+
     def _build_runtime_services(self) -> None:
         def get_task_execution_service() -> TaskExecutionService:
             return self.task_execution_service
@@ -414,6 +435,7 @@ class ServerContainer:
             run_intent_repo=self.run_intent_repo,
             workspace_manager=self.workspace_manager,
             computer_executor=self.computer_executor,
+            computer_artifact_store=self.computer_artifact_store,
             role_memory_service=self.role_memory_service,
             subagent_reflection_service=self.subagent_reflection_service,
             tool_registry=self.tool_registry,

@@ -14,25 +14,24 @@
 
 当前第一阶段只支持“桌面/计算机”语义，不依赖 DOM selector，不暴露 `page.click()`、`page.locator()` 这类 browser use 接口。
 
-## 2. 范围与非目标
+## 2. Scope And Non-goals
 
-范围：
+Scope:
 
-- 在 provider 层新增 `openai_responses_computer`
-- 直接对接 OpenAI `Responses API`
-- 引入独立的 `ComputerUseSession`
-- 引入 `ComputerExecutor` 抽象，底层可替换为 VM 或桌面执行器
-- 接入现有 run 事件流
-- 接入现有 approval ticket / approval manager / runs approval API
-- 在系统配置中支持 `computer_use` 配置项
+- Add `openai_responses_computer` at the provider layer
+- Integrate directly with OpenAI `Responses API`
+- Introduce a dedicated `ComputerUseSession`
+- Introduce a `ComputerExecutor` abstraction with VM or desktop backends
+- Reuse the existing run event stream
+- Reuse the existing approval ticket / approval manager / runs approval API
+- Support `computer_use` configuration in system settings
 
-非目标：
+Non-goals:
 
-- 不实现 DOM 驱动浏览器自动化接口
-- 不把 computer use 混入现有 pydantic-ai tool call 链路
-- 不在本阶段实现真实 VM executor
-- 不在本阶段实现截图工件持久化和前端截图时间线 UI
-- 不在本阶段实现 notification service 对 computer approval 的专门通知文案
+- Do not implement DOM-driven browser automation interfaces
+- Do not mix computer use into the existing pydantic-ai tool-call chain
+- Do not directly control the host desktop in this phase
+- Do not add a standalone computer-specific page or screenshot image-serving API in this phase
 
 ## 3. 设计原则
 
@@ -275,104 +274,88 @@
 - 批准后恢复执行，拒绝/超时后停留在 paused
 - 补 `approve` / `deny` 分支测试
 
-### 7.2 未完成
+### 7.2 Completed Follow-up PRs
 
 #### PR4: real executor backend
 
-状态：未开始
+Status: completed
 
-目标：
+Content:
 
-- 实现真实 `VmComputerExecutor` 或 `LocalDesktopExecutor`
-- 将 `UnavailableComputerExecutor` 替换为可运行执行器
-- 定义 executor 接入方式：HTTP agent、MCP 或本地驱动
-
-建议文件：
-
-- `src/agent_teams/computer/vm_executor.py`
-- `src/agent_teams/computer/executor_client.py`
-- `tests/unit_tests/computer/test_vm_executor.py`
+- Added `src/agent_teams/computer/executor_config.py` to load executor backend settings from `.env` and process env
+- Added `src/agent_teams/computer/vm_executor.py` with an HTTP-agent-based `VmComputerExecutor`
+- Updated `ServerContainer` to select `VmComputerExecutor` or `UnavailableComputerExecutor` from config
+- Added `tests/unit_tests/computer/test_executor_config.py` and `tests/unit_tests/computer/test_vm_executor.py`
 
 #### PR5: artifact persistence
 
-状态：未开始
+Status: completed
 
-目标：
+Content:
 
-- 持久化每步截图
-- 可选保存录像或关键帧
-- 为后续前端时间线和调试提供数据基础
-
-建议文件：
-
-- `src/agent_teams/computer/artifact_store.py`
-- `src/agent_teams/computer/session_repo.py`
-- `docs/database-schema.md` 更新 computer artifacts / sessions 表
+- Added `src/agent_teams/computer/artifact_store.py`
+- `ComputerUseSession` now persists every screenshot into workspace session artifacts
+- `TOOL_RESULT` payload now carries screenshot `artifact_path`
+- Added `tests/unit_tests/computer/test_artifact_store.py` and session artifact assertions
 
 #### PR6: UI / SSE visualization
 
-状态：未开始
+Status: completed (minimal reuse version)
 
-目标：
+Content:
 
-- 前端展示 computer use step timeline
-- 展示最近截图和当前动作
-- 在现有 tool approval UI 中明确区分普通工具审批和 computer safety check 审批
+- Continued reusing the existing `TOOL_CALL` / `TOOL_RESULT` / `TOOL_APPROVAL_*` SSE events
+- Frontend approval titles now show the requested computer action for `computer_use`
+- Frontend result rendering for `computer_use` now summarizes action, URL, window, and artifact path
+- No dedicated screenshot timeline page or image-serving API was added in this pass
 
 #### PR7: notification integration
 
-状态：未开始
+Status: completed
 
-目标：
+Content:
 
-- 对 computer safety approval 发出与普通 tool approval 一致的通知
-- 为通知文案增加 computer-specific 上下文
+- `ComputerUseSession` now emits approval-request notifications through the existing `NotificationService`
+- Frontend notification copy now uses computer-action wording for `computer_use`
+- Computer approvals reuse the existing dedupe and channel configuration model
 
 #### PR8: stricter policy model
 
-状态：未开始
+Status: completed
 
-目标：
+Content:
 
-- 将 `ToolApprovalPolicy` 从“按工具名审批”扩展为“按 computer action 风险等级审批”
-- 示例：
-  - `wait` / `screenshot` 可自动放行
-  - `click` / `type` / `keypress` 为中高风险
-  - 登录、提交、下载、上传等更高风险动作可附加专门策略
+- `ToolApprovalPolicy` now has computer-action approval rules and risk-level helpers
+- `ComputerUseSession` now handles both `pending_safety_checks` and policy-driven computer-action approvals
+- Low-risk actions like `wait` can pass automatically, while `click` / `type` / `keypress` / `drag` require approval by default
+- Added `tests/unit_tests/tools/runtime/test_policy.py` and policy-approval session assertions
 
-## 8. 推荐 PR 分解
+## 8. Follow-up Enhancements
 
-推荐后续继续按下面顺序推进：
+The main chain is now runnable. Useful next enhancements are:
 
-1. PR4: real executor backend
-2. PR5: artifact persistence
-3. PR6: UI / SSE visualization
-4. PR7: notification integration
-5. PR8: stricter policy model
+1. Add a controlled `/api/*` artifact read endpoint so the frontend can preview screenshots directly.
+2. Add dedicated computer session / turn persistence tables for replay and audit.
+3. Add finer-grained computer-specific events such as `computer_screenshot_captured`.
+4. Refine computer-action risk models for login, upload, download, submit, and similar flows.
+5. Add other executor backends if a VM HTTP agent is not sufficient.
 
-原因：
+## 9. Current Risks And Limits
 
-- 没有真实 executor，当前链路只能单测，无法真正运行
-- 没有 artifact persistence，调试和 UI 都缺基础数据
-- UI 和通知应建立在已稳定的后端事件和工件之上
-- 更精细的 policy 应该放在真实 executor 和 UI 跑通之后再做
+- Real execution still depends on an external VM HTTP agent; without backend config the system still falls back to `UnavailableComputerExecutor`.
+- The frontend currently shows artifact paths and action summaries, not inline screenshot image previews.
+- `computer_use.environment` still has a local-to-OpenAI tool-schema mapping layer.
+- Artifacts are persisted to the filesystem, but there are still no dedicated computer session / turn database tables.
 
-## 9. 当前风险与限制
+## 10. Conclusion
 
-- 当前默认 executor 仍是 `UnavailableComputerExecutor`，所以生产路径还不能真正操控计算机
-- 当前 approval 复用现有 tool approval API，但 UI 侧是否已明确区分 computer safety check 仍待实现
-- 当前 `computer_use.environment` 的本地配置语义与 OpenAI tool schema 的取值存在映射层
-- 当前还没有 screenshot artifact 持久化，run 结束后无法回放 computer use 过程
-- 当前没有 notification service 的 computer-specific approval 提醒
+The repository now has the full planned PR0-PR8 computer-use path implemented as a runnable minimum loop:
 
-## 10. 结论
+- provider/config plumbing
+- `Responses API` execution loop
+- safety approval and policy approval integration
+- VM executor backend config and runtime wiring
+- screenshot artifact persistence
+- reused SSE/UI/notification surfaces with computer-specific wording and result summaries
 
-当前仓库已经完成 computer use 后端主链路的前三个关键阶段：
-
-- provider/config 落地
-- `Responses API` 执行闭环
-- safety approval 接入现有审批体系
-
-也就是说，架构上已经是 computer use，而不是 browser use。
-
-剩余工作主要集中在“真实执行器”和“可观测性/UI”两块。只要补上真实 `ComputerExecutor` 实现，这条链路就可以从目前的单测可运行状态，推进到真正的端到端可用状态。
+That means the codebase is now not only architecturally aligned with computer use, but also equipped with a real executor path, approvals, notifications, and artifact-backed observability.

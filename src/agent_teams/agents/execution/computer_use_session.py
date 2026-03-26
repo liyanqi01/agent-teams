@@ -14,11 +14,17 @@ from agent_teams.agents.execution.message_repository import MessageRepository
 from agent_teams.computer import (
     ComputerAction,
     ComputerActionResult,
+    ComputerArtifactStore,
     ComputerContext,
     ComputerExecutor,
     ComputerScreenshot,
 )
 from agent_teams.net.llm_client import build_llm_http_client
+from agent_teams.notifications import (
+    NotificationContext,
+    NotificationService,
+    NotificationType,
+)
 from agent_teams.providers.model_config import ComputerUseConfig, ModelEndpointConfig
 from agent_teams.providers.provider_contracts import LLMRequest
 from agent_teams.sessions.runs.enums import RunEventType
@@ -136,6 +142,8 @@ class ComputerUseSession:
         tool_approval_manager: ToolApprovalManager,
         tool_approval_policy: ToolApprovalPolicy,
         run_runtime_repo: RunRuntimeRepository,
+        computer_artifact_store: ComputerArtifactStore | None = None,
+        notification_service: NotificationService | None = None,
         http_client: _AsyncHttpClient | None = None,
     ) -> None:
         self._config = config
@@ -148,6 +156,8 @@ class ComputerUseSession:
         self._tool_approval_manager = tool_approval_manager
         self._tool_approval_policy = tool_approval_policy
         self._run_runtime_repo = run_runtime_repo
+        self._computer_artifact_store = computer_artifact_store
+        self._notification_service = notification_service
         self._http_client: _AsyncHttpClient = http_client or build_llm_http_client(
             ssl_verify=config.ssl_verify,
             connect_timeout_seconds=config.connect_timeout_seconds,
@@ -165,10 +175,17 @@ class ComputerUseSession:
             instance_id=request.instance_id,
         )
         try:
+            step_index = 0
             context = await self._computer_executor.get_context(session_id=session_id)
             screenshot = await self._computer_executor.capture_screenshot(
                 session_id=session_id
             )
+            _ = self._store_screenshot(
+                request=request,
+                screenshot=screenshot,
+                step_index=step_index,
+            )
+            step_index += 1
             response = await self._create_initial_response(
                 request=request,
                 prompt=prompt,
@@ -185,8 +202,11 @@ class ComputerUseSession:
                     return text
                 action = self._require_action(computer_call)
                 approval_ticket_id: str | None = None
-                if computer_call.pending_safety_checks:
-                    approval_ticket_id = await self._await_safety_check_approval(
+                if self._tool_approval_policy.requires_computer_action_approval(
+                    action.type,
+                    has_pending_safety_checks=bool(computer_call.pending_safety_checks),
+                ):
+                    approval_ticket_id = await self._await_computer_action_approval(
                         request=request,
                         computer_call=computer_call,
                         action=action,
@@ -206,12 +226,19 @@ class ComputerUseSession:
                 screenshot = await self._computer_executor.capture_screenshot(
                     session_id=session_id
                 )
+                screenshot_artifact_path = self._store_screenshot(
+                    request=request,
+                    screenshot=screenshot,
+                    step_index=step_index,
+                )
+                step_index += 1
                 self._publish_tool_result_event(
                     request=request,
                     computer_call=computer_call,
                     action_result=action_result,
                     screenshot=screenshot,
                     context=context,
+                    screenshot_artifact_path=screenshot_artifact_path,
                 )
                 if approval_ticket_id is not None:
                     self._approval_ticket_repo.mark_completed(approval_ticket_id)
@@ -225,7 +252,7 @@ class ComputerUseSession:
         finally:
             await self._computer_executor.stop_session(session_id=session_id)
 
-    async def _await_safety_check_approval(
+    async def _await_computer_action_approval(
         self,
         *,
         request: LLMRequest,
@@ -259,7 +286,10 @@ class ComputerUseSession:
                 role_id=request.role_id,
                 tool_name=_COMPUTER_TOOL_NAME,
                 args_preview=args_preview,
-                risk_level="high",
+                risk_level=self._tool_approval_policy.computer_action_risk_level(
+                    action.type,
+                    has_pending_safety_checks=bool(computer_call.pending_safety_checks),
+                ),
             )
             publish_request = True
         runtime_snapshot = self._pause_for_tool_approval(request)
@@ -268,6 +298,10 @@ class ComputerUseSession:
                 request=request,
                 tool_call_id=ticket.tool_call_id,
                 args_preview=args_preview,
+            )
+            self._publish_tool_approval_notification(
+                request=request,
+                tool_call_id=ticket.tool_call_id,
             )
         try:
             action_decision, feedback = await asyncio.to_thread(
@@ -540,9 +574,13 @@ class ComputerUseSession:
         computer_call: _ResponsesComputerCall,
         action: ComputerAction,
     ) -> str:
+        approval_reason = (
+            "safety_check" if computer_call.pending_safety_checks else "policy"
+        )
         return json.dumps(
             {
                 "action": action.model_dump(mode="json"),
+                "approval_reason": approval_reason,
                 "pending_safety_checks": [
                     item.model_dump(mode="json")
                     for item in computer_call.pending_safety_checks
@@ -682,6 +720,7 @@ class ComputerUseSession:
         action_result: ComputerActionResult,
         screenshot: ComputerScreenshot,
         context: ComputerContext,
+        screenshot_artifact_path: str | None,
     ) -> None:
         action_result_payload = cast(
             dict[str, object],
@@ -694,6 +733,7 @@ class ComputerUseSession:
                 "current_url": context.current_url,
                 "active_window_title": context.active_window_title,
                 "screenshot": {
+                    "artifact_path": screenshot_artifact_path,
                     "mime_type": screenshot.mime_type,
                     "width": screenshot.width,
                     "height": screenshot.height,
@@ -721,6 +761,52 @@ class ComputerUseSession:
                     ensure_ascii=False,
                 ),
             )
+        )
+
+    def _store_screenshot(
+        self,
+        *,
+        request: LLMRequest,
+        screenshot: ComputerScreenshot,
+        step_index: int,
+    ) -> str | None:
+        if self._computer_artifact_store is None:
+            return None
+        artifact_path = self._computer_artifact_store.save_screenshot(
+            workspace_id=request.workspace_id,
+            session_id=request.session_id,
+            run_id=request.run_id,
+            instance_id=request.instance_id,
+            step_index=step_index,
+            screenshot=screenshot,
+        )
+        return str(artifact_path)
+
+    def _publish_tool_approval_notification(
+        self,
+        *,
+        request: LLMRequest,
+        tool_call_id: str,
+    ) -> None:
+        if self._notification_service is None:
+            return
+        role_label = request.role_id or "An agent"
+        body = f"{role_label} requests approval for computer_use."
+        _ = self._notification_service.emit(
+            notification_type=NotificationType.TOOL_APPROVAL_REQUESTED,
+            title="Approval Required",
+            body=body,
+            dedupe_key=f"tool_approval_requested:{request.run_id}:{tool_call_id}",
+            context=NotificationContext(
+                session_id=request.session_id,
+                run_id=request.run_id,
+                trace_id=request.trace_id,
+                task_id=request.task_id,
+                instance_id=request.instance_id,
+                role_id=request.role_id,
+                tool_call_id=tool_call_id,
+                tool_name=_COMPUTER_TOOL_NAME,
+            ),
         )
 
     def _publish_tool_approval_requested_event(

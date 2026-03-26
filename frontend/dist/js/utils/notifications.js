@@ -70,6 +70,10 @@ export function notifyFromRequest(payload = {}) {
 function buildApprovalBody(payload = {}) {
     const toolName = String(payload?.tool_name || 'tool');
     const roleId = String(payload?.role_id || '');
+    if (toolName === 'computer_use') {
+        const subject = roleId || 'An agent';
+        return `${subject} requests approval for a computer action.`;
+    }
     return roleId
         ? `${roleId} requests approval for ${toolName}.`
         : `A tool call (${toolName}) is waiting for your approval.`;

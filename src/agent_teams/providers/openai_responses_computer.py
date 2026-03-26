@@ -5,7 +5,8 @@ from typing import final, override
 
 from agent_teams.agents.execution.computer_use_session import ComputerUseSession
 from agent_teams.agents.execution.message_repository import MessageRepository
-from agent_teams.computer import ComputerExecutor
+from agent_teams.computer import ComputerArtifactStore, ComputerExecutor
+from agent_teams.notifications import NotificationService
 from agent_teams.providers.model_config import ModelEndpointConfig
 from agent_teams.providers.provider_contracts import LLMProvider, LLMRequest
 from agent_teams.sessions.runs.event_stream import RunEventHub
@@ -29,6 +30,8 @@ class OpenAIResponsesComputerProvider(LLMProvider):
         tool_approval_manager: ToolApprovalManager,
         tool_approval_policy: ToolApprovalPolicy,
         run_runtime_repo: RunRuntimeRepository,
+        computer_artifact_store: ComputerArtifactStore | None = None,
+        notification_service: NotificationService | None = None,
     ) -> None:
         self._session = ComputerUseSession(
             config,
@@ -40,6 +43,8 @@ class OpenAIResponsesComputerProvider(LLMProvider):
             tool_approval_manager=tool_approval_manager,
             tool_approval_policy=tool_approval_policy,
             run_runtime_repo=run_runtime_repo,
+            computer_artifact_store=computer_artifact_store,
+            notification_service=notification_service,
         )
 
     @override

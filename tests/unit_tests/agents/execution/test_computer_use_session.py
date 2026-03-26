@@ -16,10 +16,12 @@ from agent_teams.computer import (
     ComputerAction,
     ComputerActionClick,
     ComputerActionResult,
+    ComputerArtifactStore,
     ComputerContext,
     ComputerExecutor,
     ComputerScreenshot,
 )
+from agent_teams.notifications import NotificationService
 from agent_teams.providers.model_config import ModelEndpointConfig, ProviderType
 from agent_teams.providers.provider_contracts import LLMRequest
 from agent_teams.sessions.runs.enums import RunEventType
@@ -37,6 +39,7 @@ from agent_teams.tools.runtime.approval_ticket_repo import (
     ApprovalTicketRepository,
     ApprovalTicketStatus,
 )
+from agent_teams.workspace import WorkspaceManager
 
 
 class _FakeHttpClient:
@@ -146,6 +149,31 @@ class _FakeRunControlManager:
 
     def raise_if_cancelled(self, *, run_id: str, instance_id: str) -> None:
         self.calls.append((run_id, instance_id))
+
+
+class _FakeNotificationService:
+    def __init__(self) -> None:
+        self.requests: list[dict[str, object]] = []
+
+    def emit(
+        self,
+        *,
+        notification_type: object,
+        title: str,
+        body: str,
+        context: object,
+        dedupe_key: str | None = None,
+    ) -> bool:
+        self.requests.append(
+            {
+                "notification_type": notification_type,
+                "title": title,
+                "body": body,
+                "context": context,
+                "dedupe_key": dedupe_key,
+            }
+        )
+        return True
 
 
 class _FakeToolApprovalManager:
@@ -279,6 +307,9 @@ def _session(
     approval_manager: _FakeToolApprovalManager,
     approval_ticket_repo: ApprovalTicketRepository,
     run_runtime_repo: _FakeRunRuntimeRepo,
+    policy: ToolApprovalPolicy | None = None,
+    artifact_store: ComputerArtifactStore | None = None,
+    notification_service: _FakeNotificationService | None = None,
 ) -> ComputerUseSession:
     return ComputerUseSession(
         ModelEndpointConfig(
@@ -293,14 +324,22 @@ def _session(
         run_control_manager=cast(RunControlManager, control_manager),
         approval_ticket_repo=approval_ticket_repo,
         tool_approval_manager=cast(ToolApprovalManager, approval_manager),
-        tool_approval_policy=ToolApprovalPolicy(timeout_seconds=0.01),
+        tool_approval_policy=policy
+        or ToolApprovalPolicy(
+            timeout_seconds=0.01,
+            approval_required_computer_actions=frozenset(),
+        ),
         run_runtime_repo=cast(RunRuntimeRepository, run_runtime_repo),
+        computer_artifact_store=artifact_store,
+        notification_service=cast(NotificationService | None, notification_service),
         http_client=http_client,
     )
 
 
 @pytest.mark.asyncio
-async def test_computer_use_session_runs_loop_and_emits_events(tmp_path: Path) -> None:
+async def test_computer_use_session_runs_loop_and_emits_events(
+    tmp_path: Path,
+) -> None:
     hub = _FakeRunEventHub()
     control_manager = _FakeRunControlManager()
     approval_manager = _FakeToolApprovalManager()
@@ -308,6 +347,9 @@ async def test_computer_use_session_runs_loop_and_emits_events(tmp_path: Path) -
     run_runtime_repo = _FakeRunRuntimeRepo()
     message_repo = _FakeMessageRepository(
         history=[ModelRequest(parts=[UserPromptPart(content="Open the settings app.")])]
+    )
+    artifact_store = ComputerArtifactStore(
+        workspace_manager=WorkspaceManager(project_root=tmp_path)
     )
     http_client = _FakeHttpClient(
         responses=[
@@ -360,6 +402,7 @@ async def test_computer_use_session_runs_loop_and_emits_events(tmp_path: Path) -
         approval_manager=approval_manager,
         approval_ticket_repo=ApprovalTicketRepository(tmp_path / "tickets.db"),
         run_runtime_repo=run_runtime_repo,
+        artifact_store=artifact_store,
     )
 
     result = await session.run(_request(user_prompt=None))
@@ -407,6 +450,29 @@ async def test_computer_use_session_runs_loop_and_emits_events(tmp_path: Path) -
         tool_result_payload["result"]["data"]["current_url"]
         == "https://example.test/done"
     )
+    artifact_path = tool_result_payload["result"]["data"]["screenshot"]["artifact_path"]
+    assert artifact_path is not None
+    assert Path(artifact_path).exists()
+    assert (
+        tmp_path
+        / ".agent_teams"
+        / "sessions"
+        / "session-1"
+        / "computer"
+        / "run-1"
+        / "instance-1"
+        / "step-0000.png"
+    ).exists()
+    assert (
+        tmp_path
+        / ".agent_teams"
+        / "sessions"
+        / "session-1"
+        / "computer"
+        / "run-1"
+        / "instance-1"
+        / "step-0001.png"
+    ).exists()
     assert tool_result_payload["error"] is False
     assert control_manager.calls
 
@@ -580,3 +646,72 @@ async def test_computer_use_session_stops_when_safety_check_is_denied(
     resolved_payload = json.loads(hub.events[3].payload_json)
     assert resolved_payload["action"] == "deny"
     assert resolved_payload["feedback"] == "not safe"
+
+
+@pytest.mark.asyncio
+async def test_computer_use_session_uses_policy_approval_for_clicks_and_emits_notification(
+    tmp_path: Path,
+) -> None:
+    hub = _FakeRunEventHub()
+    control_manager = _FakeRunControlManager()
+    approval_manager = _FakeToolApprovalManager(wait_result=("approve", "policy ok"))
+    notification_service = _FakeNotificationService()
+    executor = _FakeComputerExecutor()
+    run_runtime_repo = _FakeRunRuntimeRepo()
+    message_repo = _FakeMessageRepository(
+        history=[ModelRequest(parts=[UserPromptPart(content="Open the browser.")])]
+    )
+    ticket_repo = ApprovalTicketRepository(tmp_path / "tickets.db")
+    http_client = _FakeHttpClient(
+        responses=[
+            _response(
+                {
+                    "id": "resp-1",
+                    "output": [
+                        {
+                            "type": "computer_call",
+                            "id": "item-1",
+                            "call_id": "call-1",
+                            "action": {
+                                "type": "click",
+                                "x": 100,
+                                "y": 200,
+                                "button": "left",
+                            },
+                            "pending_safety_checks": [],
+                            "status": "in_progress",
+                        }
+                    ],
+                }
+            ),
+            _response(
+                {
+                    "id": "resp-2",
+                    "output_text": "Policy-approved desktop action completed.",
+                }
+            ),
+        ]
+    )
+    session = _session(
+        http_client=http_client,
+        executor=executor,
+        message_repo=message_repo,
+        hub=hub,
+        control_manager=control_manager,
+        approval_manager=approval_manager,
+        approval_ticket_repo=ticket_repo,
+        run_runtime_repo=run_runtime_repo,
+        policy=ToolApprovalPolicy(timeout_seconds=0.01),
+        notification_service=notification_service,
+    )
+
+    result = await session.run(_request(user_prompt=None))
+
+    assert result == "Policy-approved desktop action completed."
+    assert approval_manager.last_open is not None
+    assert '"approval_reason": "policy"' in approval_manager.last_open["args_preview"]
+    assert notification_service.requests
+    notification_payload = notification_service.requests[0]
+    assert notification_payload["title"] == "Approval Required"
+    assert "computer_use" in cast(str, notification_payload["body"])
+    assert executor.execute_calls

@@ -9,7 +9,7 @@ from agent_teams.agents.orchestration.task_orchestration_service import (
 )
 from agent_teams.mcp.mcp_registry import McpRegistry
 from agent_teams.metrics import MetricRecorder
-from agent_teams.computer import ComputerExecutor
+from agent_teams.computer import ComputerArtifactStore, ComputerExecutor
 from agent_teams.notifications import NotificationService
 from agent_teams.providers.provider_contracts import EchoProvider, LLMProvider
 from agent_teams.providers.model_config import ModelEndpointConfig
@@ -55,6 +55,7 @@ def create_provider_factory(
     run_intent_repo: RunIntentRepository,
     workspace_manager: WorkspaceManager,
     computer_executor: ComputerExecutor,
+    computer_artifact_store: ComputerArtifactStore | None = None,
     role_memory_service: RoleMemoryService | None = None,
     subagent_reflection_service: SubagentReflectionService | None = None,
     tool_registry: ToolRegistry,
@@ -123,6 +124,8 @@ def create_provider_factory(
                     tool_approval_manager=tool_approval_manager,
                     tool_approval_policy=tool_approval_policy,
                     run_runtime_repo=run_runtime_repo,
+                    computer_artifact_store=computer_artifact_store,
+                    notification_service=notification_service,
                 )
             ),
         )
