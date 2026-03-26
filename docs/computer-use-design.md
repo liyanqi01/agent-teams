@@ -31,7 +31,7 @@ Non-goals:
 - Do not implement DOM-driven browser automation interfaces
 - Do not mix computer use into the existing pydantic-ai tool-call chain
 - Do not directly control the host desktop in this phase
-- Do not add a standalone computer-specific page or screenshot image-serving API in this phase
+- Do not add a dedicated computer-only frontend surface beyond the existing run/session UI reuse path in this phase
 
 ## 3. 设计原则
 
@@ -136,21 +136,24 @@ Non-goals:
 - 发布 run events
 - 结束 executor session
 
-关键点：
+Key points:
 
-- 当 `request.user_prompt` 为空时，会回退到 `MessageRepository.get_history_for_conversation_task()` 中提取最近的 `UserPromptPart`
-- `computer_call_output` 使用截图 data URL + 可选 `current_url`
-- 对 unsupported payload 会直接抛出 runtime error，不隐式降级
+- When `request.user_prompt` is empty, the session falls back to the latest `UserPromptPart` from `MessageRepository.get_history_for_conversation_task()`.
+- `computer_call_output` sends the latest screenshot as a data URL and includes `current_url` when available.
+- Screenshots are persisted under the session artifact directory and `TOOL_RESULT` includes both `artifact_path` and `artifact_url`.
+- The execution loop now also persists audit data into `computer_sessions` and `computer_turns`.
+- Unsupported payloads fail fast with a runtime error instead of silently degrading.
 
-### 5.3 Executor 抽象
+### 5.3 Executor Abstraction
 
-相关文件：
+Relevant files:
 
 - `src/agent_teams/computer/action_models.py`
 - `src/agent_teams/computer/executor_contracts.py`
 - `src/agent_teams/computer/unavailable_executor.py`
+- `src/agent_teams/computer/vm_executor.py`
 
-当前接口：
+Current interface:
 
 - `start_session(run_id, instance_id)`
 - `execute_action(session_id, action)`
@@ -158,10 +161,11 @@ Non-goals:
 - `get_context(session_id)`
 - `stop_session(session_id)`
 
-当前状态：
+Current status:
 
-- 已有 `UnavailableComputerExecutor` 作为默认占位
-- 真实 VM/desktop executor 仍未实现
+- `UnavailableComputerExecutor` remains the safe default fallback.
+- `VmComputerExecutor` is implemented via an HTTP agent and wired through container config.
+- Direct host-desktop control is still out of scope; real execution depends on an external VM agent.
 
 ### 5.4 审批集成
 
@@ -306,8 +310,8 @@ Content:
 
 - Continued reusing the existing `TOOL_CALL` / `TOOL_RESULT` / `TOOL_APPROVAL_*` SSE events
 - Frontend approval titles now show the requested computer action for `computer_use`
-- Frontend result rendering for `computer_use` now summarizes action, URL, window, and artifact path
-- No dedicated screenshot timeline page or image-serving API was added in this pass
+- Frontend result rendering for `computer_use` now summarizes action, URL, window, and artifact references
+- Screenshot preview now reuses the existing session artifact endpoint instead of introducing a dedicated computer-only UI surface
 
 #### PR7: notification integration
 
@@ -330,32 +334,63 @@ Content:
 - Low-risk actions like `wait` can pass automatically, while `click` / `type` / `keypress` / `drag` require approval by default
 - Added `tests/unit_tests/tools/runtime/test_policy.py` and policy-approval session assertions
 
+#### PR9: screenshot preview API
+
+Status: completed
+
+Commit:
+
+- `eb8b29b Add screenshot preview API`
+
+Content:
+
+- Added `GET /api/sessions/{session_id}/artifacts/{artifact_path}` to stream session-scoped artifacts securely
+- `ComputerUseSession` now emits both screenshot `artifact_path` and `artifact_url`
+- Frontend `computer_use` tool result rendering now shows inline screenshot preview through the existing markdown/image path
+- Added router, service, artifact-store, and session tests; updated `docs/api-design.md`
+
+#### PR10: computer session / turn persistence
+
+Status: completed
+
+Commit:
+
+- `740823e Add computer session and turn tables`
+
+Content:
+
+- Added `computer_sessions` and `computer_turns` tables through `ComputerSessionRepository`
+- `ComputerUseSession` now persists executor-session lifecycle, latest desktop context, and per-action turn records
+- Session deletion now cleans persisted computer session / turn rows together with other session data
+- Added repository and integration tests; updated `docs/database-schema.md`
+
 ## 8. Follow-up Enhancements
 
 The main chain is now runnable. Useful next enhancements are:
 
-1. Add a controlled `/api/*` artifact read endpoint so the frontend can preview screenshots directly.
-2. Add dedicated computer session / turn persistence tables for replay and audit.
-3. Add finer-grained computer-specific events such as `computer_screenshot_captured`.
-4. Refine computer-action risk models for login, upload, download, submit, and similar flows.
-5. Add other executor backends if a VM HTTP agent is not sufficient.
+1. Add finer-grained computer-specific events such as `computer_screenshot_captured`.
+2. Refine computer-action risk models for login, upload, download, submit, and similar flows.
+3. Add richer replay and audit views on top of the persisted `computer_sessions` / `computer_turns` data.
+4. Add other executor backends if a VM HTTP agent is not sufficient.
+5. Add a dedicated screenshot timeline or gallery surface if the current inline preview becomes insufficient.
 
 ## 9. Current Risks And Limits
 
 - Real execution still depends on an external VM HTTP agent; without backend config the system still falls back to `UnavailableComputerExecutor`.
-- The frontend currently shows artifact paths and action summaries, not inline screenshot image previews.
+- The current screenshot UX is intentionally minimal: inline preview is available, but there is still no dedicated screenshot timeline or replay page.
 - `computer_use.environment` still has a local-to-OpenAI tool-schema mapping layer.
-- Artifacts are persisted to the filesystem, but there are still no dedicated computer session / turn database tables.
+- Persisted computer session / turn data is now available, but it is not yet surfaced through dedicated query APIs or replay views.
 
 ## 10. Conclusion
 
-The repository now has the full planned PR0-PR8 computer-use path implemented as a runnable minimum loop:
+The repository now has the full planned PR0-PR8 computer-use path implemented, plus two follow-up capabilities that close the main observability gaps:
 
 - provider/config plumbing
 - `Responses API` execution loop
 - safety approval and policy approval integration
 - VM executor backend config and runtime wiring
-- screenshot artifact persistence
-- reused SSE/UI/notification surfaces with computer-specific wording and result summaries
+- screenshot artifact persistence and preview API
+- persisted `computer_sessions` / `computer_turns` audit tables
+- reused SSE/UI/notification surfaces with computer-specific wording and inline screenshot preview
 
-That means the codebase is now not only architecturally aligned with computer use, but also equipped with a real executor path, approvals, notifications, and artifact-backed observability.
+That means the codebase is now not only architecturally aligned with computer use, but also equipped with a real executor path, approvals, notifications, artifact preview, and durable computer-action audit data.
