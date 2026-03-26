@@ -25,6 +25,7 @@ _VM_TIMEOUT_ENV = "AGENT_TEAMS_COMPUTER_VM_TIMEOUT_SECONDS"
 
 class ComputerExecutorBackend(StrEnum):
     UNAVAILABLE = "unavailable"
+    LOCAL_DESKTOP = "local_desktop"
     VM_HTTP = "vm_http"
 
 
@@ -44,16 +45,28 @@ class VmHttpExecutorConfig(BaseModel):
         return value
 
 
+class LocalDesktopExecutorConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
 class ComputerExecutorConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     backend: ComputerExecutorBackend = ComputerExecutorBackend.UNAVAILABLE
+    local_desktop: LocalDesktopExecutorConfig | None = None
     vm_http: VmHttpExecutorConfig | None = None
 
     @model_validator(mode="after")
     def _validate_backend_requirements(self) -> ComputerExecutorConfig:
         if self.backend == ComputerExecutorBackend.VM_HTTP and self.vm_http is None:
             raise ValueError("vm_http backend requires vm_http configuration.")
+        if (
+            self.backend == ComputerExecutorBackend.LOCAL_DESKTOP
+            and self.local_desktop is None
+        ):
+            raise ValueError(
+                "local_desktop backend requires local_desktop configuration."
+            )
         return self
 
 
@@ -74,6 +87,8 @@ def load_computer_executor_config(
             ComputerExecutorBackend.UNAVAILABLE.value,
         ),
     }
+    if payload["backend"] == ComputerExecutorBackend.LOCAL_DESKTOP.value:
+        payload["local_desktop"] = {}
     vm_http_payload: dict[str, object] = {}
 
     base_url = _normalized_env_value(resolved_env.get(_VM_BASE_URL_ENV))

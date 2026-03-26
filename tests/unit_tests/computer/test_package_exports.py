@@ -44,3 +44,17 @@ def test_computer_package_exports_session_repo_lazily() -> None:
 
     exported = getattr(module, "ComputerSessionRepository", None)
     assert exported is not None
+
+
+def test_computer_package_exports_local_desktop_executor_lazily() -> None:
+    module = import_module("agent_teams.computer")
+
+    exported = getattr(module, "LocalDesktopExecutor", None)
+    assert exported is not None
+
+
+def test_computer_package_exports_local_desktop_executor_config_lazily() -> None:
+    module = import_module("agent_teams.computer")
+
+    exported = getattr(module, "LocalDesktopExecutorConfig", None)
+    assert exported is not None

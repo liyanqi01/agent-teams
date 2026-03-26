@@ -30,11 +30,13 @@ if TYPE_CHECKING:
     from agent_teams.computer.executor_config import (
         ComputerExecutorBackend,
         ComputerExecutorConfig,
+        LocalDesktopExecutorConfig,
         VmHttpExecutorConfig,
     )
     from agent_teams.computer.executor_contracts import ComputerExecutor
-    from agent_teams.computer.unavailable_executor import UnavailableComputerExecutor
+    from agent_teams.computer.local_desktop_executor import LocalDesktopExecutor
     from agent_teams.computer.session_repo import ComputerSessionRepository
+    from agent_teams.computer.unavailable_executor import UnavailableComputerExecutor
     from agent_teams.computer.vm_executor import VmComputerExecutor
 
 __all__ = [
@@ -61,6 +63,8 @@ __all__ = [
     "ComputerSessionStatus",
     "ComputerTurnRecord",
     "ComputerTurnStatus",
+    "LocalDesktopExecutor",
+    "LocalDesktopExecutorConfig",
     "MouseButton",
     "UnavailableComputerExecutor",
     "VmComputerExecutor",
@@ -135,6 +139,14 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "ComputerTurnStatus": (
         "agent_teams.computer.action_models",
         "ComputerTurnStatus",
+    ),
+    "LocalDesktopExecutor": (
+        "agent_teams.computer.local_desktop_executor",
+        "LocalDesktopExecutor",
+    ),
+    "LocalDesktopExecutorConfig": (
+        "agent_teams.computer.executor_config",
+        "LocalDesktopExecutorConfig",
     ),
     "MouseButton": ("agent_teams.computer.action_models", "MouseButton"),
     "UnavailableComputerExecutor": (

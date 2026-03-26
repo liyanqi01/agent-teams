@@ -26,6 +26,7 @@ from agent_teams.computer import (
     ComputerExecutor,
     ComputerExecutorBackend,
     ComputerSessionRepository,
+    LocalDesktopExecutor,
     UnavailableComputerExecutor,
     VmComputerExecutor,
 )
@@ -413,6 +414,11 @@ class ServerContainer:
         )
 
     def _build_computer_executor(self) -> ComputerExecutor:
+        if (
+            self.computer_executor_config.backend
+            == ComputerExecutorBackend.LOCAL_DESKTOP
+        ):
+            return LocalDesktopExecutor()
         if self.computer_executor_config.backend == ComputerExecutorBackend.VM_HTTP:
             vm_http = self.computer_executor_config.vm_http
             if vm_http is None:

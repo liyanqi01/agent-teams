@@ -15,6 +15,20 @@ def test_load_computer_executor_config_defaults_to_unavailable(tmp_path: Path) -
     config = load_computer_executor_config(config_dir=tmp_path, merged_env={})
 
     assert config.backend == ComputerExecutorBackend.UNAVAILABLE
+    assert config.local_desktop is None
+    assert config.vm_http is None
+
+
+def test_load_computer_executor_config_reads_local_desktop_env(tmp_path: Path) -> None:
+    config = load_computer_executor_config(
+        config_dir=tmp_path,
+        merged_env={
+            "AGENT_TEAMS_COMPUTER_EXECUTOR_BACKEND": "local_desktop",
+        },
+    )
+
+    assert config.backend == ComputerExecutorBackend.LOCAL_DESKTOP
+    assert config.local_desktop is not None
     assert config.vm_http is None
 
 
