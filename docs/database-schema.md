@@ -276,6 +276,83 @@ Purpose: one row per `agent.iter()` completion cycle (coordinator or subagent). 
 
 ---
 
+### 2.7.1 `computer_sessions`
+
+```sql
+CREATE TABLE IF NOT EXISTS computer_sessions (
+    computer_session_id TEXT PRIMARY KEY,
+    session_id          TEXT NOT NULL,
+    run_id              TEXT NOT NULL,
+    task_id             TEXT NOT NULL,
+    instance_id         TEXT NOT NULL,
+    role_id             TEXT NOT NULL,
+    status              TEXT NOT NULL,
+    current_url         TEXT,
+    active_window_title TEXT,
+    last_error          TEXT,
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL,
+    completed_at        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_computer_sessions_session_updated
+    ON computer_sessions(session_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_computer_sessions_run_updated
+    ON computer_sessions(run_id, updated_at DESC);
+```
+
+Purpose: durable metadata for each executor-backed computer-use session created during a run. This captures the mapping from the runtime session/run/task/instance tuple to the executor session id and the latest visible desktop context.
+
+`status` values:
+- `active`
+- `completed`
+- `failed`
+
+---
+
+### 2.7.2 `computer_turns`
+
+```sql
+CREATE TABLE IF NOT EXISTS computer_turns (
+    turn_id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    computer_session_id      TEXT NOT NULL,
+    session_id               TEXT NOT NULL,
+    run_id                   TEXT NOT NULL,
+    task_id                  TEXT NOT NULL,
+    instance_id              TEXT NOT NULL,
+    role_id                  TEXT NOT NULL,
+    step_index               INTEGER NOT NULL,
+    response_id              TEXT,
+    tool_call_id             TEXT,
+    action_type              TEXT NOT NULL,
+    action_json              TEXT NOT NULL,
+    result_json              TEXT NOT NULL DEFAULT '{}',
+    screenshot_artifact_path TEXT,
+    current_url              TEXT,
+    active_window_title      TEXT,
+    status                   TEXT NOT NULL,
+    error_message            TEXT,
+    created_at               TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_computer_turns_session_step
+    ON computer_turns(computer_session_id, step_index);
+CREATE INDEX IF NOT EXISTS idx_computer_turns_run_step
+    ON computer_turns(run_id, step_index ASC);
+CREATE INDEX IF NOT EXISTS idx_computer_turns_session_step_lookup
+    ON computer_turns(session_id, step_index ASC);
+```
+
+Purpose: append-only action log for one computer-use session. Each row stores the model response id, tool call id, serialized action/result payloads, the persisted screenshot artifact reference, and the desktop context observed after the action completed.
+
+`status` values:
+- `completed`
+- `denied`
+- `timed_out`
+- `failed`
+
+---
+
 ### 2.8 `triggers`
 
 ```sql
@@ -418,6 +495,7 @@ Primary query keys used by repositories:
 - `agent_teams.agents.execution`: `messages`.
 - `agent_teams.tools.runtime`: `approval_tickets`.
 - `agent_teams.providers`: `token_usage`.
+- `agent_teams.computer`: `computer_sessions`, `computer_turns`.
 - `agent_teams.triggers`: `triggers`, `trigger_events`.
 - `agent_teams.gateway`: `gateway_sessions`.
 - `agent_teams.roles`: `role_memories`.

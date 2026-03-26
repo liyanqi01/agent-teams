@@ -20,6 +20,8 @@ from agent_teams.computer import (
     ComputerContext,
     ComputerExecutor,
     ComputerScreenshot,
+    ComputerSessionRepository,
+    ComputerSessionStatus,
 )
 from agent_teams.notifications import NotificationService
 from agent_teams.providers.model_config import ModelEndpointConfig, ProviderType
@@ -309,6 +311,7 @@ def _session(
     run_runtime_repo: _FakeRunRuntimeRepo,
     policy: ToolApprovalPolicy | None = None,
     artifact_store: ComputerArtifactStore | None = None,
+    computer_session_repo: ComputerSessionRepository | None = None,
     notification_service: _FakeNotificationService | None = None,
 ) -> ComputerUseSession:
     return ComputerUseSession(
@@ -331,6 +334,7 @@ def _session(
         ),
         run_runtime_repo=cast(RunRuntimeRepository, run_runtime_repo),
         computer_artifact_store=artifact_store,
+        computer_session_repo=computer_session_repo,
         notification_service=cast(NotificationService | None, notification_service),
         http_client=http_client,
     )
@@ -351,6 +355,7 @@ async def test_computer_use_session_runs_loop_and_emits_events(
     artifact_store = ComputerArtifactStore(
         workspace_manager=WorkspaceManager(project_root=tmp_path)
     )
+    computer_session_repo = ComputerSessionRepository(tmp_path / "computer_sessions.db")
     http_client = _FakeHttpClient(
         responses=[
             _response(
@@ -403,6 +408,7 @@ async def test_computer_use_session_runs_loop_and_emits_events(
         approval_ticket_repo=ApprovalTicketRepository(tmp_path / "tickets.db"),
         run_runtime_repo=run_runtime_repo,
         artifact_store=artifact_store,
+        computer_session_repo=computer_session_repo,
     )
 
     result = await session.run(_request(user_prompt=None))
@@ -478,6 +484,16 @@ async def test_computer_use_session_runs_loop_and_emits_events(
         / "step-0001.png"
     ).exists()
     assert tool_result_payload["error"] is False
+    computer_session = computer_session_repo.get_session("computer-session-1")
+    assert computer_session is not None
+    assert computer_session.status == ComputerSessionStatus.COMPLETED
+    assert computer_session.current_url == "https://example.test/done"
+    turns = computer_session_repo.list_turns("computer-session-1")
+    assert len(turns) == 1
+    assert turns[0].tool_call_id == "call-1"
+    assert (
+        turns[0].screenshot_artifact_path == "computer/run-1/instance-1/step-0001.png"
+    )
     assert control_manager.calls
 
 
@@ -494,6 +510,7 @@ async def test_computer_use_session_uses_tool_approval_for_safety_checks(
         history=[ModelRequest(parts=[UserPromptPart(content="Open the browser.")])]
     )
     ticket_repo = ApprovalTicketRepository(tmp_path / "tickets.db")
+    computer_session_repo = ComputerSessionRepository(tmp_path / "computer_sessions.db")
     http_client = _FakeHttpClient(
         responses=[
             _response(
@@ -539,6 +556,7 @@ async def test_computer_use_session_uses_tool_approval_for_safety_checks(
         approval_manager=approval_manager,
         approval_ticket_repo=ticket_repo,
         run_runtime_repo=run_runtime_repo,
+        computer_session_repo=computer_session_repo,
     )
 
     result = await session.run(_request(user_prompt=None))
@@ -554,6 +572,9 @@ async def test_computer_use_session_uses_tool_approval_for_safety_checks(
     runtime = run_runtime_repo.get("run-1")
     assert runtime is not None
     assert runtime.status == RunRuntimeStatus.RUNNING
+    computer_session = computer_session_repo.get_session("computer-session-1")
+    assert computer_session is not None
+    assert computer_session.status == ComputerSessionStatus.COMPLETED
 
     event_types = [event.event_type for event in hub.events]
     assert event_types == [
@@ -585,6 +606,7 @@ async def test_computer_use_session_stops_when_safety_check_is_denied(
         history=[ModelRequest(parts=[UserPromptPart(content="Open the browser.")])]
     )
     ticket_repo = ApprovalTicketRepository(tmp_path / "tickets.db")
+    computer_session_repo = ComputerSessionRepository(tmp_path / "computer_sessions.db")
     http_client = _FakeHttpClient(
         responses=[
             _response(
@@ -624,6 +646,7 @@ async def test_computer_use_session_stops_when_safety_check_is_denied(
         approval_manager=approval_manager,
         approval_ticket_repo=ticket_repo,
         run_runtime_repo=run_runtime_repo,
+        computer_session_repo=computer_session_repo,
     )
 
     with pytest.raises(RuntimeError, match="denied by user"):
@@ -639,6 +662,12 @@ async def test_computer_use_session_stops_when_safety_check_is_denied(
     assert runtime.status == RunRuntimeStatus.PAUSED
     assert runtime.phase == RunRuntimePhase.AWAITING_TOOL_APPROVAL
     assert runtime.last_error == "Computer use safety check was denied by user."
+    computer_session = computer_session_repo.get_session("computer-session-1")
+    assert computer_session is not None
+    assert computer_session.status == ComputerSessionStatus.FAILED
+    assert (
+        computer_session.last_error == "Computer use safety check was denied by user."
+    )
 
     event_types = [event.event_type for event in hub.events]
     assert event_types == [

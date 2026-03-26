@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import cast
 
 from agent_teams.agents.instances.models import AgentRuntimeRecord
+from agent_teams.computer import ComputerSessionRepository
 from agent_teams.agents.execution.subagent_reflection import SubagentReflectionService
 from agent_teams.agents.orchestration.settings_service import (
     OrchestrationSettingsService,
@@ -81,6 +82,7 @@ class SessionService:
         shared_store: SharedStateRepository | None = None,
         metrics_store: SqliteMetricAggregateStore | None = None,
         workspace_manager: WorkspaceManager | None = None,
+        computer_session_repo: ComputerSessionRepository | None = None,
         workspace_service: WorkspaceService | None = None,
         external_session_binding_repo: ExternalSessionBindingRepository | None = None,
         role_memory_service: RoleMemoryService | None = None,
@@ -105,6 +107,7 @@ class SessionService:
         self._shared_store = shared_store
         self._metrics_store = metrics_store
         self._workspace_manager = workspace_manager
+        self._computer_session_repo = computer_session_repo
         self._workspace_service = workspace_service
         self._external_session_binding_repo = external_session_binding_repo
         self._role_memory_service = role_memory_service
@@ -233,6 +236,8 @@ class SessionService:
             self._external_session_binding_repo.delete_by_session(session_id)
         self._session_repo.delete(session_id)
         self._token_usage_repo.delete_by_session(session_id)
+        if self._computer_session_repo is not None:
+            self._computer_session_repo.delete_by_session(session_id)
         if self._metrics_store is not None:
             self._metrics_store.delete_by_session(session_id)
         if self._workspace_manager is not None:

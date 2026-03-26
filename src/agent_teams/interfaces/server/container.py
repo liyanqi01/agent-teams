@@ -25,6 +25,7 @@ from agent_teams.computer import (
     ComputerArtifactStore,
     ComputerExecutor,
     ComputerExecutorBackend,
+    ComputerSessionRepository,
     UnavailableComputerExecutor,
     VmComputerExecutor,
 )
@@ -220,6 +221,9 @@ class ServerContainer:
         self.token_usage_repo: TokenUsageRepository = TokenUsageRepository(
             runtime.paths.db_path
         )
+        self.computer_session_repo: ComputerSessionRepository = (
+            ComputerSessionRepository(runtime.paths.db_path)
+        )
         self.metric_registry: MetricRegistry = MetricRegistry(DEFAULT_DEFINITIONS)
         self.metrics_store: SqliteMetricAggregateStore = SqliteMetricAggregateStore(
             runtime.paths.db_path
@@ -348,6 +352,7 @@ class ServerContainer:
             shared_store=self.shared_store,
             metrics_store=self.metrics_store,
             workspace_manager=self.workspace_manager,
+            computer_session_repo=self.computer_session_repo,
             workspace_service=self.workspace_service,
             external_session_binding_repo=self.external_session_binding_repo,
             role_memory_service=self.role_memory_service,
@@ -436,6 +441,7 @@ class ServerContainer:
             workspace_manager=self.workspace_manager,
             computer_executor=self.computer_executor,
             computer_artifact_store=self.computer_artifact_store,
+            computer_session_repo=self.computer_session_repo,
             role_memory_service=self.role_memory_service,
             subagent_reflection_service=self.subagent_reflection_service,
             tool_registry=self.tool_registry,

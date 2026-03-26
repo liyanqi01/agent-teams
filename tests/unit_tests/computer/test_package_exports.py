@@ -37,3 +37,10 @@ def test_computer_package_exports_artifact_store_lazily() -> None:
 
     exported = getattr(module, "ComputerArtifactStore", None)
     assert exported is not None
+
+
+def test_computer_package_exports_session_repo_lazily() -> None:
+    module = import_module("agent_teams.computer")
+
+    exported = getattr(module, "ComputerSessionRepository", None)
+    assert exported is not None

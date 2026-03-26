@@ -14,6 +14,19 @@ class MouseButton(StrEnum):
     RIGHT = "right"
 
 
+class ComputerSessionStatus(StrEnum):
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class ComputerTurnStatus(StrEnum):
+    COMPLETED = "completed"
+    DENIED = "denied"
+    TIMED_OUT = "timed_out"
+    FAILED = "failed"
+
+
 class ComputerPoint(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -133,11 +146,40 @@ class ComputerSafetyCheck(BaseModel):
 class ComputerSessionRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    computer_session_id: str = Field(min_length=1)
     session_id: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
+    task_id: str = Field(min_length=1)
     instance_id: str = Field(min_length=1)
-    status: str = Field(min_length=1)
+    role_id: str = Field(min_length=1)
+    status: ComputerSessionStatus = ComputerSessionStatus.ACTIVE
     current_url: str | None = None
     active_window_title: str | None = None
+    last_error: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
+    completed_at: datetime | None = None
+
+
+class ComputerTurnRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    turn_id: int | None = None
+    computer_session_id: str = Field(min_length=1)
+    session_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    task_id: str = Field(min_length=1)
+    instance_id: str = Field(min_length=1)
+    role_id: str = Field(min_length=1)
+    step_index: int = Field(ge=0)
+    response_id: str | None = None
+    tool_call_id: str | None = None
+    action_type: str = Field(min_length=1)
+    action_json: str = Field(min_length=2)
+    result_json: str = Field(default="{}", min_length=2)
+    screenshot_artifact_path: str | None = None
+    current_url: str | None = None
+    active_window_title: str | None = None
+    status: ComputerTurnStatus = ComputerTurnStatus.COMPLETED
+    error_message: str | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))

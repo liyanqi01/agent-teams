@@ -12,6 +12,9 @@ from agent_teams.computer import (
     ComputerExecutor,
     ComputerPoint,
     ComputerSessionRecord,
+    ComputerSessionStatus,
+    ComputerTurnRecord,
+    ComputerTurnStatus,
     MouseButton,
 )
 
@@ -43,16 +46,41 @@ def test_computer_action_drag_requires_at_least_two_points() -> None:
 
 def test_computer_session_record_tracks_context_fields() -> None:
     record = ComputerSessionRecord(
-        session_id="computer_session_1",
-        run_id="run_1",
-        instance_id="instance_1",
-        status="running",
+        computer_session_id="computer-session-1",
+        session_id="session-1",
+        run_id="run-1",
+        task_id="task-1",
+        instance_id="instance-1",
+        role_id="desktop_operator",
+        status=ComputerSessionStatus.ACTIVE,
         current_url="https://openai.com",
         active_window_title="OpenAI",
     )
 
     assert record.current_url == "https://openai.com"
     assert record.active_window_title == "OpenAI"
+    assert record.status == ComputerSessionStatus.ACTIVE
+
+
+def test_computer_turn_record_tracks_step_status() -> None:
+    record = ComputerTurnRecord(
+        computer_session_id="computer-session-1",
+        session_id="session-1",
+        run_id="run-1",
+        task_id="task-1",
+        instance_id="instance-1",
+        role_id="desktop_operator",
+        step_index=0,
+        response_id="resp-1",
+        tool_call_id="call-1",
+        action_type="click",
+        action_json='{"type":"click"}',
+        result_json='{"ok":true}',
+        status=ComputerTurnStatus.COMPLETED,
+    )
+
+    assert record.step_index == 0
+    assert record.status == ComputerTurnStatus.COMPLETED
 
 
 def test_computer_package_exports_executor_protocol() -> None:

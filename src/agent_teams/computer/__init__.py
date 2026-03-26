@@ -21,6 +21,9 @@ if TYPE_CHECKING:
         ComputerSafetyCheck,
         ComputerScreenshot,
         ComputerSessionRecord,
+        ComputerSessionStatus,
+        ComputerTurnRecord,
+        ComputerTurnStatus,
         MouseButton,
     )
     from agent_teams.computer.artifact_store import ComputerArtifactStore
@@ -31,6 +34,7 @@ if TYPE_CHECKING:
     )
     from agent_teams.computer.executor_contracts import ComputerExecutor
     from agent_teams.computer.unavailable_executor import UnavailableComputerExecutor
+    from agent_teams.computer.session_repo import ComputerSessionRepository
     from agent_teams.computer.vm_executor import VmComputerExecutor
 
 __all__ = [
@@ -53,6 +57,10 @@ __all__ = [
     "ComputerSafetyCheck",
     "ComputerScreenshot",
     "ComputerSessionRecord",
+    "ComputerSessionRepository",
+    "ComputerSessionStatus",
+    "ComputerTurnRecord",
+    "ComputerTurnStatus",
     "MouseButton",
     "UnavailableComputerExecutor",
     "VmComputerExecutor",
@@ -111,6 +119,22 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "ComputerSessionRecord": (
         "agent_teams.computer.action_models",
         "ComputerSessionRecord",
+    ),
+    "ComputerSessionRepository": (
+        "agent_teams.computer.session_repo",
+        "ComputerSessionRepository",
+    ),
+    "ComputerSessionStatus": (
+        "agent_teams.computer.action_models",
+        "ComputerSessionStatus",
+    ),
+    "ComputerTurnRecord": (
+        "agent_teams.computer.action_models",
+        "ComputerTurnRecord",
+    ),
+    "ComputerTurnStatus": (
+        "agent_teams.computer.action_models",
+        "ComputerTurnStatus",
     ),
     "MouseButton": ("agent_teams.computer.action_models", "MouseButton"),
     "UnavailableComputerExecutor": (

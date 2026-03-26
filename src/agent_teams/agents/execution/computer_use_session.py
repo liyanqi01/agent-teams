@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timezone
 from collections.abc import Mapping, Sequence
 from typing import Protocol, cast
 
@@ -18,6 +19,11 @@ from agent_teams.computer import (
     ComputerContext,
     ComputerExecutor,
     ComputerScreenshot,
+    ComputerSessionRecord,
+    ComputerSessionRepository,
+    ComputerSessionStatus,
+    ComputerTurnRecord,
+    ComputerTurnStatus,
 )
 from agent_teams.net.llm_client import build_llm_http_client
 from agent_teams.notifications import (
@@ -143,6 +149,7 @@ class ComputerUseSession:
         tool_approval_policy: ToolApprovalPolicy,
         run_runtime_repo: RunRuntimeRepository,
         computer_artifact_store: ComputerArtifactStore | None = None,
+        computer_session_repo: ComputerSessionRepository | None = None,
         notification_service: NotificationService | None = None,
         http_client: _AsyncHttpClient | None = None,
     ) -> None:
@@ -157,6 +164,7 @@ class ComputerUseSession:
         self._tool_approval_policy = tool_approval_policy
         self._run_runtime_repo = run_runtime_repo
         self._computer_artifact_store = computer_artifact_store
+        self._computer_session_repo = computer_session_repo
         self._notification_service = notification_service
         self._http_client: _AsyncHttpClient = http_client or build_llm_http_client(
             ssl_verify=config.ssl_verify,
@@ -170,15 +178,25 @@ class ComputerUseSession:
         )
         prompt = self._resolve_prompt(request=request, conversation_id=conversation_id)
         self._raise_if_cancelled(request)
-        session_id = await self._computer_executor.start_session(
+        computer_session_id = await self._computer_executor.start_session(
             run_id=request.run_id,
             instance_id=request.instance_id,
         )
+        context = ComputerContext(screen_width=1, screen_height=1)
         try:
             step_index = 0
-            context = await self._computer_executor.get_context(session_id=session_id)
+            turn_index = 0
+            context = await self._computer_executor.get_context(
+                session_id=computer_session_id
+            )
+            self._upsert_computer_session(
+                request=request,
+                computer_session_id=computer_session_id,
+                context=context,
+                status=ComputerSessionStatus.ACTIVE,
+            )
             screenshot = await self._computer_executor.capture_screenshot(
-                session_id=session_id
+                session_id=computer_session_id
             )
             _, _ = self._store_screenshot(
                 request=request,
@@ -197,6 +215,12 @@ class ComputerUseSession:
                 computer_call = self._extract_first_computer_call(response)
                 if computer_call is None:
                     text = self._extract_output_text(response)
+                    self._upsert_computer_session(
+                        request=request,
+                        computer_session_id=computer_session_id,
+                        context=context,
+                        status=ComputerSessionStatus.COMPLETED,
+                    )
                     if text:
                         self._publish_text_delta_event(request=request, text=text)
                     return text
@@ -217,14 +241,14 @@ class ComputerUseSession:
                     action=action,
                 )
                 action_result = await self._computer_executor.execute_action(
-                    session_id=session_id,
+                    session_id=computer_session_id,
                     action=action,
                 )
                 context = await self._computer_executor.get_context(
-                    session_id=session_id
+                    session_id=computer_session_id
                 )
                 screenshot = await self._computer_executor.capture_screenshot(
-                    session_id=session_id
+                    session_id=computer_session_id
                 )
                 (
                     screenshot_artifact_path,
@@ -234,7 +258,25 @@ class ComputerUseSession:
                     screenshot=screenshot,
                     step_index=step_index,
                 )
+                self._record_computer_turn(
+                    request=request,
+                    computer_session_id=computer_session_id,
+                    response_id=response.id,
+                    computer_call=computer_call,
+                    action=action,
+                    action_result=action_result,
+                    context=context,
+                    screenshot_artifact_path=screenshot_artifact_path,
+                    step_index=turn_index,
+                )
+                turn_index += 1
                 step_index += 1
+                self._upsert_computer_session(
+                    request=request,
+                    computer_session_id=computer_session_id,
+                    context=context,
+                    status=ComputerSessionStatus.ACTIVE,
+                )
                 self._publish_tool_result_event(
                     request=request,
                     computer_call=computer_call,
@@ -253,8 +295,17 @@ class ComputerUseSession:
                     screenshot=screenshot,
                     context=context,
                 )
+        except Exception as exc:
+            self._upsert_computer_session(
+                request=request,
+                computer_session_id=computer_session_id,
+                context=context,
+                status=ComputerSessionStatus.FAILED,
+                last_error=str(exc),
+            )
+            raise
         finally:
-            await self._computer_executor.stop_session(session_id=session_id)
+            await self._computer_executor.stop_session(session_id=computer_session_id)
 
     async def _await_computer_action_approval(
         self,
@@ -664,6 +715,89 @@ class ComputerUseSession:
         self._run_control_manager.raise_if_cancelled(
             run_id=request.run_id,
             instance_id=request.instance_id,
+        )
+
+    def _upsert_computer_session(
+        self,
+        *,
+        request: LLMRequest,
+        computer_session_id: str,
+        context: ComputerContext,
+        status: ComputerSessionStatus,
+        last_error: str | None = None,
+    ) -> None:
+        if self._computer_session_repo is None:
+            return
+        completed_at = None
+        if status in {
+            ComputerSessionStatus.COMPLETED,
+            ComputerSessionStatus.FAILED,
+        }:
+            completed_at = datetime.now(tz=timezone.utc)
+        existing = self._computer_session_repo.get_session(computer_session_id)
+        created_at = (
+            existing.created_at
+            if existing is not None
+            else datetime.now(tz=timezone.utc)
+        )
+        self._computer_session_repo.upsert_session(
+            ComputerSessionRecord(
+                computer_session_id=computer_session_id,
+                session_id=request.session_id,
+                run_id=request.run_id,
+                task_id=request.task_id,
+                instance_id=request.instance_id,
+                role_id=request.role_id,
+                status=status,
+                current_url=context.current_url,
+                active_window_title=context.active_window_title,
+                last_error=last_error,
+                created_at=created_at,
+                updated_at=datetime.now(tz=timezone.utc),
+                completed_at=completed_at,
+            )
+        )
+
+    def _record_computer_turn(
+        self,
+        *,
+        request: LLMRequest,
+        computer_session_id: str,
+        response_id: str,
+        computer_call: _ResponsesComputerCall,
+        action: ComputerAction,
+        action_result: ComputerActionResult,
+        context: ComputerContext,
+        screenshot_artifact_path: str | None,
+        step_index: int,
+    ) -> None:
+        if self._computer_session_repo is None:
+            return
+        status = (
+            ComputerTurnStatus.COMPLETED
+            if action_result.ok
+            else ComputerTurnStatus.FAILED
+        )
+        self._computer_session_repo.record_turn(
+            ComputerTurnRecord(
+                computer_session_id=computer_session_id,
+                session_id=request.session_id,
+                run_id=request.run_id,
+                task_id=request.task_id,
+                instance_id=request.instance_id,
+                role_id=request.role_id,
+                step_index=step_index,
+                response_id=response_id,
+                tool_call_id=computer_call.call_id,
+                action_type=action.type,
+                action_json=action.model_dump_json(),
+                result_json=action_result.model_dump_json(),
+                screenshot_artifact_path=screenshot_artifact_path,
+                current_url=context.current_url,
+                active_window_title=context.active_window_title,
+                status=status,
+                error_message=None if action_result.ok else action_result.message,
+            )
         )
 
     def _publish_model_step_event(

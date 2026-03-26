@@ -5,6 +5,11 @@ from pathlib import Path
 
 import pytest
 
+from agent_teams.computer import (
+    ComputerSessionRecord,
+    ComputerSessionRepository,
+)
+
 from agent_teams.agents.instances.enums import InstanceStatus
 from agent_teams.sessions.runs.event_stream import RunEventHub
 from agent_teams.sessions.session_service import SessionService
@@ -54,6 +59,7 @@ def _build_service(db_path: Path, project_root: Path) -> SessionService:
             shared_store=shared_store,
             workspace_repo=workspace_repo,
         ),
+        computer_session_repo=ComputerSessionRepository(db_path),
         workspace_service=workspace_service,
     )
 
@@ -90,6 +96,8 @@ def test_delete_session_cleans_workspace_and_role_state(tmp_path: Path) -> None:
         shared_store=shared_store,
         workspace_repo=WorkspaceRepository(db_path),
     )
+
+    computer_session_repo = ComputerSessionRepository(db_path)
 
     _ = task_repo.create(
         TaskEnvelope(
@@ -173,6 +181,17 @@ def test_delete_session_cleans_workspace_and_role_state(tmp_path: Path) -> None:
         )
     )
 
+    _ = computer_session_repo.upsert_session(
+        ComputerSessionRecord(
+            computer_session_id="computer-session-1",
+            session_id="session-1",
+            run_id="run-1",
+            task_id="task-1",
+            instance_id="inst-1",
+            role_id="time",
+        )
+    )
+
     session_dir = workspace_manager.session_artifact_dir(
         workspace_id=session.workspace_id,
         session_id="session-1",
@@ -229,6 +248,7 @@ def test_delete_session_cleans_workspace_and_role_state(tmp_path: Path) -> None:
         == ()
     )
     assert not session_dir.exists()
+    assert computer_session_repo.get_session("computer-session-1") is None
     assert project_root.exists()
     with pytest.raises(KeyError):
         SessionRepository(db_path).get("session-1")
