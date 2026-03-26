@@ -158,6 +158,7 @@ function handleAddProfile() {
     document.getElementById('profile-context-window').value = '';
     document.getElementById('profile-connect-timeout').value = '15';
     document.getElementById('profile-ssl-verify').value = '';
+    resetComputerUseFields();
 
     showProfileEditor();
     renderDraftApiKeyField();
@@ -193,6 +194,7 @@ function handleEditProfile(name) {
     document.getElementById('profile-context-window').value = profile.context_window || '';
     document.getElementById('profile-connect-timeout').value = profile.connect_timeout_seconds || 15;
     document.getElementById('profile-ssl-verify').value = serializeTriStateValue(profile.ssl_verify);
+    populateComputerUseFields(profile.computer_use);
 
     showProfileEditor();
     renderDraftApiKeyField();
@@ -228,6 +230,7 @@ async function handleSaveProfile() {
     const contextWindow = contextWindowValue ? parseInt(contextWindowValue) || null : null;
     const connectTimeoutSeconds = parseFloat(document.getElementById('profile-connect-timeout').value) || 15;
     const sslVerify = parseTriStateValue(document.getElementById('profile-ssl-verify').value);
+    const computerUse = readComputerUseConfig();
 
     if (!name) {
         showToast({ title: 'Profile Required', message: 'Profile name is required.', tone: 'warning' });
@@ -266,6 +269,9 @@ async function handleSaveProfile() {
 
     if (apiKey) {
         profile.api_key = apiKey;
+    }
+    if (computerUse !== null) {
+        profile.computer_use = computerUse;
     }
     if (editingProfile) {
         profile.source_name = editingProfile;
@@ -798,6 +804,37 @@ function renderDraftApiKeyToggle() {
     }
 }
 
+function readComputerUseConfig() {
+    const displayWidth = parseInt(document.getElementById('profile-computer-display-width').value, 10) || 1280;
+    const displayHeight = parseInt(document.getElementById('profile-computer-display-height').value, 10) || 800;
+    const environment = String(document.getElementById('profile-computer-environment').value || '').trim() || 'computer';
+    const reasoningSummaryValue = String(
+        document.getElementById('profile-computer-reasoning-summary').value || '',
+    ).trim();
+    const truncation = String(document.getElementById('profile-computer-truncation').value || '').trim() || 'auto';
+
+    return {
+        display_width: displayWidth,
+        display_height: displayHeight,
+        environment: environment,
+        reasoning_summary: reasoningSummaryValue || null,
+        truncation: truncation,
+    };
+}
+
+function populateComputerUseFields(computerUse) {
+    const normalized = computerUse && typeof computerUse === 'object' ? computerUse : {};
+    document.getElementById('profile-computer-display-width').value = normalized.display_width || 1280;
+    document.getElementById('profile-computer-display-height').value = normalized.display_height || 800;
+    document.getElementById('profile-computer-environment').value = normalized.environment || 'computer';
+    document.getElementById('profile-computer-reasoning-summary').value = normalized.reasoning_summary || '';
+    document.getElementById('profile-computer-truncation').value = normalized.truncation || 'auto';
+}
+
+function resetComputerUseFields() {
+    populateComputerUseFields(null);
+}
+
 function parseTriStateValue(value) {
     const normalized = String(value || '').trim().toLowerCase();
     if (normalized === 'true') {
@@ -917,6 +954,9 @@ function findProfileCard(name) {
 function formatProviderLabel(provider) {
     if (provider === 'openai_compatible') {
         return 'OpenAI Compatible';
+    }
+    if (provider === 'openai_responses_computer') {
+        return 'OpenAI Responses Computer';
     }
     if (provider === 'echo') {
         return 'Echo';

@@ -332,7 +332,8 @@ CREATE TABLE IF NOT EXISTS computer_turns (
     active_window_title      TEXT,
     status                   TEXT NOT NULL,
     error_message            TEXT,
-    created_at               TEXT NOT NULL
+    created_at               TEXT NOT NULL,
+    FOREIGN KEY(computer_session_id) REFERENCES computer_sessions(computer_session_id)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_computer_turns_session_step
@@ -343,7 +344,7 @@ CREATE INDEX IF NOT EXISTS idx_computer_turns_session_step_lookup
     ON computer_turns(session_id, step_index ASC);
 ```
 
-Purpose: append-only action log for one computer-use session. Each row stores the model response id, tool call id, serialized action/result payloads, the persisted screenshot artifact reference, and the desktop context observed after the action completed.
+Purpose: append-only action log for one computer-use session. Each row stores the model response id, tool call id, serialized action/result payloads, the persisted screenshot artifact reference, and the desktop context observed after the action completed. Rows are deleted when the owning Agent Teams session is deleted.
 
 `status` values:
 - `completed`
@@ -475,6 +476,7 @@ Primary query keys used by repositories:
 - `session_id`: session-level retrieval across `sessions`, `tasks`, `agent_instances`, `events`, `messages`, `token_usage`.
 - `trace_id` (`run_id`): run-level retrieval across `tasks`, `events`, `messages`, `token_usage`.
 - `task_id`: task-level retrieval and task assignment tracking.
+- `computer_session_id`: computer-use session level retrieval across `computer_sessions` and `computer_turns`.
 - `instance_id`: agent-level retrieval and message history.
 - `trigger_id`: trigger-level retrieval across `triggers`, `trigger_events`.
 - `event_id`: trigger-event level retrieval for audit and replay preparation.

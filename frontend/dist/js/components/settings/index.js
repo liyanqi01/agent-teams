@@ -137,6 +137,7 @@ function createModal() {
                                                 <input type="text" id="profile-provider" list="profile-provider-options" autocomplete="off" spellcheck="false">
                                                 <datalist id="profile-provider-options">
                                                     <option value="openai_compatible"></option>
+                                                    <option value="openai_responses_computer"></option>
                                                 </datalist>
                                             </div>
                                             <div class="form-group form-group-span-2">
@@ -207,6 +208,31 @@ function createModal() {
                                                         <option value="true" data-i18n="settings.proxy.verify">Verify</option>
                                                         <option value="false" data-i18n="settings.proxy.skip_verify">Skip Verify</option>
                                                     </select>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div class="profile-editor-subsection">
+                                            <h5 data-i18n="settings.model.computer_use">Computer Use</h5>
+                                            <div class="form-row">
+                                                <div class="form-group">
+                                                    <label for="profile-computer-display-width" data-i18n="settings.model.computer_display_width">Display Width</label>
+                                                    <input type="number" id="profile-computer-display-width" value="1280" min="1" autocomplete="off">
+                                                </div>
+                                                <div class="form-group">
+                                                    <label for="profile-computer-display-height" data-i18n="settings.model.computer_display_height">Display Height</label>
+                                                    <input type="number" id="profile-computer-display-height" value="800" min="1" autocomplete="off">
+                                                </div>
+                                                <div class="form-group">
+                                                    <label for="profile-computer-environment" data-i18n="settings.model.computer_environment">Environment</label>
+                                                    <input type="text" id="profile-computer-environment" value="computer" placeholder="computer" autocomplete="off">
+                                                </div>
+                                                <div class="form-group">
+                                                    <label for="profile-computer-reasoning-summary" data-i18n="settings.model.computer_reasoning_summary">Reasoning Summary</label>
+                                                    <input type="text" id="profile-computer-reasoning-summary" value="" placeholder="Optional" data-i18n-placeholder="settings.model.optional" autocomplete="off">
+                                                </div>
+                                                <div class="form-group">
+                                                    <label for="profile-computer-truncation" data-i18n="settings.model.computer_truncation">Truncation</label>
+                                                    <input type="text" id="profile-computer-truncation" value="auto" autocomplete="off">
                                                 </div>
                                             </div>
                                         </div>

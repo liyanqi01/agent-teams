@@ -67,6 +67,58 @@ console.log(JSON.stringify({
     assert saved_profile_body["is_default"] is True
     assert saved_profile_body["context_window"] == 128000
 
+    assert saved_profile_body["computer_use"] == {
+        "display_width": 1280,
+        "display_height": 800,
+        "environment": "computer",
+        "reasoning_summary": None,
+        "truncation": "auto",
+    }
+
+
+def test_saving_computer_use_fields_persists_custom_config(tmp_path: Path) -> None:
+    payload = _run_model_profiles_script(
+        tmp_path=tmp_path,
+        runner_source="""
+import { bindModelProfileHandlers } from "./modelProfiles.mjs";
+
+const notifications = [];
+
+const elements = createElements();
+installGlobals(elements, notifications);
+bindModelProfileHandlers();
+
+document.getElementById("add-profile-btn").onclick();
+document.getElementById("profile-name").value = "computer-profile";
+document.getElementById("profile-provider").value = "openai_responses_computer";
+document.getElementById("profile-model").value = "computer-use-preview";
+document.getElementById("profile-base-url").value = "https://api.openai.com/v1";
+document.getElementById("profile-api-key").value = "test-api-key";
+document.getElementById("profile-computer-display-width").value = "1440";
+document.getElementById("profile-computer-display-height").value = "900";
+document.getElementById("profile-computer-environment").value = "desktop";
+document.getElementById("profile-computer-reasoning-summary").value = "concise";
+document.getElementById("profile-computer-truncation").value = "auto";
+
+await document.getElementById("save-profile-btn").onclick();
+
+console.log(JSON.stringify({
+    savedProfile: globalThis.__savedProfile,
+}));
+""".strip(),
+    )
+
+    saved_profile = cast(dict[str, JsonValue], payload["savedProfile"])
+    saved_profile_body = cast(dict[str, JsonValue], saved_profile["profile"])
+    assert saved_profile_body["provider"] == "openai_responses_computer"
+    assert saved_profile_body["computer_use"] == {
+        "display_width": 1440,
+        "display_height": 900,
+        "environment": "desktop",
+        "reasoning_summary": "concise",
+        "truncation": "auto",
+    }
+
 
 def test_draft_probe_updates_inline_status_and_payload(tmp_path: Path) -> None:
     payload = _run_model_profiles_script(
@@ -432,6 +484,40 @@ console.log(JSON.stringify({
     assert payload["defaultChecked"] is True
 
 
+def test_edit_profile_prefills_computer_use_fields(
+    tmp_path: Path,
+) -> None:
+    payload = _run_model_profiles_script(
+        tmp_path=tmp_path,
+        runner_source="""
+import { bindModelProfileHandlers, loadModelProfilesPanel } from "./modelProfiles.mjs";
+
+const notifications = [];
+
+const elements = createElements();
+installGlobals(elements, notifications);
+bindModelProfileHandlers();
+await loadModelProfilesPanel();
+
+document.getElementById("profiles-list").querySelectorAll(".edit-profile-btn")[0].onclick();
+
+console.log(JSON.stringify({
+    displayWidth: document.getElementById("profile-computer-display-width").value,
+    displayHeight: document.getElementById("profile-computer-display-height").value,
+    environment: document.getElementById("profile-computer-environment").value,
+    reasoningSummary: document.getElementById("profile-computer-reasoning-summary").value,
+    truncation: document.getElementById("profile-computer-truncation").value,
+}));
+""".strip(),
+    )
+
+    assert payload["displayWidth"] == 1366
+    assert payload["displayHeight"] == 768
+    assert payload["environment"] == "desktop"
+    assert payload["reasoningSummary"] == "concise"
+    assert payload["truncation"] == "auto"
+
+
 def test_saved_profile_probe_uses_profile_connect_timeout(tmp_path: Path) -> None:
     payload = _run_model_profiles_script(
         tmp_path=tmp_path,
@@ -568,6 +654,13 @@ export async function fetchModelProfiles() {
             max_tokens: 512,
             context_window: 128000,
             connect_timeout_seconds: 15,
+            computer_use: {
+                display_width: 1366,
+                display_height: 768,
+                environment: "desktop",
+                reasoning_summary: "concise",
+                truncation: "auto",
+            },
         },
         "ui-regression-profile": {
             provider: "openai_compatible",
@@ -764,6 +857,11 @@ function createElements() {{
             ["profile-context-window", createElement("block")],
             ["profile-connect-timeout", createElement("block")],
             ["profile-ssl-verify", createElement("block")],
+            ["profile-computer-display-width", createElement("block")],
+            ["profile-computer-display-height", createElement("block")],
+            ["profile-computer-environment", createElement("block")],
+            ["profile-computer-reasoning-summary", createElement("block")],
+            ["profile-computer-truncation", createElement("block")],
         ]);
     }}
 
