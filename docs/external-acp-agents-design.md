@@ -15,7 +15,7 @@ This keeps the role system as the stable product surface while allowing the exec
 
 ## 2. Configuration Model
 
-External agents are stored in `~/.agent-teams/agents.json`.
+External agents are stored in the resolved app config dir `agents.json`, by default `~/.relay-teams/agents.json`.
 
 Each agent record contains:
 
@@ -54,7 +54,7 @@ Rules:
 - runtime resolution reattaches secret values only at execution time
 
 When a usable system keyring backend exists, the secret store uses keyring.
-Otherwise it falls back to `~/.agent-teams/secrets.json`.
+Otherwise it falls back to the resolved app config dir `secrets.json`, by default `~/.relay-teams/secrets.json`.
 
 ## 4. Role Binding
 
@@ -115,9 +115,15 @@ The outbound prompt text is packaged as:
 
 - `Role Prompt`: current `request.system_prompt`
 - `Host Tools`: host-tool usage guidance when Agent Teams exposes local tools to the remote agent
-- `User Prompt`: the current user/task prompt text
+- `User Prompt`: the current user/task prompt text, including any routed `## Skill Candidates` appendix
 
 This keeps the remote ACP session aligned with the active runtime role instructions even when the remote session itself is reused across turns.
+
+Cache-safety constraint:
+
+- routed skill candidates must never be injected into `Role Prompt`
+- objective-dependent skill routing text only appears in `User Prompt`
+- this preserves a stable provider system prompt prefix for the bound role while still surfacing relevant skills per turn
 
 ### 6.2 Host Tool Bridge
 
@@ -133,6 +139,22 @@ Rules:
 - because the stdio payload is prompt-scoped, Agent Teams refreshes the remote ACP session when that context changes between prompts
 
 The exported names are fully namespaced so they do not collide with native tools provided by the external ACP agent itself.
+
+### 6.3 Runtime Model Profile Propagation
+
+Bound external agents still inherit the effective Agent Teams model selection for the current role and session.
+
+Rules:
+
+- Agent Teams resolves the effective `model_profile` using the role setting plus any session-scoped default-model override
+- for OpenCode stdio ACP agents, Agent Teams injects that resolved model through `OPENCODE_CONFIG_CONTENT`, not through `--model`
+- BigModel and other Z.AI-compatible profiles are projected onto OpenCode's built-in `zai` provider with the runtime API key injected through `ZHIPU_API_KEY`, so OpenCode keeps its provider-specific request shaping instead of falling back to a generic OpenAI-compatible transport
+- when a Z.AI-compatible profile does not declare `context_window`, Agent Teams synthesizes a conservative OpenCode `limit.context` so custom injected model entries remain callable
+- other OpenAI-compatible profiles still use an ephemeral custom provider with provider-level `api` and env-backed API key injection, instead of relying on the user's persisted OpenCode default
+- outside the Z.AI special case above, Agent Teams only emits OpenCode `limit` values when both `context` and `output` are available, because ACP startup rejects partial limit objects
+- when the resolved model runtime changes between prompts, Agent Teams recreates the external OpenCode transport instead of reusing the old process
+
+This keeps a bound OpenCode role aligned with the current Agent Teams profile selection, rather than silently falling back to OpenCode's local default model.
 
 ## 7. Direct `@Role` Chat
 

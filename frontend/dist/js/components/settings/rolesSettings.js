@@ -3,15 +3,17 @@
  * Role settings panel bindings.
  */
 import {
+    deleteRoleConfig,
     fetchModelProfiles,
     fetchRoleConfig,
     fetchRoleConfigOptions,
     fetchRoleConfigs,
+    reloadSkillsConfig,
     saveRoleConfig,
     validateRoleConfig,
 } from '../../core/api.js';
 import { parseMarkdown } from '../../utils/markdown.js';
-import { showToast } from '../../utils/feedback.js';
+import { showConfirmDialog, showToast } from '../../utils/feedback.js';
 import { t } from '../../utils/i18n.js';
 import { errorToPayload, logError } from '../../utils/logger.js';
 
@@ -30,13 +32,17 @@ let selectedRoleId = '';
 let selectedSourceRoleId = '';
 let promptPreviewMode = 'edit';
 let currentMemoryProfile = { enabled: true };
+let hasLoadedRoleConfigOptions = false;
 let currentSelections = {
     tools: [],
     mcp_servers: [],
     skills: [],
 };
 let currentBoundAgentId = '';
+let currentExecutionSurface = 'api';
 let languageBound = false;
+let roleActionPromise = null;
+let roleActionRequestId = 0;
 
 export function bindRoleSettingsHandlers() {
     bindActionButton('add-role-btn', handleAddRole);
@@ -64,16 +70,9 @@ export function bindRoleSettingsHandlers() {
 
 export async function loadRoleSettingsPanel(preferredRoleId = '') {
     try {
-        const [summaries, options, modelProfiles] = await Promise.all([
-            fetchRoleConfigs(),
-            fetchRoleConfigOptions(),
-            fetchModelProfiles(),
-        ]);
-        roleSummaries = Array.isArray(summaries) ? summaries : [];
-        roleConfigOptions = normalizeRoleConfigOptions(options);
-        const normalizedModelProfiles = normalizeModelProfiles(modelProfiles);
-        availableModelProfiles = normalizedModelProfiles.names;
-        defaultModelProfileName = normalizedModelProfiles.defaultName;
+        const summaries = await fetchRoleConfigs();
+        await refreshRoleSettingsDependencies();
+        roleSummaries = Array.isArray(summaries) ? summaries.map(normalizeRoleSummary) : [];
         renderRolesList();
         if (roleSummaries.length === 0) {
             showRolesList();
@@ -103,13 +102,30 @@ function bindActionButton(id, handler) {
     }
 }
 
+function normalizeRoleSummary(role) {
+    return {
+        role_id: String(role?.role_id || '').trim(),
+        name: String(role?.name || '').trim(),
+        description: String(role?.description || '').trim(),
+        version: String(role?.version || '').trim(),
+        model_profile: String(role?.model_profile || 'default').trim() || 'default',
+        bound_agent_id: role?.bound_agent_id == null ? null : String(role.bound_agent_id).trim(),
+        execution_surface: String(role?.execution_surface || 'api').trim() || 'api',
+        source: String(role?.source || '').trim(),
+        deletable: role?.deletable === true,
+    };
+}
+
 function normalizeRoleConfigOptions(options) {
     return {
         coordinator_role_id: String(options?.coordinator_role_id || '').trim(),
         main_agent_role_id: String(options?.main_agent_role_id || '').trim(),
-        tools: Array.isArray(options?.tools) ? options.tools : [],
-        mcp_servers: Array.isArray(options?.mcp_servers) ? options.mcp_servers : [],
-        skills: Array.isArray(options?.skills) ? options.skills : [],
+        tools: normalizeOptionNames(options?.tools),
+        mcp_servers: normalizeOptionNames(options?.mcp_servers),
+        skills: normalizeSkillOptions(options?.skills),
+        execution_surfaces: normalizeOptionNames(
+            options?.execution_surfaces || ['api', 'browser', 'desktop', 'hybrid'],
+        ),
         agents: Array.isArray(options?.agents) ? options.agents.map(agent => ({
             agent_id: String(agent?.agent_id || '').trim(),
             name: String(agent?.name || '').trim(),
@@ -146,6 +162,119 @@ function normalizeModelProfiles(modelProfiles) {
     };
 }
 
+function normalizeOptionNames(values) {
+    if (!Array.isArray(values)) {
+        return [];
+    }
+    return values
+        .map(normalizeOptionName)
+        .filter(value => Boolean(value));
+}
+
+function normalizeOptionName(value) {
+    if (typeof value === 'string') {
+        return value.trim();
+    }
+    if (typeof value?.name === 'string') {
+        return value.name.trim();
+    }
+    return '';
+}
+
+function normalizeSkillOptions(values) {
+    if (!Array.isArray(values)) {
+        return [];
+    }
+    return values
+        .map(normalizeSkillOption)
+        .filter(option => option !== null)
+        .sort(compareSkillOptions);
+}
+
+function normalizeSkillOption(value) {
+    if (typeof value === 'string') {
+        const parsed = parseSkillRef(value);
+        const ref = value.trim();
+        if (!ref) {
+            return null;
+        }
+        return {
+            ref,
+            name: parsed ? parsed.name : ref,
+            description: '',
+            scope: parsed ? parsed.scope : '',
+        };
+    }
+    const ref = typeof value?.ref === 'string' ? value.ref.trim() : '';
+    const name = typeof value?.name === 'string' ? value.name.trim() : '';
+    if (!ref || !name) {
+        return null;
+    }
+    return {
+        ref,
+        name,
+        description: typeof value?.description === 'string' ? value.description.trim() : '',
+        scope: typeof value?.scope === 'string' ? value.scope.trim().toLowerCase() : '',
+    };
+}
+
+function normalizeSkillSelections(values) {
+    if (!Array.isArray(values)) {
+        return [];
+    }
+    return values
+        .map(value => {
+            if (typeof value === 'string') {
+                return value.trim();
+            }
+            if (typeof value?.ref === 'string') {
+                return value.ref.trim();
+            }
+            return '';
+        })
+        .filter(value => Boolean(value));
+}
+
+function compareSkillOptions(left, right) {
+    const leftName = String(left?.name || '');
+    const rightName = String(right?.name || '');
+    if (leftName !== rightName) {
+        return leftName.localeCompare(rightName);
+    }
+    const leftPriority = left?.scope === 'app' ? 0 : 1;
+    const rightPriority = right?.scope === 'app' ? 0 : 1;
+    if (leftPriority !== rightPriority) {
+        return leftPriority - rightPriority;
+    }
+    return String(left?.ref || '').localeCompare(String(right?.ref || ''));
+}
+
+function parseSkillRef(value) {
+    const normalized = String(value || '').trim();
+    const delimiterIndex = normalized.indexOf(':');
+    if (delimiterIndex <= 0 || delimiterIndex >= normalized.length - 1) {
+        return null;
+    }
+    const scope = normalized.slice(0, delimiterIndex).trim().toLowerCase();
+    const name = normalized.slice(delimiterIndex + 1).trim();
+    if (!name || (scope !== 'app' && scope !== 'builtin')) {
+        return null;
+    }
+    return { scope, name };
+}
+
+function formatSkillOptionLabel(option) {
+    const name = String(option?.name || '').trim();
+    const scope = String(option?.scope || '').trim().toUpperCase();
+    const duplicateCount = roleConfigOptions.skills.filter(
+        candidate => String(candidate?.name || '').trim() === name,
+    ).length;
+    if (!scope || duplicateCount <= 1) {
+        return name;
+    }
+    return `${name} · ${scope}`;
+}
+
 function renderRolesList() {
     const listEl = document.getElementById('roles-list');
     if (!listEl) return;
@@ -169,12 +298,16 @@ function renderRolesList() {
                     <div class="role-record-meta">
                         <span>v${escapeHtml(role.version)}</span>
                         <span>${escapeHtml(role.model_profile)}</span>
+                        <span>${escapeHtml(role.execution_surface || 'api')}</span>
                         ${renderRoleBoundAgentMeta(role.bound_agent_id)}
                         ${renderRoleUsageMeta(role.role_id)}
                     </div>
                 </div>
                 <div class="role-record-actions">
                     <button class="settings-inline-action settings-list-action role-record-edit-btn" data-role-id="${escapeHtml(role.role_id)}" type="button">${escapeHtml(t('settings.roles.edit'))}</button>
+                    ${role.deletable === true
+            ? `<button class="settings-inline-action settings-list-action role-record-delete-btn" data-role-id="${escapeHtml(role.role_id)}" type="button">${escapeHtml(t('settings.action.delete'))}</button>`
+            : ''}
                 </div>
             </div>
         `)
@@ -183,18 +316,26 @@ function renderRolesList() {
     `;
 
     listEl.querySelectorAll('.role-record').forEach(button => {
-        button.onclick = () => {
+        button.onclick = async () => {
             const nextRoleId = String(button.dataset.roleId || '').trim();
             if (!nextRoleId) return;
-            void loadRoleDocument(nextRoleId);
+            await loadRoleDocument(nextRoleId);
         };
     });
     listEl.querySelectorAll('.role-record-edit-btn').forEach(button => {
-        button.onclick = event => {
+        button.onclick = async event => {
             event.stopPropagation();
             const nextRoleId = String(button.dataset.roleId || '').trim();
             if (!nextRoleId) return;
-            void loadRoleDocument(nextRoleId);
+            await loadRoleDocument(nextRoleId);
+        };
+    });
+    listEl.querySelectorAll('.role-record-delete-btn').forEach(button => {
+        button.onclick = async event => {
+            event.stopPropagation();
+            const nextRoleId = String(button.dataset.roleId || '').trim();
+            if (!nextRoleId) return;
+            await handleDeleteRole(nextRoleId);
         };
     });
 }
@@ -202,7 +343,10 @@ function renderRolesList() {
 async function loadRoleDocument(roleId) {
     selectedRoleId = roleId;
     renderRolesList();
-    const record = await fetchRoleConfig(roleId);
+    const [record] = await Promise.all([
+        fetchRoleConfig(roleId),
+        refreshRoleSettingsDependencies(),
+    ]);
     selectedRoleId = record.role_id;
     selectedSourceRoleId = record.source_role_id || record.role_id;
     applyRoleRecord(record);
@@ -220,10 +364,11 @@ function applyRoleRecord(record) {
 
     currentMemoryProfile = normalizeMemoryProfile(record.memory_profile);
     currentBoundAgentId = String(record.bound_agent_id || '').trim();
+    currentExecutionSurface = String(record.execution_surface || 'api').trim() || 'api';
     currentSelections = {
-        tools: Array.isArray(record.tools) ? [...record.tools] : [],
-        mcp_servers: Array.isArray(record.mcp_servers) ? [...record.mcp_servers] : [],
-        skills: Array.isArray(record.skills) ? [...record.skills] : [],
+        tools: normalizeOptionNames(record.tools),
+        mcp_servers: normalizeOptionNames(record.mcp_servers),
+        skills: normalizeSkillSelections(record.skills),
     };
 
     setInputValue('role-id-input', record.role_id || '');
@@ -232,6 +377,7 @@ function applyRoleRecord(record) {
     setInputValue('role-version-input', record.version || '');
     renderModelProfileSelect(record.model_profile || 'default');
     renderBoundAgentSelect(currentBoundAgentId);
+    renderExecutionSurfaceSelect(currentExecutionSurface);
     renderRoleOptionPickers();
     renderMemoryProfileSelects(currentMemoryProfile);
     setInputValue('role-system-prompt-input', record.system_prompt || '');
@@ -306,10 +452,46 @@ function renderOptionPicker(containerId, availableValues, selectedValues, emptyM
     });
 }
 
+function renderSkillOptionPicker(selectedValues, emptyMessage) {
+    const container = document.getElementById('role-skills-picker');
+    if (!container) return;
+
+    const selectedSet = new Set(Array.isArray(selectedValues) ? selectedValues : []);
+    const availableList = Array.isArray(roleConfigOptions.skills) ? roleConfigOptions.skills : [];
+    const availableRefs = new Set(availableList.map(option => option.ref));
+    const invalidValues = Array.from(selectedSet).filter(value => !availableRefs.has(value));
+
+    if (availableList.length === 0 && invalidValues.length === 0) {
+        container.innerHTML = `<div class="role-option-empty">${escapeHtml(emptyMessage)}</div>`;
+        return;
+    }
+
+    container.innerHTML = [
+        ...availableList.map(option => `
+            <label class="role-option-item">
+                <input type="checkbox" data-option-value="${escapeHtml(option.ref)}"${selectedSet.has(option.ref) ? ' checked' : ''}>
+                <span class="role-option-check" aria-hidden="true"></span>
+                <span class="role-option-label">${escapeHtml(formatSkillOptionLabel(option))}</span>
+            </label>
+        `),
+        ...invalidValues.map(value => `
+            <label class="role-option-item role-option-item-invalid">
+                <input type="checkbox" data-option-value="${escapeHtml(value)}" checked>
+                <span class="role-option-check" aria-hidden="true"></span>
+                <span class="role-option-label">${escapeHtml(value)} <em>Unavailable</em></span>
+            </label>
+        `),
+    ].join('');
+
+    container.querySelectorAll('input[type="checkbox"]').forEach(input => {
+        input.onchange = () => syncOptionSelection('role-skills-picker');
+    });
+}
+
 function renderRoleOptionPickers() {
     renderOptionPicker('role-tools-picker', roleConfigOptions.tools, currentSelections.tools, t('settings.roles.no_tools'));
     renderOptionPicker('role-mcp-picker', roleConfigOptions.mcp_servers, currentSelections.mcp_servers, t('settings.roles.no_mcp'));
-    renderOptionPicker('role-skills-picker', roleConfigOptions.skills, currentSelections.skills, t('settings.roles.no_skills'));
+    renderSkillOptionPicker(currentSelections.skills, t('settings.roles.no_skills'));
     renderSkillsShellAdvisory();
 }
 
@@ -348,22 +530,73 @@ function renderBoundAgentSelect(selectedAgentId) {
     };
 }
 
+function renderExecutionSurfaceSelect(selectedSurface) {
+    const selectEl = document.getElementById('role-execution-surface-input');
+    if (!selectEl) return;
+
+    const safeSelectedSurface = String(selectedSurface || '').trim() || 'api';
+    const availableSurfaces = Array.isArray(roleConfigOptions.execution_surfaces)
+        ? roleConfigOptions.execution_surfaces
+        : ['api', 'browser', 'desktop', 'hybrid'];
+    const options = availableSurfaces.includes(safeSelectedSurface)
+        ? availableSurfaces
+        : [...availableSurfaces, safeSelectedSurface];
+    selectEl.innerHTML = options.map(surface => {
+        const selected = surface === safeSelectedSurface ? ' selected' : '';
+        return `<option value="${escapeHtml(surface)}"${selected}>${escapeHtml(surface)}</option>`;
+    }).join('');
+    selectEl.onchange = event => {
+        currentExecutionSurface = String(event?.target?.value || '').trim() || 'api';
+    };
+}
+
 function renderSkillsShellAdvisory() {
     const container = document.getElementById('role-skills-picker');
     if (!container) return;
-    const hasSkills = Array.isArray(currentSelections.skills) && currentSelections.skills.length > 0;
-    const hasShell = Array.isArray(currentSelections.tools) && currentSelections.tools.includes('shell');
-    if (!hasSkills || hasShell) {
-        return;
-    }
-    container.innerHTML += `
+    const advisoryHtml = `
         <div class="role-option-empty role-option-advisory">${escapeHtml(t('settings.roles.skills_shell_advisory'))}</div>
     `;
+    const existingAdvisory = typeof container.querySelector === 'function'
+        ? container.querySelector('.role-option-advisory')
+        : null;
+    if (existingAdvisory) {
+        if (typeof existingAdvisory.remove === 'function') {
+            existingAdvisory.remove();
+        } else if (existingAdvisory.parentNode && typeof existingAdvisory.parentNode.removeChild === 'function') {
+            existingAdvisory.parentNode.removeChild(existingAdvisory);
+        }
+    }
+    const hasSkills = Array.isArray(currentSelections.skills) && currentSelections.skills.length > 0;
+    const hasExecCommand = Array.isArray(currentSelections.tools)
+        && (
+            currentSelections.tools.includes('shell')
+            || currentSelections.tools.includes('shell')
+        );
+    if (!hasSkills || hasExecCommand) {
+        return;
+    }
+    container.insertAdjacentHTML('beforeend', advisoryHtml);
+}
+
+function pickerHasInvalidOptions(container) {
+    return typeof container?.innerHTML === 'string'
+        && container.innerHTML.includes('role-option-item-invalid');
+}
+
+function refreshOptionPicker(containerId) {
+    if (containerId === 'role-tools-picker') {
+        renderOptionPicker('role-tools-picker', roleConfigOptions.tools, currentSelections.tools, t('settings.roles.no_tools'));
+        return;
+    }
+    if (containerId === 'role-skills-picker') {
+        renderSkillOptionPicker(currentSelections.skills, t('settings.roles.no_skills'));
+    }
 }
 
 function syncOptionSelection(containerId) {
     const container = document.getElementById(containerId);
     if (!container) return;
+    const shouldRefreshPicker = pickerHasInvalidOptions(container);
     const nextValues = [];
     container.querySelectorAll('input[type="checkbox"]').forEach(input => {
         if (input.checked) {
@@ -377,8 +610,11 @@ function syncOptionSelection(containerId) {
     } else if (containerId === 'role-skills-picker') {
         currentSelections.skills = nextValues;
     }
+    if (shouldRefreshPicker) {
+        refreshOptionPicker(containerId);
+    }
     if (containerId === 'role-tools-picker' || containerId === 'role-skills-picker') {
-        renderRoleOptionPickers();
+        renderSkillsShellAdvisory();
     }
 }
 
@@ -479,6 +715,7 @@ function handleAddRole() {
         skills: [],
         model_profile: 'default',
         bound_agent_id: null,
+        execution_surface: 'api',
         memory_profile: { enabled: true },
         system_prompt: '',
         file_name: '',
@@ -491,43 +728,102 @@ function handleAddRole() {
 }
 
 async function handleValidateRole() {
-    try {
-        const draft = buildDraftFromForm();
-        const result = await validateRoleConfig(draft);
-        renderRoleStatus(t('settings.roles.validated_message'), 'success');
-        showToast({
-            title: t('settings.roles.validated'),
-            message: t('settings.roles.validated_toast').replace('{role_id}', result.role.role_id),
-            tone: 'success',
-        });
-    } catch (error) {
-        renderRoleStatus(error.message || t('settings.roles.validation_failed_message'), 'danger');
-        showToast({
-            title: t('settings.roles.validation_failed'),
-            message: error.message || t('settings.roles.validation_failed_toast'),
-            tone: 'danger',
-        });
-    }
+    return runRoleEditorAction(async requestId => {
+        try {
+            await refreshRoleSettingsDependencies();
+            const draft = buildDraftFromForm();
+            const result = await performRoleRequestWithBuiltinSkillRecovery(
+                () => validateRoleConfig(draft),
+            );
+            if (!isCurrentRoleActionRequest(requestId)) {
+                return;
+            }
+            renderRoleStatus(t('settings.roles.validated_message'), 'success');
+            showToast({
+                title: t('settings.roles.validated'),
+                message: t('settings.roles.validated_toast').replace('{role_id}', result.role.role_id),
+                tone: 'success',
+            });
+        } catch (error) {
+            if (!isCurrentRoleActionRequest(requestId)) {
+                return;
+            }
+            renderRoleStatus(error.message || t('settings.roles.validation_failed_message'), 'danger');
+            showToast({
+                title: t('settings.roles.validation_failed'),
+                message: error.message || t('settings.roles.validation_failed_toast'),
+                tone: 'danger',
+            });
+        }
+    });
 }
 
 async function handleSaveRole() {
+    return runRoleEditorAction(async requestId => {
+        try {
+            await refreshRoleSettingsDependencies();
+            const draft = buildDraftFromForm();
+            const saved = await performRoleRequestWithBuiltinSkillRecovery(
+                () => saveRoleConfig(draft.role_id, draft),
+            );
+            if (!isCurrentRoleActionRequest(requestId)) {
+                return;
+            }
+            selectedRoleId = saved.role_id;
+            selectedSourceRoleId = saved.role_id;
+            await loadRoleSettingsPanel(saved.role_id);
+            if (!isCurrentRoleActionRequest(requestId)) {
+                return;
+            }
+            renderRoleStatus(t('settings.roles.saved_message'), 'success');
+            showToast({
+                title: t('settings.roles.saved'),
+                message: t('settings.roles.saved_toast').replace('{role_id}', saved.role_id),
+                tone: 'success',
+            });
+        } catch (error) {
+            if (!isCurrentRoleActionRequest(requestId)) {
+                return;
+            }
+            renderRoleStatus(error.message || t('settings.roles.save_failed_message'), 'danger');
+            showToast({
+                title: t('settings.roles.save_failed'),
+                message: error.message || t('settings.roles.save_failed_toast'),
+                tone: 'danger',
+            });
+        }
+    });
+}
+
+async function handleDeleteRole(roleId) {
+    const summary = roleSummaries.find(role => role.role_id === roleId) || null;
+    const roleLabel = summary?.name || roleId;
+    const confirmed = await showConfirmDialog({
+        title: t('settings.roles.delete_confirm_title'),
+        message: t('settings.roles.delete_confirm_message').replace('{name}', roleLabel),
+        tone: 'warning',
+        confirmLabel: t('settings.action.delete'),
+        cancelLabel: t('settings.action.cancel'),
+    });
+    if (!confirmed) {
+        return;
+    }
     try {
-        const draft = buildDraftFromForm();
-        const saved = await saveRoleConfig(draft.role_id, draft);
-        selectedRoleId = saved.role_id;
-        selectedSourceRoleId = saved.role_id;
+        await deleteRoleConfig(roleId);
+        if (selectedRoleId === roleId || selectedSourceRoleId === roleId) {
+            selectedRoleId = '';
+            selectedSourceRoleId = '';
+        }
         showToast({
-            title: t('settings.roles.saved'),
-            message: t('settings.roles.saved_toast').replace('{role_id}', saved.role_id),
+            title: t('settings.roles.deleted'),
+            message: t('settings.roles.deleted_message').replace('{role_id}', roleId),
             tone: 'success',
         });
-        await loadRoleSettingsPanel(saved.role_id);
-        renderRoleStatus(t('settings.roles.saved_message'), 'success');
+        await loadRoleSettingsPanel();
     } catch (error) {
-        renderRoleStatus(error.message || t('settings.roles.save_failed_message'), 'danger');
         showToast({
-            title: t('settings.roles.save_failed'),
-            message: error.message || t('settings.roles.save_failed_toast'),
+            title: t('settings.roles.delete_failed'),
+            message: error.message || t('settings.roles.delete_failed_message'),
             tone: 'danger',
         });
     }
@@ -551,6 +847,8 @@ function buildDraftFromForm() {
     const selectedModelProfile = resolveSelectedModelProfile();
     const selectedBoundAgentId = String(getInputValue('role-bound-agent-input')).trim();
     currentBoundAgentId = selectedBoundAgentId;
+    const selectedExecutionSurface = String(getInputValue('role-execution-surface-input')).trim() || 'api';
+    currentExecutionSurface = selectedExecutionSurface;
     const memoryProfile = {
         ...(currentMemoryProfile || {}),
         enabled: getBooleanSelectValue('role-memory-enabled-input', true),
@@ -564,12 +862,127 @@ function buildDraftFromForm() {
         version: String(getInputValue('role-version-input')).trim(),
         model_profile: selectedModelProfile,
         bound_agent_id: selectedBoundAgentId || null,
+        execution_surface: selectedExecutionSurface,
         tools: [...currentSelections.tools],
         mcp_servers: [...currentSelections.mcp_servers],
         skills: [...currentSelections.skills],
         memory_profile: memoryProfile,
         system_prompt: systemPrompt,
     };
+}
+
+async function refreshRoleSettingsDependencies({ applyEditorState = false } = {}) {
+    const selectedModelProfile = resolveSelectedModelProfile();
+    const selectedBoundAgentId = currentBoundAgentId || String(getInputValue('role-bound-agent-input')).trim();
+    const selectedExecutionSurface = String(getInputValue('role-execution-surface-input')).trim()
+        || currentExecutionSurface
+        || 'api';
+    let roleOptionsReady = hasLoadedRoleConfigOptions;
+    let usedCachedRoleOptions = false;
+    const [optionsResult, modelProfilesResult] = await Promise.allSettled([
+        fetchRoleConfigOptions(),
+        fetchModelProfiles(),
+    ]);
+    if (optionsResult.status === 'fulfilled') {
+        roleConfigOptions = normalizeRoleConfigOptions(optionsResult.value);
+        hasLoadedRoleConfigOptions = true;
+        roleOptionsReady = true;
+    } else {
+        if (!hasLoadedRoleConfigOptions) {
+            roleConfigOptions = normalizeRoleConfigOptions(null);
+            roleOptionsReady = false;
+        } else {
+            usedCachedRoleOptions = true;
+        }
+        logError(
+            'frontend.roles_settings.dependencies.role_options_failed',
+            'Failed to load role options',
+            errorToPayload(optionsResult.reason),
+        );
+    }
+    if (modelProfilesResult.status === 'fulfilled') {
+        const normalizedModelProfiles = normalizeModelProfiles(modelProfilesResult.value);
+        availableModelProfiles = normalizedModelProfiles.names;
+        defaultModelProfileName = normalizedModelProfiles.defaultName;
+    } else {
+        availableModelProfiles = [];
+        defaultModelProfileName = '';
+        logError(
+            'frontend.roles_settings.dependencies.model_profiles_failed',
+            'Failed to load model profiles',
+            errorToPayload(modelProfilesResult.reason),
+        );
+    }
+    const dependencyState = {
+        roleOptionsReady,
+        usedCachedRoleOptions,
+        modelProfilesReady: modelProfilesResult.status === 'fulfilled',
+    };
+    if (!applyEditorState) {
+        return dependencyState;
+    }
+    renderModelProfileSelect(selectedModelProfile);
+    renderBoundAgentSelect(selectedBoundAgentId);
+    currentExecutionSurface = selectedExecutionSurface;
+    renderExecutionSurfaceSelect(selectedExecutionSurface);
+    renderRoleOptionPickers();
+    return dependencyState;
+}
+
+function runRoleEditorAction(action) {
+    if (roleActionPromise) {
+        return roleActionPromise;
+    }
+    const requestId = ++roleActionRequestId;
+    setRoleEditorActionBusy(true);
+    roleActionPromise = (async () => {
+        try {
+            return await action(requestId);
+        } finally {
+            if (roleActionRequestId === requestId) {
+                roleActionPromise = null;
+                setRoleEditorActionBusy(false);
+            }
+        }
+    })();
+    return roleActionPromise;
+}
+
+function isCurrentRoleActionRequest(requestId) {
+    return roleActionRequestId === requestId;
+}
+
+function setRoleEditorActionBusy(isBusy) {
+    [
+        'add-role-btn',
+        'save-role-btn',
+        'validate-role-btn',
+        'cancel-role-btn',
+    ].forEach(id => {
+        const button = document.getElementById(id);
+        if (button) {
+            button.disabled = isBusy;
+            button.dataset.busy = isBusy ? 'true' : 'false';
+        }
+    });
+}
+
+async function performRoleRequestWithBuiltinSkillRecovery(request) {
+    try {
+        return await request();
+    } catch (error) {
+        if (!shouldRetryBuiltinSkillRecovery(error)) {
+            throw error;
+        }
+        await reloadSkillsConfig();
+        await refreshRoleSettingsDependencies();
+        return request();
+    }
+}
+
+function shouldRetryBuiltinSkillRecovery(error) {
+    const message = String(error?.message || '').trim();
+    return message.includes('Unknown skills:') && /builtin:[\w-]+/.test(message);
 }
 
 function setPromptPreviewMode(mode) {
@@ -708,8 +1121,13 @@ function formatDefaultProfileOptionLabel() {
 
 function isReservedSystemRoleId(roleId) {
     const safeRoleId = String(roleId || '').trim();
-    return safeRoleId === String(roleConfigOptions.coordinator_role_id || '').trim()
-        || safeRoleId === String(roleConfigOptions.main_agent_role_id || '').trim();
+    if (!safeRoleId) {
+        return false;
+    }
+    const coordinatorRoleId = String(roleConfigOptions.coordinator_role_id || '').trim();
+    const mainAgentRoleId = String(roleConfigOptions.main_agent_role_id || '').trim();
+    return (coordinatorRoleId !== '' && safeRoleId === coordinatorRoleId)
+        || (mainAgentRoleId !== '' && safeRoleId === mainAgentRoleId);
 }
 
 function renderRoleUsageChips(roleId) {

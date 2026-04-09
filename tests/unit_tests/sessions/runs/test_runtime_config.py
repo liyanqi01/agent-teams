@@ -6,8 +6,10 @@ from pathlib import Path
 
 import pytest
 
-from agent_teams.providers.model_config import DEFAULT_LLM_CONNECT_TIMEOUT_SECONDS
-from agent_teams.sessions.runs import runtime_config
+from relay_teams.providers.model_header_utils import model_header_secret_field_name
+from relay_teams.providers.model_config import DEFAULT_LLM_CONNECT_TIMEOUT_SECONDS
+from relay_teams.secrets import get_secret_store
+from relay_teams.sessions.runs import runtime_config
 
 
 def test_load_runtime_config_uses_project_config_dir_by_default(
@@ -36,7 +38,7 @@ def test_load_runtime_config_uses_project_config_dir_by_default(
     assert resolved.paths.config_dir == config_dir.resolve()
     assert resolved.paths.env_file == (config_dir / ".env").resolve()
     assert resolved.paths.roles_dir == (config_dir / "roles")
-    assert resolved.paths.db_path == (config_dir / "agent_teams.db")
+    assert resolved.paths.db_path == (config_dir / "relay_teams.db")
     assert resolved.paths.prompts_file == (config_dir / "prompts.json").resolve()
     assert resolved.llm_retry.max_retries == 5
     assert resolved.llm_retry.initial_delay_ms == 2000
@@ -131,6 +133,7 @@ def test_load_llm_configs_error_mentions_model_file_only(tmp_path: Path) -> None
     with pytest.raises(FileNotFoundError) as exc_info:
         runtime_config.load_llm_configs(tmp_path, {})
 
+    assert f'"{tmp_path / "model.json"}"' in str(exc_info.value)
     assert "Please create model.json with at least one profile." in str(exc_info.value)
 
 
@@ -163,7 +166,7 @@ def test_load_llm_configs_reads_bigmodel_provider_field(tmp_path: Path) -> None:
                 "default": {
                     "provider": "bigmodel",
                     "model": "glm-4.5",
-                    "base_url": "https://open.bigmodel.cn/api/paas/v4",
+                    "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
                     "api_key": "plain-text-key",
                 }
             }
@@ -332,6 +335,29 @@ def test_load_llm_configs_reads_context_window(tmp_path: Path) -> None:
     assert profiles["default"].context_window == 128000
 
 
+def test_load_llm_configs_infers_known_context_window_when_missing(
+    tmp_path: Path,
+) -> None:
+    model_file = tmp_path / "model.json"
+    model_file.write_text(
+        json.dumps(
+            {
+                "default": {
+                    "provider": "openai_compatible",
+                    "model": "gpt-4.1",
+                    "base_url": "https://example.test/v1",
+                    "api_key": "plain-text-key",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    profiles = runtime_config.load_llm_configs(tmp_path, {})
+
+    assert profiles["default"].context_window == 1000000
+
+
 def test_load_llm_configs_resolves_api_key_env_placeholder(tmp_path: Path) -> None:
     model_file = tmp_path / "model.json"
     model_file.write_text(
@@ -379,3 +405,65 @@ def test_load_llm_configs_errors_when_api_key_env_placeholder_is_missing(
         "environment variable 'OPENAI_API_KEY' referenced by api_key is not set"
         in str(exc_info.value)
     )
+
+
+def test_load_llm_configs_allows_header_only_profiles(tmp_path: Path) -> None:
+    model_file = tmp_path / "model.json"
+    model_file.write_text(
+        json.dumps(
+            {
+                "default": {
+                    "model": "gpt-4o-mini",
+                    "base_url": "https://example.test/v1",
+                    "headers": [
+                        {
+                            "name": "Authorization",
+                            "value": "Bearer header-only",
+                        }
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    profiles = runtime_config.load_llm_configs(tmp_path, {})
+
+    assert profiles["default"].api_key is None
+    assert profiles["default"].headers[0].name == "Authorization"
+    assert profiles["default"].headers[0].value == "Bearer header-only"
+
+
+def test_load_llm_configs_resolves_secret_headers_from_secret_store(
+    tmp_path: Path,
+) -> None:
+    model_file = tmp_path / "model.json"
+    model_file.write_text(
+        json.dumps(
+            {
+                "default": {
+                    "model": "gpt-4o-mini",
+                    "base_url": "https://example.test/v1",
+                    "headers": [
+                        {
+                            "name": "Authorization",
+                            "secret": True,
+                            "configured": False,
+                        }
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    get_secret_store().set_secret(
+        tmp_path,
+        namespace="model_profile",
+        owner_id="default",
+        field_name=model_header_secret_field_name("Authorization"),
+        value="Bearer stored-secret",
+    )
+
+    profiles = runtime_config.load_llm_configs(tmp_path, {})
+
+    assert profiles["default"].headers[0].value == "Bearer stored-secret"

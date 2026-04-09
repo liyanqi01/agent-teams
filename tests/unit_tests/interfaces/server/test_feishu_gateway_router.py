@@ -5,18 +5,18 @@ from datetime import UTC, datetime
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from agent_teams.gateway.feishu import (
+from relay_teams.gateway.feishu import (
     FeishuAccountNameConflictError,
     FeishuGatewayAccountCreateInput,
     FeishuGatewayAccountRecord,
     FeishuGatewayAccountStatus,
     FeishuGatewayAccountUpdateInput,
 )
-from agent_teams.interfaces.server.deps import (
+from relay_teams.interfaces.server.deps import (
     get_feishu_gateway_service,
     get_feishu_subscription_service,
 )
-from agent_teams.interfaces.server.routers import feishu_gateway
+from relay_teams.interfaces.server.routers import feishu_gateway
 
 
 class _FakeFeishuGatewayService:
@@ -72,6 +72,8 @@ class _FakeFeishuGatewayService:
         account_id: str,
         enabled: bool,
     ) -> FeishuGatewayAccountRecord:
+        if account_id == "invalid":
+            raise ValueError("Unknown workspace: missing-workspace")
         return self._record().model_copy(
             update={
                 "account_id": account_id,
@@ -125,8 +127,8 @@ def _client(
     app = FastAPI()
     app.include_router(feishu_gateway.router, prefix="/api")
     app.dependency_overrides[get_feishu_gateway_service] = lambda: gateway_service
-    app.dependency_overrides[get_feishu_subscription_service] = (
-        lambda: subscription_service
+    app.dependency_overrides[get_feishu_subscription_service] = lambda: (
+        subscription_service
     )
     return TestClient(app)
 
@@ -169,6 +171,30 @@ def test_create_feishu_account_route_reloads_subscription_service() -> None:
     assert gateway_service.created_payloads[0].name == "feishu_ops"
 
 
+def test_create_feishu_account_route_rejects_none_like_name() -> None:
+    gateway_service = _FakeFeishuGatewayService()
+    subscription_service = _FakeSubscriptionService()
+    client = _client(gateway_service, subscription_service)
+
+    response = client.post(
+        "/api/gateway/feishu/accounts",
+        json={
+            "name": "None",
+            "source_config": {
+                "provider": "feishu",
+                "trigger_rule": "mention_only",
+                "app_id": "cli_demo",
+                "app_name": "Agent Teams Bot",
+            },
+            "target_config": {"workspace_id": "default"},
+            "secret_config": {"app_secret": "secret-demo"},
+        },
+    )
+
+    assert response.status_code == 422
+    assert gateway_service.created_payloads == []
+
+
 def test_update_feishu_account_route_reloads_when_runtime_changes() -> None:
     gateway_service = _FakeFeishuGatewayService()
     subscription_service = _FakeSubscriptionService()
@@ -200,3 +226,26 @@ def test_delete_feishu_account_route_maps_missing_account_to_404() -> None:
 
     assert response.status_code == 404
     assert "Unknown Feishu account" in response.json()["detail"]
+
+
+def test_enable_feishu_account_route_maps_validation_error_to_422() -> None:
+    client = _client(_FakeFeishuGatewayService(), _FakeSubscriptionService())
+
+    response = client.post("/api/gateway/feishu/accounts/invalid:enable")
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Unknown workspace: missing-workspace"
+
+
+def test_update_feishu_account_route_rejects_none_like_path_identifier() -> None:
+    gateway_service = _FakeFeishuGatewayService()
+    subscription_service = _FakeSubscriptionService()
+    client = _client(gateway_service, subscription_service)
+
+    response = client.patch(
+        "/api/gateway/feishu/accounts/None",
+        json={"display_name": "Feishu Ops"},
+    )
+
+    assert response.status_code == 422
+    assert gateway_service.updated_payloads == []

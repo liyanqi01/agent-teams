@@ -1,22 +1,31 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from typing import cast
+
+from pydantic import JsonValue
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from agent_teams.env.proxy_env import ProxyEnvInput
-from agent_teams.external_agents import (
+from relay_teams.env.proxy_env import ProxyEnvInput
+from relay_teams.external_agents import (
     ExternalAgentConfig,
     ExternalAgentSummary,
     ExternalAgentTestResult,
     StdioTransportConfig,
 )
-from agent_teams.env.github_config_models import GitHubConfig
-from agent_teams.env.github_connectivity import GitHubConnectivityProbeRequest
-from agent_teams.env.github_connectivity import GitHubConnectivityProbeResult
-from agent_teams.env.web_config_models import WebConfig, WebProvider
-from agent_teams.env.web_connectivity import WebConnectivityProbeResult
-from agent_teams.interfaces.server.deps import (
+from relay_teams.env.github_config_models import GitHubConfig
+from relay_teams.env.github_connectivity import GitHubConnectivityProbeRequest
+from relay_teams.env.github_connectivity import GitHubConnectivityProbeResult
+from relay_teams.env.web_config_models import (
+    DEFAULT_SEARXNG_INSTANCE_SEEDS,
+    DEFAULT_SEARXNG_INSTANCE_URL,
+    WebConfig,
+    WebFallbackProvider,
+    WebProvider,
+)
+from relay_teams.env.web_connectivity import WebConnectivityProbeResult
+from relay_teams.interfaces.server.deps import (
     get_config_status_service,
     get_environment_variable_service,
     get_external_agent_config_service,
@@ -30,17 +39,17 @@ from agent_teams.interfaces.server.deps import (
     get_ui_language_settings_service,
     get_web_config_service,
 )
-from agent_teams.interfaces.server.ui_language_models import (
+from relay_teams.interfaces.server.ui_language_models import (
     UiLanguage,
     UiLanguageSettings,
 )
-from agent_teams.interfaces.server.routers import system
-from agent_teams.providers.model_connectivity import (
+from relay_teams.interfaces.server.routers import system
+from relay_teams.providers.model_connectivity import (
     ModelConnectivityProbeRequest,
     ModelConnectivityProbeResult,
     ModelDiscoveryResult,
 )
-from agent_teams.providers.model_config import ProviderModelInfo, ProviderType
+from relay_teams.providers.model_config import ProviderModelInfo, ProviderType
 
 
 class _FakeSystemService:
@@ -88,6 +97,7 @@ class _FakeSystemService:
                 "base_url": "https://example.test/v1",
                 "api_key": "secret",
                 "has_api_key": True,
+                "headers": [],
                 "is_default": True,
                 "context_window": 128000,
             }
@@ -131,7 +141,12 @@ class _FakeSystemService:
         self.saved_proxy_config = config.model_dump(mode="json")
 
     def get_web_config(self) -> WebConfig:
-        return WebConfig(provider=WebProvider.EXA, api_key=None)
+        return WebConfig(
+            provider=WebProvider.EXA,
+            exa_api_key=None,
+            fallback_provider=WebFallbackProvider.SEARXNG,
+            searxng_instance_url=DEFAULT_SEARXNG_INSTANCE_URL,
+        )
 
     def list_agents(self) -> tuple[ExternalAgentSummary, ...]:
         return tuple(
@@ -162,7 +177,10 @@ class _FakeSystemService:
         return self.external_agents[agent_id]
 
     def save_web_config(self, config: WebConfig) -> None:
-        self.saved_web_config = config.model_dump(mode="json")
+        self.saved_web_config = config.model_dump(
+            mode="json",
+            exclude={"searxng_instance_seeds"},
+        )
 
     def get_github_config(self) -> GitHubConfig:
         return GitHubConfig(token=None)
@@ -236,7 +254,7 @@ class _FakeSystemService:
                 profile="glm",
                 provider=ProviderType.BIGMODEL,
                 model="glm-4.5",
-                base_url="https://open.bigmodel.cn/api/paas/v4",
+                base_url="https://open.bigmodel.cn/api/coding/paas/v4",
             ),
             ProviderModelInfo(
                 profile="echo",
@@ -355,6 +373,33 @@ def _create_test_client(fake_service: object) -> TestClient:
     app.dependency_overrides[get_github_config_service] = lambda: fake_service
     app.dependency_overrides[get_external_agent_config_service] = lambda: fake_service
     return TestClient(app)
+
+
+def test_health_check_returns_runtime_identity_and_skill_sanity() -> None:
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.get("/api/system/health")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "ok"
+    assert payload["version"] == "0.1.0"
+    assert payload["python_executable"]
+    assert payload["package_root"]
+    assert payload["config_dir"]
+    assert payload["builtin_roles_dir"]
+    assert payload["builtin_skills_dir"]
+    role_registry_sanity = payload["role_registry_sanity"]
+    assert role_registry_sanity["builtin_role_count"] >= 1
+    assert role_registry_sanity["has_builtin_coordinator"] is True
+    assert role_registry_sanity["has_builtin_main_agent"] is True
+    skill_registry_sanity = payload["skill_registry_sanity"]
+    assert skill_registry_sanity["builtin_skill_count"] >= 1
+    assert "builtin:deepresearch" in skill_registry_sanity["builtin_skill_refs"]
+    assert skill_registry_sanity["has_builtin_deepresearch"] is True
+    tool_registry_sanity = payload["tool_registry_sanity"]
+    assert tool_registry_sanity["available_tool_count"] >= 1
+    assert "write" in tool_registry_sanity["available_tool_names"]
 
 
 def test_get_notification_config() -> None:
@@ -629,7 +674,10 @@ def test_get_web_config() -> None:
     assert response.status_code == 200
     assert response.json() == {
         "provider": "exa",
-        "api_key": None,
+        "exa_api_key": None,
+        "fallback_provider": "searxng",
+        "searxng_instance_url": DEFAULT_SEARXNG_INSTANCE_URL,
+        "searxng_instance_seeds": list(DEFAULT_SEARXNG_INSTANCE_SEEDS),
     }
 
 
@@ -671,7 +719,9 @@ def test_save_web_config() -> None:
         "/api/system/configs/web",
         json={
             "provider": "exa",
-            "api_key": "secret",
+            "exa_api_key": "secret",
+            "fallback_provider": "searxng",
+            "searxng_instance_url": "https://search.example.test/",
         },
     )
 
@@ -679,7 +729,49 @@ def test_save_web_config() -> None:
     assert response.json() == {"status": "ok"}
     assert service.saved_web_config == {
         "provider": "exa",
-        "api_key": "secret",
+        "exa_api_key": "secret",
+        "fallback_provider": "searxng",
+        "searxng_instance_url": "https://search.example.test/",
+    }
+
+
+def test_save_web_config_rejects_searxng_primary_provider() -> None:
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.put(
+        "/api/system/configs/web",
+        json={
+            "provider": "searxng",
+            "exa_api_key": None,
+            "fallback_provider": "searxng",
+            "searxng_instance_url": "https://search.example.test/",
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_save_web_config_accepts_disabled_fallback_provider() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.put(
+        "/api/system/configs/web",
+        json={
+            "provider": "exa",
+            "exa_api_key": "secret",
+            "fallback_provider": "disabled",
+            "searxng_instance_url": DEFAULT_SEARXNG_INSTANCE_URL,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert service.saved_web_config == {
+        "provider": "exa",
+        "exa_api_key": "secret",
+        "fallback_provider": "disabled",
+        "searxng_instance_url": DEFAULT_SEARXNG_INSTANCE_URL,
     }
 
 
@@ -851,6 +943,50 @@ def test_save_model_profile_allows_missing_api_key_for_edit() -> None:
     assert source_name is None
 
 
+def test_save_model_profile_omits_max_tokens_when_not_provided() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.put(
+        "/api/system/configs/model/profiles/default",
+        json={
+            "provider": ProviderType.OPENAI_COMPATIBLE.value,
+            "model": "kimi-k2.5",
+            "base_url": "https://api.moonshot.cn/v1",
+            "temperature": 1.0,
+            "top_p": 0.95,
+        },
+    )
+
+    assert response.status_code == 200
+    assert service.saved_model_profile is not None
+    _, saved_profile, _ = service.saved_model_profile
+    assert "max_tokens" not in saved_profile
+
+
+def test_save_model_profile_allows_clearing_max_tokens_with_null() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.put(
+        "/api/system/configs/model/profiles/default",
+        json={
+            "provider": ProviderType.OPENAI_COMPATIBLE.value,
+            "model": "kimi-k2.5",
+            "base_url": "https://api.moonshot.cn/v1",
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "max_tokens": None,
+        },
+    )
+
+    assert response.status_code == 200
+    assert service.saved_model_profile is not None
+    _, saved_profile, _ = service.saved_model_profile
+    assert "max_tokens" in saved_profile
+    assert saved_profile["max_tokens"] is None
+
+
 def test_save_model_profile_accepts_bigmodel_provider() -> None:
     service = _FakeSystemService()
     client = _create_test_client(service)
@@ -860,7 +996,7 @@ def test_save_model_profile_accepts_bigmodel_provider() -> None:
         json={
             "provider": ProviderType.BIGMODEL.value,
             "model": "glm-4.5",
-            "base_url": "https://open.bigmodel.cn/api/paas/v4",
+            "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
             "api_key": "secret",
             "temperature": 0.2,
             "top_p": 0.9,
@@ -945,6 +1081,40 @@ def test_save_model_profile_includes_default_flag_when_present() -> None:
     assert service.saved_model_profile is not None
     _, saved_profile, _ = service.saved_model_profile
     assert saved_profile["is_default"] is True
+
+
+def test_save_model_profile_forwards_headers() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.put(
+        "/api/system/configs/model/profiles/default",
+        json={
+            "provider": ProviderType.OPENAI_COMPATIBLE.value,
+            "model": "claude-proxy",
+            "base_url": "https://example.test/v1",
+            "headers": [
+                {
+                    "name": "Authorization",
+                    "value": "Bearer from-header",
+                    "secret": True,
+                }
+            ],
+            "temperature": 0.2,
+            "top_p": 1.0,
+            "max_tokens": 2048,
+        },
+    )
+
+    assert response.status_code == 200
+    assert service.saved_model_profile is not None
+    _, saved_profile, _ = service.saved_model_profile
+    saved_headers = saved_profile["headers"]
+    assert isinstance(saved_headers, list)
+    first_header = saved_headers[0]
+    assert isinstance(first_header, dict)
+    first_header_payload = first_header
+    assert cast(dict[str, JsonValue], first_header_payload)["name"] == "Authorization"
 
 
 class _FakeEnvironmentVariableService:

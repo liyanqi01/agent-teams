@@ -105,6 +105,83 @@ console.log(JSON.stringify({
     assert payload["sortedFirstProjectTitle"] == "Alpha Project"
 
 
+def test_projects_sidebar_new_session_keeps_session_visibility_collapsed_and_declares_animations(
+    tmp_path: Path,
+) -> None:
+    payload = _run_sidebar_script(
+        tmp_path=tmp_path,
+        runner_source="""
+import {
+    loadProjects,
+    setSelectSessionHandler,
+} from "./sidebar.mjs";
+
+installGlobals(createDomEnvironment());
+setSelectSessionHandler(async (sessionId) => {
+    globalThis.__selectedSessionIds.push(sessionId);
+});
+
+await loadProjects();
+const projectsList = document.getElementById("projects-list");
+const firstProject = projectsList.children.filter(child => child.className === "project-card")[0];
+
+firstProject.querySelector(".project-session-visibility-btn").onclick();
+await flushTasks();
+const expandedProject = projectsList.children.filter(child => child.className === "project-card")[0];
+expandedProject.querySelector(".project-session-visibility-btn").onclick();
+await flushTasks();
+const recollapsedProject = projectsList.children.filter(child => child.className === "project-card")[0];
+const beforeCount = recollapsedProject.querySelectorAll(".session-item").length;
+const beforeVisibilityLabel = recollapsedProject.querySelector(".project-session-visibility-btn").textContent;
+
+recollapsedProject.querySelectorAll(".project-new-session-btn")[0].onclick();
+await flushTasks();
+await flushTasks();
+
+const refreshedProject = projectsList.children.filter(child => child.className === "project-card")[0];
+const afterCount = refreshedProject.querySelectorAll(".session-item").length;
+const afterVisibilityLabel = refreshedProject.querySelector(".project-session-visibility-btn").textContent;
+
+console.log(JSON.stringify({
+    beforeCount,
+    beforeVisibilityLabel,
+    afterCount,
+    afterVisibilityLabel,
+    selectedSessionIds: globalThis.__selectedSessionIds,
+}));
+""".strip(),
+    )
+
+    repo_root = Path(__file__).resolve().parents[3]
+    sidebar_script = (
+        repo_root / "frontend" / "dist" / "js" / "components" / "sidebar.js"
+    ).read_text(encoding="utf-8")
+    components_base_css = (
+        repo_root / "frontend" / "dist" / "css" / "components" / "base.css"
+    ).read_text(encoding="utf-8")
+
+    assert payload["beforeCount"] == 10
+    assert payload["beforeVisibilityLabel"] == "Show all (11)"
+    assert payload["afterCount"] == 10
+    assert payload["afterVisibilityLabel"] == "Show all (12)"
+    assert payload["selectedSessionIds"] == ["session-new-1"]
+    assert (
+        "expandedProjectSessionIds.add(groupKey('workspace', targetWorkspaceId));"
+        not in sidebar_script
+    )
+    assert "let pendingSessionAnimation = null;" in sidebar_script
+    assert "function animateSessionItem(item, animation) {" in sidebar_script
+    assert "setPendingSessionAnimation(data.session_id, 'entering');" in sidebar_script
+    assert "animateSessionItem(sessionItem, 'removing');" in sidebar_script
+    assert "animateSessionItem(button, 'activating');" in sidebar_script
+    assert ".session-item-entering {" in components_base_css
+    assert ".session-item-removing {" in components_base_css
+    assert ".session-item-activating {" in components_base_css
+    assert "@keyframes sessionItemEnter {" in components_base_css
+    assert "@keyframes sessionItemRemove {" in components_base_css
+    assert "@keyframes sessionItemActivate {" in components_base_css
+
+
 def test_projects_sidebar_renames_session_from_sidebar_action(tmp_path: Path) -> None:
     payload = _run_sidebar_script(
         tmp_path=tmp_path,
@@ -289,7 +366,7 @@ globalThis.__showFormDialogResult = {
     cron_expression: "0 9 * * *",
     timezone: "UTC",
     enabled: true,
-    delivery_binding_key: "trg_feishu::tenant-1::oc_123",
+    delivery_binding_key: "trg_feishu::tenant-1::oc_123::session-im-1",
     delivery_event_started: true,
     delivery_event_completed: true,
     delivery_event_failed: true,
@@ -302,7 +379,7 @@ await flushTasks();
 console.log(JSON.stringify({
     createPayload: globalThis.__createAutomationPayload,
     formOptions: globalThis.__showFormDialogCalls[0],
-    runCalls: globalThis.__runAutomationProjectCalls,
+    runCalls: globalThis.__runAutomationProjectCalls || null,
 }));
 """.strip(),
         mock_api_source="""
@@ -415,6 +492,7 @@ export async function runAutomationProject(projectId) {
 
     assert delivery_binding["trigger_id"] == "trg_feishu"
     assert delivery_binding["chat_id"] == "oc_123"
+    assert delivery_binding["session_id"] == "session-im-1"
     assert delivery_events == [
         "started",
         "completed",
@@ -422,7 +500,274 @@ export async function runAutomationProject(projectId) {
     ]
     assert binding_options[1]["label"] == "feishu_main - Release Updates"
     assert binding_options[1]["description"] == "Feishu Main - group"
-    assert payload["runCalls"] == ["aut_created"]
+    assert payload["runCalls"] is None
+
+
+def test_projects_sidebar_aliases_reused_im_session_into_automation_group(
+    tmp_path: Path,
+) -> None:
+    payload = _run_sidebar_script(
+        tmp_path=tmp_path,
+        runner_source="""
+import {
+    loadProjects,
+} from "./sidebar.mjs";
+
+installGlobals(createDomEnvironment());
+
+await loadProjects();
+const projectCards = document.getElementById("projects-list").children.filter(child => String(child.className || "").includes("project-card"));
+const workspaceCard = projectCards.find(child => child.querySelector(".project-title")?.textContent === "Alpha Project");
+const automationCard = projectCards.find(child => child.querySelector(".project-title")?.textContent === "Daily Briefing");
+
+console.log(JSON.stringify({
+    workspaceSessionCount: workspaceCard?.querySelectorAll(".session-item").length || 0,
+    automationSessionCount: automationCard?.querySelectorAll(".session-item").length || 0,
+    automationFirstSessionLabel: automationCard?.querySelectorAll(".session-id")[0]?.textContent || "",
+}));
+""".strip(),
+        mock_api_source="""
+const workspaces = [
+    {
+        workspace_id: "alpha-project",
+        root_path: "/work/Alpha Project",
+        updated_at: "2026-03-14T10:00:00Z",
+        profile: {
+            file_scope: {
+                backend: "project",
+            },
+        },
+    },
+];
+
+const sessions = [
+    {
+        session_id: "session-im-1",
+        workspace_id: "alpha-project",
+        project_kind: "workspace",
+        project_id: "alpha-project",
+        updated_at: "2026-03-14T10:11:00Z",
+        pending_tool_approval_count: 0,
+        metadata: {
+            title: "feishu_main - Release Updates",
+            source_kind: "im",
+        },
+    },
+];
+
+export async function fetchWorkspaces() {
+    return workspaces;
+}
+
+export async function fetchSessions() {
+    return sessions;
+}
+
+export async function fetchAutomationProjects() {
+    return [
+        {
+            automation_project_id: "aut_1",
+            display_name: "Daily Briefing",
+            name: "daily-briefing",
+            status: "enabled",
+            workspace_id: "alpha-project",
+            last_session_id: "session-im-1",
+            updated_at: "2026-03-14T10:12:00Z",
+            last_run_started_at: "2026-03-14T10:12:00Z",
+        },
+    ];
+}
+
+export async function fetchAutomationFeishuBindings() {
+    return [];
+}
+
+export async function startNewSession() {
+    throw new Error("not used");
+}
+
+export async function updateSession() {
+    return { status: "ok" };
+}
+
+export async function pickWorkspace() {
+    throw new Error("not used");
+}
+
+export async function forkWorkspace() {
+    throw new Error("not used");
+}
+
+export async function deleteSession() {
+    return undefined;
+}
+
+export async function deleteWorkspace() {
+    return { status: "ok" };
+}
+
+export async function createAutomationProject() {
+    throw new Error("not used");
+}
+
+export async function deleteAutomationProject() {
+    return { status: "ok" };
+}
+
+export async function disableAutomationProject() {
+    return { status: "ok" };
+}
+
+export async function enableAutomationProject() {
+    return { status: "ok" };
+}
+
+export async function runAutomationProject() {
+    throw new Error("not used");
+}
+""".strip(),
+    )
+
+    assert payload["workspaceSessionCount"] == 1
+    assert payload["automationSessionCount"] == 1
+    assert payload["automationFirstSessionLabel"] == "feishu_main - Release Updates"
+
+
+def test_projects_sidebar_keeps_automation_view_for_reused_bound_session_run(
+    tmp_path: Path,
+) -> None:
+    payload = _run_sidebar_script(
+        tmp_path=tmp_path,
+        runner_source="""
+import {
+    loadProjects,
+    setSelectSessionHandler,
+} from "./sidebar.mjs";
+
+installGlobals(createDomEnvironment());
+setSelectSessionHandler(async (sessionId) => {
+    globalThis.__selectedSessionIds.push(sessionId);
+});
+
+await loadProjects();
+const projectCards = document.getElementById("projects-list").children.filter(child => String(child.className || "").includes("project-card"));
+const automationCard = projectCards.find(child => child.querySelector(".project-title")?.textContent === "Daily Briefing");
+automationCard?.querySelector(".project-new-session-btn")?.onclick?.();
+await flushTasks();
+await flushTasks();
+
+console.log(JSON.stringify({
+    selectedSessionIds: globalThis.__selectedSessionIds,
+    openedAutomationProjectIds: globalThis.__openedAutomationProjectIds,
+    logs: globalThis.__logs,
+}));
+""".strip(),
+        mock_api_source="""
+const workspaces = [
+    {
+        workspace_id: "alpha-project",
+        root_path: "/work/Alpha Project",
+        updated_at: "2026-03-14T10:00:00Z",
+        profile: {
+            file_scope: {
+                backend: "project",
+            },
+        },
+    },
+];
+
+export async function fetchWorkspaces() {
+    return workspaces;
+}
+
+export async function fetchSessions() {
+    return [
+        {
+            session_id: "session-im-1",
+            workspace_id: "alpha-project",
+            updated_at: "2026-03-14T10:11:00Z",
+            pending_tool_approval_count: 0,
+            metadata: { title: "feishu_main - Release Updates", source_kind: "im" },
+        },
+    ];
+}
+
+export async function fetchAutomationProjects() {
+    return [
+        {
+            automation_project_id: "aut_1",
+            display_name: "Daily Briefing",
+            name: "daily-briefing",
+            status: "enabled",
+            workspace_id: "alpha-project",
+            last_session_id: "session-im-1",
+            updated_at: "2026-03-14T10:12:00Z",
+            last_run_started_at: "2026-03-14T10:12:00Z",
+        },
+    ];
+}
+
+export async function fetchAutomationFeishuBindings() {
+    return [];
+}
+
+export async function startNewSession() {
+    throw new Error("not used");
+}
+
+export async function updateSession() {
+    return { status: "ok" };
+}
+
+export async function pickWorkspace() {
+    throw new Error("not used");
+}
+
+export async function forkWorkspace() {
+    throw new Error("not used");
+}
+
+export async function deleteSession() {
+    return undefined;
+}
+
+export async function deleteWorkspace() {
+    return { status: "ok" };
+}
+
+export async function createAutomationProject() {
+    throw new Error("not used");
+}
+
+export async function deleteAutomationProject() {
+    return { status: "ok" };
+}
+
+export async function disableAutomationProject() {
+    return { status: "ok" };
+}
+
+export async function enableAutomationProject() {
+    return { status: "ok" };
+}
+
+export async function runAutomationProject() {
+    return {
+        automation_project_id: "aut_1",
+        session_id: "session-im-1",
+        run_id: "run-1",
+        queued: true,
+        reused_bound_session: true,
+    };
+}
+""".strip(),
+    )
+
+    assert payload["selectedSessionIds"] == []
+    assert payload["openedAutomationProjectIds"] == ["aut_1"]
+    assert payload["logs"] == [
+        "Queued automation run in bound IM session: session-im-1"
+    ]
 
 
 def test_projects_sidebar_forks_project_and_can_keep_worktree_on_remove(
@@ -704,6 +1049,11 @@ def _run_sidebar_script(
     mock_logger_path = tmp_path / "mockLogger.mjs"
     mock_api_path = tmp_path / "mockApi.mjs"
     mock_state_path = tmp_path / "mockState.mjs"
+    mock_stream_path = tmp_path / "mockStream.mjs"
+    mock_recovery_path = tmp_path / "mockRecovery.mjs"
+    mock_message_renderer_path = tmp_path / "mockMessageRenderer.mjs"
+    mock_agent_panel_path = tmp_path / "mockAgentPanel.mjs"
+    mock_context_indicators_path = tmp_path / "mockContextIndicators.mjs"
     mock_project_view_path = tmp_path / "mockProjectView.mjs"
     runner_path = tmp_path / "runner.mjs"
 
@@ -974,8 +1324,11 @@ const translations = {
     "sidebar.sort_name": "Sort by name",
     "sidebar.sort_recent": "Sort by recent",
     "sidebar.new_project": "New project",
+    "sidebar.new_automation": "New automation",
     "sidebar.fork": "Fork",
     "sidebar.remove": "Remove",
+    "sidebar.collapse": "Collapse",
+    "sidebar.show_all": "Show all ({count})",
     "sidebar.fork_project": "Fork Project",
     "sidebar.fork_project_message": "Enter the name for the forked project.",
     "sidebar.fork_project_placeholder": "Forked project name",
@@ -985,6 +1338,10 @@ const translations = {
     "sidebar.remove_project_worktree_message": "Delete the git worktree for {workspace} too? Choose Cancel to keep the worktree on disk.",
     "sidebar.delete_worktree": "Delete Worktree",
     "sidebar.keep_worktree": "Keep Worktree",
+    "sidebar.rename_session_title": "Rename Session",
+    "sidebar.rename_session_message": "Enter a new name for this session.",
+    "sidebar.session_name_placeholder": "Session name",
+    "sidebar.log.queued_bound_session": "Queued automation run in bound IM session: {session_id}",
     "sidebar.no_projects_title": "No projects yet",
     "sidebar.no_projects_copy": "Add a project below to attach a workspace and start sessions.",
     "sidebar.workspace": "Workspace",
@@ -996,6 +1353,13 @@ const translations = {
 
 export function t(key) {
     return translations[key] || key;
+}
+
+export function formatMessage(key, values = {}) {
+    return Object.entries(values).reduce(
+        (message, [name, value]) => message.replaceAll(`{${name}}`, String(value)),
+        t(key),
+    );
 }
 """.strip(),
         encoding="utf-8",
@@ -1165,7 +1529,53 @@ export const state = {
     currentWorkspaceId: "alpha-project",
     currentMainView: "session",
     currentProjectViewWorkspaceId: null,
+    activeEventSource: null,
 };
+""".strip(),
+        encoding="utf-8",
+    )
+    mock_stream_path.write_text(
+        """
+export function detachActiveStreamForSessionSwitch() {
+    globalThis.__detachStreamCalls = (globalThis.__detachStreamCalls || 0) + 1;
+}
+""".strip(),
+        encoding="utf-8",
+    )
+    mock_recovery_path.write_text(
+        """
+export function clearSessionRecovery() {
+    globalThis.__clearSessionRecoveryCalls = (globalThis.__clearSessionRecoveryCalls || 0) + 1;
+}
+
+export function stopSessionContinuity(sessionId) {
+    globalThis.__stoppedSessionContinuity = globalThis.__stoppedSessionContinuity || [];
+    globalThis.__stoppedSessionContinuity.push(sessionId);
+}
+""".strip(),
+        encoding="utf-8",
+    )
+    mock_message_renderer_path.write_text(
+        """
+export function clearAllStreamState() {
+    globalThis.__clearAllStreamStateCalls = (globalThis.__clearAllStreamStateCalls || 0) + 1;
+}
+""".strip(),
+        encoding="utf-8",
+    )
+    mock_agent_panel_path.write_text(
+        """
+export function clearAllPanels() {
+    globalThis.__clearAllPanelsCalls = (globalThis.__clearAllPanelsCalls || 0) + 1;
+}
+""".strip(),
+        encoding="utf-8",
+    )
+    mock_context_indicators_path.write_text(
+        """
+export function clearContextIndicators() {
+    globalThis.__clearContextIndicatorsCalls = (globalThis.__clearContextIndicatorsCalls || 0) + 1;
+}
 """.strip(),
         encoding="utf-8",
     )
@@ -1203,6 +1613,11 @@ export function hideProjectView() {
         .replace("../utils/logger.js", "./mockLogger.mjs")
         .replace("../core/api.js", "./mockApi.mjs")
         .replace("../core/state.js", "./mockState.mjs")
+        .replace("../core/stream.js", "./mockStream.mjs")
+        .replace("../app/recovery.js", "./mockRecovery.mjs")
+        .replace("./messageRenderer.js", "./mockMessageRenderer.mjs")
+        .replace("./agentPanel.js", "./mockAgentPanel.mjs")
+        .replace("./contextIndicators.js", "./mockContextIndicators.mjs")
         .replace("./projectView.js", "./mockProjectView.mjs")
     )
     module_under_test_path.write_text(source_text, encoding="utf-8")
@@ -1237,7 +1652,7 @@ installGlobals(createDomEnvironment());
         check=False,
         cwd=str(repo_root),
         text=True,
-        timeout=30,
+        timeout=3,
     )
 
     if completed.returncode != 0:

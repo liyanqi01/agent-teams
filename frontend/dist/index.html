@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -14,6 +14,7 @@
     <link rel="stylesheet" href="/css/components/orchestration.css" />
     <link rel="stylesheet" href="/css/components/settings.css" />
     <link rel="stylesheet" href="/css/components/tokens.css" />
+    <link rel="stylesheet" href="/css/components/highlight.css" />
     <link rel="stylesheet" href="/css/components.css" />
   </head>
 
@@ -21,7 +22,14 @@
     <div class="app-shell">
       <header class="topbar">
         <div class="topbar-section topbar-section-left">
-          <button id="toggle-sidebar" class="icon-btn" title="Toggle Sidebar">
+          <button
+            id="toggle-sidebar"
+            class="icon-btn"
+            title="切换侧边栏"
+            aria-label="切换侧边栏"
+            data-i18n-title="topbar.toggle_sidebar"
+            data-i18n-aria-label="topbar.toggle_sidebar"
+          >
             <svg
               viewBox="0 0 24 24"
               fill="none"
@@ -48,7 +56,7 @@
             title="Switch language"
             aria-label="Switch language"
           >
-            EN
+            中文
           </button>
           <button
             id="observability-btn"
@@ -166,7 +174,8 @@
         <div
           class="sidebar-resizer"
           id="sidebar-resizer"
-          title="Drag to resize sidebar"
+          title="拖动调整侧边栏宽度"
+          data-i18n-title="sidebar.resize"
         ></div>
 
         <!-- Main Workspace -->
@@ -304,8 +313,8 @@
             <!-- Input Area -->
             <div class="input-container">
               <div
-                id="recovery-banner-host"
-                class="recovery-banner-host"
+                id="recovery-approval-host"
+                class="recovery-approval-host"
                 style="display: none"
               ></div>
               <form id="chat-form">
@@ -322,15 +331,24 @@
                     class="prompt-mention-menu"
                     hidden
                   ></div>
-                  <div
-                    id="main-context-indicator"
-                    class="context-indicator"
-                    data-state="idle"
-                    title="Latest provider context usage"
-                    data-i18n-title="composer.context_title"
+                  <button
+                    type="button"
+                    id="resume-run-btn"
+                    class="composer-resume-btn"
+                    title="Resume run"
+                    data-i18n-title="recovery.action.resume_run"
+                    style="display: none"
                   >
-                    -- / --
-                  </div>
+                    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                      <path
+                        d="M8 6.5v11l9-5.5-9-5.5Z"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        stroke-linejoin="round"
+                      />
+                    </svg>
+                    <span data-i18n="recovery.action.resume_run">Resume Run</span>
+                  </button>
                   <button
                     type="submit"
                     id="send-btn"
@@ -486,22 +504,33 @@
                         id="thinking-effort-select"
                         class="composer-mode-inline-select"
                       >
-                        <option value="minimal">Minimal</option>
-                        <option value="low">Low</option>
-                        <option value="medium" selected>Medium</option>
-                        <option value="high">High</option>
+                    <option value="minimal" data-i18n="composer.effort.minimal">最少</option>
+                    <option value="low" data-i18n="composer.effort.low">低</option>
+                    <option value="medium" selected data-i18n="composer.effort.medium">中</option>
+                    <option value="high" data-i18n="composer.effort.high">高</option>
                       </select>
                     </span>
                   </span>
                 </label>
-                <div
-                  id="session-token-usage"
-                  class="session-token-usage"
-                  title="Session token usage"
-                  data-i18n-title="composer.tokens_title"
-                  data-i18n="composer.tokens"
-                >
-                  Tokens --
+                <div class="composer-usage-strip">
+                  <div
+                    id="main-context-indicator"
+                    class="context-indicator composer-context-indicator composer-usage-pill"
+                    data-state="idle"
+                    title="Prompt / context window"
+                    data-i18n-title="context_indicator.latest_title"
+                  >
+                    -- / --
+                  </div>
+                  <div
+                    id="session-token-usage"
+                    class="session-token-usage composer-usage-pill"
+                    title="Session token usage"
+                    data-i18n-title="composer.tokens_title"
+                    data-i18n="composer.tokens"
+                  >
+                    ↑ -- ↓ --
+                  </div>
                 </div>
               </div>
             </div>
@@ -510,7 +539,8 @@
         <div
           class="right-rail-resizer"
           id="right-rail-resizer"
-          title="Drag to resize right rail"
+          title="拖动调整侧边栏宽度"
+          data-i18n-title="sidebar.resize"
         ></div>
 
         <aside class="right-rail" id="right-rail">
@@ -601,6 +631,8 @@
     </div>
 
     <script src="/vendor/chart.js"></script>
+    <script src="/js/vendor/marked.min.js"></script>
+    <script src="/js/vendor/highlight.min.js"></script>
     <script type="module" src="/js/app.js"></script>
   </body>
 </html>

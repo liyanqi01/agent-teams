@@ -314,6 +314,12 @@ export function schedulePanelContextPreview() {
 const translations = {
     "subagent.reflect_title": "Refresh reflection memory",
     "subagent.reflect": "Reflect",
+    "subagent.reflecting": "Reflecting...",
+    "subagent.reflecting_title": "Refreshing reflection memory",
+    "subagent.reflected": "Reflected",
+    "subagent.reflected_title": "Reflection refreshed",
+    "subagent.retry_reflect": "Retry reflect",
+    "subagent.reflect_failed_title": "Reflection refresh failed",
     "subagent.stop_title": "Stop this subagent",
     "subagent.stop": "Stop",
     "subagent.sections": "Agent sections",
@@ -330,7 +336,7 @@ const translations = {
     "subagent.status_idle": "Idle",
     "subagent.no_tasks": "No delegated tasks yet.",
     "subagent.inject_placeholder": "Inject message to this agent...",
-    "composer.context_title": "Latest provider context usage",
+    "composer.context_title": "Prompt / context window",
     "composer.send_title": "Send (Enter)",
     "subagent.delete_reflection_confirm": "Delete reflection memory for this subagent role?",
     "subagent.reflection_placeholder": "Write long-term notes for this subagent role...",
@@ -338,6 +344,13 @@ const translations = {
 
 export function t(key) {
     return translations[key] || key;
+}
+
+export function formatMessage(key, values = {}) {
+    return Object.entries(values).reduce(
+        (message, [name, value]) => message.replaceAll(`{${name}}`, String(value)),
+        t(key),
+    );
 }
 """.strip(),
         encoding="utf-8",
@@ -576,7 +589,7 @@ globalThis.document = {{
         cwd=str(repo_root),
         text=True,
         encoding="utf-8",
-        timeout=30,
+        timeout=3,
     )
 
     if completed.returncode != 0:

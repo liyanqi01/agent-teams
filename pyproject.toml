@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "cool-play-agent-teams"
+name = "relay-teams"
 dynamic = ["version"]
 description = "Role-driven multi-agent framework with strong typing and tool-based collaboration."
 readme = "README.md"
@@ -17,9 +17,12 @@ dependencies = [
   "fastapi>=0.100.0",
   "uvicorn[standard]>=0.23.0",
   "httpx>=0.27.0",
+  "json-repair>=0.58.7",
   "lark-oapi==1.5.3",
   "markdownify>=1.2.0",
+  "defusedxml>=0.7.1",
   "qrcode>=8.0",
+  "pywinpty>=3.0.3; platform_system == 'Windows'",
 ]
 
 [project.optional-dependencies]
@@ -38,8 +41,8 @@ dev = [
 ]
 
 [project.scripts]
-agent-teams = "agent_teams.interfaces.cli.app:main"
-agent-teams-evals = "agent_teams_evals.run:app"
+relay-teams = "relay_teams.interfaces.cli.app:main"
+relay-teams-evals = "relay_teams_evals.run:app"
 
 [tool.pytest.ini_options]
 testpaths = ["tests/unit_tests", "tests/integration_tests"]
@@ -49,20 +52,16 @@ pythonpath = ["src", "tests", "."]
 where = ["src"]
 
 [tool.setuptools.dynamic]
-version = { attr = "agent_teams._version.__version__" }
+version = { attr = "relay_teams._version.__version__" }
 
 [tool.setuptools.package-data]
-"agent_teams.builtin" = [
+"relay_teams.builtin" = [
   "config/*.json",
   "logging/*.ini",
   "roles/*.md",
-  "skills/*/SKILL.md",
-  "skills/*/scripts/*.py",
+  "skills/**/*",
 ]
-"agent_teams.tools.task_tools" = ["*.txt"]
-"agent_teams.tools.web_tools" = ["*.txt"]
-"agent_teams.tools.workspace_tools" = ["*.txt"]
-"agent_teams.tools.feishu_tools" = ["*.txt"]
+"relay_teams.tools" = ["*/*.txt"]
 
 [dependency-groups]
 evals = [
@@ -78,3 +77,13 @@ default-groups = ["evals"]
 [tool.pyright]
 extraPaths = ["src", "tests"]
 typeCheckingMode = "standard"
+exclude = [
+  ".venv",
+  "**/__pycache__",
+  "**/node_modules",
+  "src/relay_teams/builtin/skills/pptx-craft/scripts/svg_to_pptx",
+]
+
+[tool.ruff]
+extend-exclude = ["src/relay_teams/builtin/skills/pptx-craft/scripts/svg_to_pptx"]
+

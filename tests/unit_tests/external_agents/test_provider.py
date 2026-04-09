@@ -11,54 +11,62 @@ import pytest
 from pydantic import JsonValue
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
-import agent_teams.external_agents.provider as provider_module
-from agent_teams.agents.execution.message_repository import MessageRepository
-from agent_teams.agents.instances.instance_repository import AgentInstanceRepository
-from agent_teams.agents.orchestration.task_execution_service import TaskExecutionService
-from agent_teams.agents.orchestration.task_orchestration_service import (
+import relay_teams.external_agents.provider as provider_module
+from relay_teams.agents.execution.message_repository import MessageRepository
+from relay_teams.agents.instances.instance_repository import AgentInstanceRepository
+from relay_teams.agents.orchestration.task_execution_service import TaskExecutionService
+from relay_teams.agents.orchestration.task_orchestration_service import (
     TaskOrchestrationService,
 )
-from agent_teams.agents.tasks.task_repository import TaskRepository
-from agent_teams.external_agents.config_service import ExternalAgentConfigService
-from agent_teams.external_agents.host_tool_bridge import (
+from relay_teams.agents.tasks.task_repository import TaskRepository
+from relay_teams.external_agents.config_service import ExternalAgentConfigService
+from relay_teams.external_agents.host_tool_bridge import (
     HOST_TOOL_SERVER_ID,
     ExternalAcpHostToolBridge,
 )
-from agent_teams.external_agents.models import (
+from relay_teams.external_agents.models import (
     ExternalAgentConfig,
     ExternalAgentSessionRecord,
     StdioTransportConfig,
 )
-from agent_teams.external_agents.provider import (
+from relay_teams.external_agents.provider import (
     _ActivePromptState,
+    _annotate_external_computer_tool_result,
     _ConversationHandle,
     _conversation_key,
     _extract_tool_result,
     ExternalAcpSessionManager,
 )
-from agent_teams.external_agents.session_repository import (
+from relay_teams.external_agents.session_repository import (
     ExternalAgentSessionRepository,
 )
-from agent_teams.mcp.mcp_registry import McpRegistry
-from agent_teams.notifications import NotificationService
-from agent_teams.persistence.shared_state_repo import SharedStateRepository
-from agent_teams.providers.provider_contracts import LLMRequest
-from agent_teams.roles.memory_service import RoleMemoryService
-from agent_teams.roles.role_models import RoleDefinition
-from agent_teams.roles.role_registry import RoleRegistry
-from agent_teams.sessions.runs.enums import RunEventType
-from agent_teams.sessions.runs.event_log import EventLog
-from agent_teams.sessions.runs.event_stream import RunEventHub
-from agent_teams.sessions.runs.injection_queue import RunInjectionManager
-from agent_teams.sessions.runs.run_control_manager import RunControlManager
-from agent_teams.sessions.runs.run_intent_repo import RunIntentRepository
-from agent_teams.sessions.runs.run_runtime_repo import RunRuntimeRepository
-from agent_teams.skills.skill_registry import SkillRegistry
-from agent_teams.gateway.im import ImToolService
-from agent_teams.tools.registry import ToolRegistry
-from agent_teams.tools.runtime import ToolApprovalManager, ToolApprovalPolicy
-from agent_teams.tools.runtime.approval_ticket_repo import ApprovalTicketRepository
-from agent_teams.workspace import WorkspaceManager
+from relay_teams.mcp.mcp_models import McpConfigScope, McpServerSpec
+from relay_teams.mcp.mcp_registry import McpRegistry
+from relay_teams.notifications import NotificationService
+from relay_teams.persistence.shared_state_repo import SharedStateRepository
+from relay_teams.providers.model_config import (
+    ModelEndpointConfig,
+    ModelRequestHeader,
+    ProviderType,
+    SamplingConfig,
+)
+from relay_teams.providers.provider_contracts import LLMRequest
+from relay_teams.roles.memory_service import RoleMemoryService
+from relay_teams.roles.role_models import RoleDefinition
+from relay_teams.roles.role_registry import RoleRegistry
+from relay_teams.sessions.runs.enums import RunEventType
+from relay_teams.sessions.runs.event_log import EventLog
+from relay_teams.sessions.runs.event_stream import RunEventHub
+from relay_teams.sessions.runs.injection_queue import RunInjectionManager
+from relay_teams.sessions.runs.run_control_manager import RunControlManager
+from relay_teams.sessions.runs.run_intent_repo import RunIntentRepository
+from relay_teams.sessions.runs.run_runtime_repo import RunRuntimeRepository
+from relay_teams.skills.skill_registry import SkillRegistry
+from relay_teams.gateway.im import ImToolService
+from relay_teams.tools.registry import ToolRegistry
+from relay_teams.tools.runtime import ToolApprovalManager, ToolApprovalPolicy
+from relay_teams.tools.runtime.approval_ticket_repo import ApprovalTicketRepository
+from relay_teams.workspace import WorkspaceManager
 
 _TransportMessageHandler = Callable[
     [str, dict[str, JsonValue], str | int | None],
@@ -137,6 +145,7 @@ class _RequestCapturingTransport:
         self.requests: list[tuple[str, dict[str, JsonValue]]] = []
         self.notifications: list[tuple[str, dict[str, JsonValue]]] = []
         self.on_message: _TransportMessageHandler | None = None
+        self.close_calls = 0
 
     async def start(self) -> None:
         return None
@@ -177,6 +186,7 @@ class _RequestCapturingTransport:
         self.notifications.append((method, params))
 
     async def close(self) -> None:
+        self.close_calls += 1
         return None
 
 
@@ -246,6 +256,60 @@ class _SequencedPromptTransport:
         return None
 
 
+class _DeferredPromptTransport:
+    def __init__(self, *, response_text: str) -> None:
+        self.response_text = response_text
+        self.on_message: _TransportMessageHandler | None = None
+
+    async def start(self) -> None:
+        return None
+
+    async def send_request(
+        self,
+        method: str,
+        params: dict[str, JsonValue],
+    ) -> dict[str, JsonValue]:
+        if method == "initialize":
+            return {"protocolVersion": 1}
+        if method in {"session/new", "session/load"}:
+            return {"sessionId": "remote-1"}
+        if method != "session/prompt":
+            raise AssertionError(f"Unexpected request: {method}")
+        _ = params
+        if self.on_message is not None:
+            handler = self.on_message
+            loop = asyncio.get_running_loop()
+            update_params = cast(
+                dict[str, JsonValue],
+                {
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {
+                            "type": "text",
+                            "text": self.response_text,
+                        },
+                    }
+                },
+            )
+
+            async def _publish_update() -> None:
+                await handler("session/update", update_params, None)
+
+            loop.call_soon(asyncio.create_task, _publish_update())
+        return {"stopReason": "end_turn"}
+
+    async def send_notification(
+        self,
+        method: str,
+        params: dict[str, JsonValue],
+    ) -> None:
+        _ = method
+        _ = params
+
+    async def close(self) -> None:
+        return None
+
+
 class _FakeHostToolBridge:
     def __init__(self, *, has_tools: bool) -> None:
         self.has_tools_value = has_tools
@@ -280,9 +344,9 @@ class _FakeHostToolBridge:
         return {
             "name": HOST_TOOL_SERVER_ID,
             "command": "python",
-            "args": ["-m", "agent_teams.external_agents.host_tool_stdio_server"],
+            "args": ["-m", "relay_teams.external_agents.host_tool_stdio_server"],
             "env": [
-                {"name": "AGENT_TEAMS_CONFIG_DIR", "value": str(config_dir)},
+                {"name": "RELAY_TEAMS_CONFIG_DIR", "value": str(config_dir)},
                 {"name": "AGENT_TEAMS_HOST_TOOL_RUN_ID", "value": request.run_id},
                 {"name": "AGENT_TEAMS_HOST_TOOL_TASK_ID", "value": request.task_id},
             ],
@@ -358,12 +422,37 @@ def _build_request() -> LLMRequest:
     )
 
 
-def _build_agent() -> ExternalAgentConfig:
+def _build_agent(
+    *,
+    command: str = "acp-agent",
+    args: tuple[str, ...] = (),
+) -> ExternalAgentConfig:
     return ExternalAgentConfig(
         agent_id="agent-1",
         name="ACP Agent",
         description="External ACP agent.",
-        transport=StdioTransportConfig(command="acp-agent"),
+        transport=StdioTransportConfig(command=command, args=args),
+    )
+
+
+def _build_model_config(
+    *,
+    provider: ProviderType = ProviderType.BIGMODEL,
+    model: str = "glm-4.6v",
+    base_url: str = "https://open.bigmodel.cn/api/coding/paas/v4",
+    api_key: str = "sk-test",
+    headers: tuple[ModelRequestHeader, ...] = (),
+    context_window: int | None = 128000,
+    max_tokens: int = 4096,
+) -> ModelEndpointConfig:
+    return ModelEndpointConfig(
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
+        headers=headers,
+        context_window=context_window,
+        sampling=SamplingConfig(max_tokens=max_tokens),
     )
 
 
@@ -373,11 +462,15 @@ def _build_manager(
     workdir: Path,
     config_dir: Path,
     tool_approval_policy: ToolApprovalPolicy | None = None,
+    agent: ExternalAgentConfig | None = None,
+    resolve_model_config: (
+        Callable[[RoleDefinition, LLMRequest], ModelEndpointConfig | None] | None
+    ) = None,
 ) -> ExternalAcpSessionManager:
     return ExternalAcpSessionManager(
         config_dir=config_dir,
         config_service=cast(
-            ExternalAgentConfigService, _FakeConfigService(_build_agent())
+            ExternalAgentConfigService, _FakeConfigService(agent or _build_agent())
         ),
         session_repo=cast(ExternalAgentSessionRepository, _FakeSessionRepo()),
         message_repo=cast(MessageRepository, _FakeMessageRepo(prompt_text)),
@@ -391,9 +484,10 @@ def _build_manager(
         approval_ticket_repo=cast(ApprovalTicketRepository, object()),
         run_runtime_repo=cast(RunRuntimeRepository, object()),
         run_intent_repo=cast(RunIntentRepository, object()),
+        background_task_service=None,
         role_memory_service=cast(RoleMemoryService | None, None),
         tool_registry=cast(ToolRegistry, object()),
-        get_mcp_registry=lambda: cast(McpRegistry, object()),
+        get_mcp_registry=lambda: McpRegistry(),
         get_skill_registry=lambda: cast(SkillRegistry, object()),
         get_role_registry=lambda: cast(RoleRegistry, object()),
         get_task_execution_service=lambda: cast(TaskExecutionService, object()),
@@ -402,6 +496,7 @@ def _build_manager(
         tool_approval_manager=cast(ToolApprovalManager, object()),
         tool_approval_policy=tool_approval_policy or ToolApprovalPolicy(),
         get_notification_service=lambda: cast(NotificationService | None, None),
+        resolve_model_config=resolve_model_config,
         im_tool_service=cast(ImToolService | None, None),
     )
 
@@ -409,7 +504,7 @@ def _build_manager(
 def _install_transport_builder(
     *,
     monkeypatch: pytest.MonkeyPatch,
-    transport: _RequestCapturingTransport,
+    transport: _RequestCapturingTransport | _DeferredPromptTransport,
     captured: dict[str, object],
 ) -> None:
     def fake_build_acp_transport(
@@ -417,7 +512,7 @@ def _install_transport_builder(
         config: ExternalAgentConfig,
         on_message: _TransportMessageHandler,
         runtime_cwd: str | None = None,
-    ) -> _RequestCapturingTransport:
+    ) -> _RequestCapturingTransport | _DeferredPromptTransport:
         captured["config"] = config
         captured["on_message"] = on_message
         captured["runtime_cwd"] = runtime_cwd
@@ -429,6 +524,37 @@ def _install_transport_builder(
         "build_acp_transport",
         fake_build_acp_transport,
     )
+
+
+def test_build_mcp_servers_for_role_ignores_unknown_servers() -> None:
+    role = RoleDefinition(
+        role_id="writer",
+        name="Writer",
+        description="Writes documents.",
+        version="1.0.0",
+        tools=(),
+        mcp_servers=("docs", "missing_server"),
+        skills=(),
+        model_profile="default",
+        system_prompt="Write clearly.",
+    )
+    mcp_registry = McpRegistry(
+        (
+            McpServerSpec(
+                name="docs",
+                config={"mcpServers": {"docs": {"command": "npx"}}},
+                server_config={"command": "npx"},
+                source=McpConfigScope.APP,
+            ),
+        )
+    )
+
+    servers = provider_module._build_mcp_servers_for_role(
+        role=role,
+        mcp_registry=mcp_registry,
+    )
+
+    assert servers == [{"command": "npx", "id": "docs", "name": "docs"}]
 
 
 def _cast_bridge(bridge: _FakeHostToolBridge) -> ExternalAcpHostToolBridge:
@@ -510,6 +636,50 @@ async def test_external_acp_prompt_includes_system_prompt_and_host_server(
 
 
 @pytest.mark.asyncio
+async def test_external_acp_prompt_keeps_skill_candidates_in_user_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    transport = _RequestCapturingTransport()
+    captured: dict[str, object] = {}
+    manager = _build_manager(
+        prompt_text=(
+            "Summarize the architecture.\n\n"
+            "## Skill Candidates\n"
+            "- time: Normalize all times to UTC."
+        ),
+        workdir=tmp_path,
+        config_dir=tmp_path / "config",
+    )
+    _install_transport_builder(
+        monkeypatch=monkeypatch,
+        transport=transport,
+        captured=captured,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_create_host_tool_bridge",
+        lambda: _FakeHostToolBridge(has_tools=False),
+    )
+
+    _ = await manager.prompt(
+        agent_id="agent-1",
+        role=_build_role(),
+        request=_build_request(),
+    )
+
+    prompt_payload = transport.requests[2][1]
+    prompt_parts = cast(list[dict[str, object]], prompt_payload["prompt"])
+    prompt_text = str(prompt_parts[0]["text"])
+    assert "## Role Prompt\nProvider system prompt text." in prompt_text
+    assert "## Skill Candidates" in prompt_text
+    assert (
+        "## User Prompt\nSummarize the architecture.\n\n## Skill Candidates\n- time: Normalize all times to UTC."
+        in prompt_text
+    )
+
+
+@pytest.mark.asyncio
 async def test_external_acp_refreshes_remote_session_when_prompt_scoped_mcp_signature_changes(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -548,6 +718,356 @@ async def test_external_acp_refreshes_remote_session_when_prompt_scoped_mcp_sign
     env = cast(list[dict[str, str]], mcp_servers[0]["env"])
     assert {"name": "AGENT_TEAMS_HOST_TOOL_RUN_ID", "value": "run-2"} in env
     assert {"name": "AGENT_TEAMS_HOST_TOOL_TASK_ID", "value": "task-2"} in env
+
+
+@pytest.mark.asyncio
+async def test_external_acp_injects_runtime_model_profile_into_opencode_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    transport = _RequestCapturingTransport()
+    captured: dict[str, object] = {}
+    manager = _build_manager(
+        prompt_text="Inspect the image.",
+        workdir=tmp_path,
+        config_dir=tmp_path / "config",
+        agent=_build_agent(command="opencode", args=("--print-logs", "acp")),
+        resolve_model_config=lambda _role, _request: _build_model_config(
+            model="glm-4v-flash"
+        ),
+    )
+    _install_transport_builder(
+        monkeypatch=monkeypatch,
+        transport=transport,
+        captured=captured,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_create_host_tool_bridge",
+        lambda: _FakeHostToolBridge(has_tools=False),
+    )
+
+    _ = await manager.prompt(
+        agent_id="agent-1",
+        role=_build_role(),
+        request=_build_request(),
+    )
+
+    runtime_agent = cast(ExternalAgentConfig, captured["config"])
+    runtime_transport = runtime_agent.transport
+    assert isinstance(runtime_transport, StdioTransportConfig)
+    assert runtime_transport.args == ("--print-logs", "acp")
+    env_by_name = {binding.name: binding.value for binding in runtime_transport.env}
+    assert "OPENCODE_CONFIG_CONTENT" in env_by_name
+    assert env_by_name["ZHIPU_API_KEY"] == "sk-test"
+    config_content = json.loads(cast(str, env_by_name["OPENCODE_CONFIG_CONTENT"]))
+    assert config_content["model"] == "zai/glm-4v-flash"
+    provider_config = config_content["provider"]["zai"]
+    assert provider_config["npm"] == "@ai-sdk/openai-compatible"
+    assert provider_config["api"] == "https://open.bigmodel.cn/api/coding/paas/v4"
+    assert provider_config["env"] == ["ZHIPU_API_KEY"]
+    model_entry = provider_config["models"]["glm-4v-flash"]
+    assert model_entry["attachment"] is True
+    assert model_entry["tool_call"] is False
+    assert model_entry["modalities"]["input"] == ["text", "image", "video"]
+    assert model_entry["limit"] == {"context": 128000, "output": 4096}
+
+
+@pytest.mark.asyncio
+async def test_external_acp_waits_for_trailing_message_chunks_after_prompt_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    transport = _DeferredPromptTransport(response_text="Deferred output.")
+    captured: dict[str, object] = {}
+    manager = _build_manager(
+        prompt_text="Answer briefly.",
+        workdir=tmp_path,
+        config_dir=tmp_path / "config",
+    )
+    _install_transport_builder(
+        monkeypatch=monkeypatch,
+        transport=transport,
+        captured=captured,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_create_host_tool_bridge",
+        lambda: _FakeHostToolBridge(has_tools=False),
+    )
+
+    output = await manager.prompt(
+        agent_id="agent-1",
+        role=_build_role(),
+        request=_build_request(),
+    )
+
+    assert output == "Deferred output."
+
+
+@pytest.mark.asyncio
+async def test_external_acp_synthesizes_opencode_zai_limit_when_context_window_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    transport = _RequestCapturingTransport()
+    captured: dict[str, object] = {}
+    manager = _build_manager(
+        prompt_text="Inspect the image.",
+        workdir=tmp_path,
+        config_dir=tmp_path / "config",
+        agent=_build_agent(command="opencode", args=("--print-logs", "acp")),
+        resolve_model_config=lambda _role, _request: _build_model_config(
+            context_window=None
+        ),
+    )
+    _install_transport_builder(
+        monkeypatch=monkeypatch,
+        transport=transport,
+        captured=captured,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_create_host_tool_bridge",
+        lambda: _FakeHostToolBridge(has_tools=False),
+    )
+
+    _ = await manager.prompt(
+        agent_id="agent-1",
+        role=_build_role(),
+        request=_build_request(),
+    )
+
+    runtime_agent = cast(ExternalAgentConfig, captured["config"])
+    runtime_transport = runtime_agent.transport
+    assert isinstance(runtime_transport, StdioTransportConfig)
+    env_by_name = {binding.name: binding.value for binding in runtime_transport.env}
+    config_content = json.loads(cast(str, env_by_name["OPENCODE_CONFIG_CONTENT"]))
+    model_entry = config_content["provider"]["zai"]["models"]["glm-4.6v"]
+    assert model_entry["limit"] == {"context": 128000, "output": 4096}
+
+
+@pytest.mark.asyncio
+async def test_external_acp_falls_back_to_custom_provider_for_generic_openai_compatible_profiles(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    transport = _RequestCapturingTransport()
+    captured: dict[str, object] = {}
+    manager = _build_manager(
+        prompt_text="Answer briefly.",
+        workdir=tmp_path,
+        config_dir=tmp_path / "config",
+        agent=_build_agent(command="opencode", args=("acp",)),
+        resolve_model_config=lambda _role, _request: _build_model_config(
+            provider=ProviderType.OPENAI_COMPATIBLE,
+            model="gpt-4o-mini",
+            base_url="https://example.test/v1",
+        ),
+    )
+    _install_transport_builder(
+        monkeypatch=monkeypatch,
+        transport=transport,
+        captured=captured,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_create_host_tool_bridge",
+        lambda: _FakeHostToolBridge(has_tools=False),
+    )
+
+    _ = await manager.prompt(
+        agent_id="agent-1",
+        role=_build_role(),
+        request=_build_request(),
+    )
+
+    runtime_agent = cast(ExternalAgentConfig, captured["config"])
+    runtime_transport = runtime_agent.transport
+    assert isinstance(runtime_transport, StdioTransportConfig)
+    env_by_name = {binding.name: binding.value for binding in runtime_transport.env}
+    assert env_by_name["AGENT_TEAMS_OPENCODE_API_KEY"] == "sk-test"
+    config_content = json.loads(cast(str, env_by_name["OPENCODE_CONFIG_CONTENT"]))
+    assert config_content["model"] == "agent_teams/gpt-4o-mini"
+    provider_config = config_content["provider"]["agent_teams"]
+    assert provider_config["api"] == "https://example.test/v1"
+    assert provider_config["env"] == ["AGENT_TEAMS_OPENCODE_API_KEY"]
+    assert provider_config["npm"] == "@ai-sdk/openai-compatible"
+    assert provider_config["models"]["gpt-4o-mini"]["name"] == "gpt-4o-mini"
+
+
+@pytest.mark.asyncio
+async def test_external_acp_injects_custom_headers_into_opencode_provider_options(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    transport = _RequestCapturingTransport()
+    captured: dict[str, object] = {}
+    manager = _build_manager(
+        prompt_text="Answer briefly.",
+        workdir=tmp_path,
+        config_dir=tmp_path / "config",
+        agent=_build_agent(command="opencode", args=("acp",)),
+        resolve_model_config=lambda _role, _request: _build_model_config(
+            provider=ProviderType.OPENAI_COMPATIBLE,
+            model="gpt-4o-mini",
+            base_url="https://example.test/v1",
+            api_key="sk-ignored",
+            headers=(
+                ModelRequestHeader(
+                    name="Authorization",
+                    value="Bearer header-override",
+                ),
+                ModelRequestHeader(
+                    name="anthropic-version",
+                    value="2023-06-01",
+                ),
+            ),
+        ),
+    )
+    _install_transport_builder(
+        monkeypatch=monkeypatch,
+        transport=transport,
+        captured=captured,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_create_host_tool_bridge",
+        lambda: _FakeHostToolBridge(has_tools=False),
+    )
+
+    _ = await manager.prompt(
+        agent_id="agent-1",
+        role=_build_role(),
+        request=_build_request(),
+    )
+
+    runtime_agent = cast(ExternalAgentConfig, captured["config"])
+    runtime_transport = runtime_agent.transport
+    assert isinstance(runtime_transport, StdioTransportConfig)
+    env_by_name = {binding.name: binding.value for binding in runtime_transport.env}
+    assert "AGENT_TEAMS_OPENCODE_API_KEY" not in env_by_name
+    config_content = json.loads(cast(str, env_by_name["OPENCODE_CONFIG_CONTENT"]))
+    provider_config = config_content["provider"]["agent_teams"]
+    assert "env" not in provider_config
+    assert provider_config["options"]["headers"] == {
+        "Authorization": "Bearer header-override",
+        "anthropic-version": "2023-06-01",
+    }
+
+
+@pytest.mark.asyncio
+async def test_external_acp_omits_custom_provider_limit_when_context_window_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    transport = _RequestCapturingTransport()
+    captured: dict[str, object] = {}
+    manager = _build_manager(
+        prompt_text="Answer briefly.",
+        workdir=tmp_path,
+        config_dir=tmp_path / "config",
+        agent=_build_agent(command="opencode", args=("acp",)),
+        resolve_model_config=lambda _role, _request: _build_model_config(
+            provider=ProviderType.OPENAI_COMPATIBLE,
+            model="gpt-4o-mini",
+            base_url="https://example.test/v1",
+            context_window=None,
+        ),
+    )
+    _install_transport_builder(
+        monkeypatch=monkeypatch,
+        transport=transport,
+        captured=captured,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_create_host_tool_bridge",
+        lambda: _FakeHostToolBridge(has_tools=False),
+    )
+
+    _ = await manager.prompt(
+        agent_id="agent-1",
+        role=_build_role(),
+        request=_build_request(),
+    )
+
+    runtime_agent = cast(ExternalAgentConfig, captured["config"])
+    runtime_transport = runtime_agent.transport
+    assert isinstance(runtime_transport, StdioTransportConfig)
+    env_by_name = {binding.name: binding.value for binding in runtime_transport.env}
+    config_content = json.loads(cast(str, env_by_name["OPENCODE_CONFIG_CONTENT"]))
+    model_entry = config_content["provider"]["agent_teams"]["models"]["gpt-4o-mini"]
+    assert "limit" not in model_entry
+
+
+@pytest.mark.asyncio
+async def test_external_acp_recreates_opencode_transport_when_model_profile_changes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    transports = [_RequestCapturingTransport(), _RequestCapturingTransport()]
+    captured_configs: list[ExternalAgentConfig] = []
+    model_state = {"config": _build_model_config(model="glm-4.6v")}
+    manager = _build_manager(
+        prompt_text="Inspect the image.",
+        workdir=tmp_path,
+        config_dir=tmp_path / "config",
+        agent=_build_agent(command="opencode", args=("acp",)),
+        resolve_model_config=lambda _role, _request: model_state["config"],
+    )
+
+    def fake_build_acp_transport(
+        *,
+        config: ExternalAgentConfig,
+        on_message: _TransportMessageHandler,
+        runtime_cwd: str | None = None,
+    ) -> _RequestCapturingTransport:
+        _ = on_message
+        _ = runtime_cwd
+        captured_configs.append(config)
+        transport = transports[len(captured_configs) - 1]
+        transport.on_message = on_message
+        return transport
+
+    monkeypatch.setattr(
+        provider_module,
+        "build_acp_transport",
+        fake_build_acp_transport,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_create_host_tool_bridge",
+        lambda: _FakeHostToolBridge(has_tools=False),
+    )
+
+    _ = await manager.prompt(
+        agent_id="agent-1",
+        role=_build_role(),
+        request=_build_request(),
+    )
+
+    model_state["config"] = _build_model_config(model="glm-5")
+    _ = await manager.prompt(
+        agent_id="agent-1",
+        role=_build_role(),
+        request=_build_request().model_copy(
+            update={"run_id": "run-2", "task_id": "task-2"}
+        ),
+    )
+
+    assert len(captured_configs) == 2
+    first_transport = cast(StdioTransportConfig, captured_configs[0].transport)
+    second_transport = cast(StdioTransportConfig, captured_configs[1].transport)
+    assert first_transport.args == ("acp",)
+    assert second_transport.args == ("acp",)
+    first_env = {binding.name: binding.value for binding in first_transport.env}
+    second_env = {binding.name: binding.value for binding in second_transport.env}
+    first_config = json.loads(cast(str, first_env["OPENCODE_CONFIG_CONTENT"]))
+    second_config = json.loads(cast(str, second_env["OPENCODE_CONFIG_CONTENT"]))
+    assert first_config["model"] == "zai/glm-4.6v"
+    assert second_config["model"] == "zai/glm-5"
+    assert transports[0].close_calls == 1
 
 
 @pytest.mark.asyncio
@@ -703,6 +1223,33 @@ def test_extract_tool_result_converts_image_content_to_text_data_url() -> None:
     )
 
     assert result == {"text": "data:image/png;base64,aGVsbG8="}
+
+
+def test_annotate_external_computer_tool_result_wraps_known_desktop_tools() -> None:
+    result = _annotate_external_computer_tool_result(
+        tool_name="press_key",
+        tool_result={
+            "text": "Pressed Enter.",
+            "content": [
+                {
+                    "kind": "media_ref",
+                    "asset_id": "asset-1",
+                    "session_id": "session-1",
+                    "modality": "image",
+                    "mime_type": "image/png",
+                    "url": "/api/sessions/session-1/media/asset-1/file",
+                }
+            ],
+            "observation": {"focused_window": "Chrome DevTools"},
+        },
+    )
+
+    assert isinstance(result, dict)
+    computer = result["computer"]
+    assert isinstance(computer, dict)
+    assert computer["source"] == "acp"
+    assert computer["runtime_kind"] == "external_acp"
+    assert result["text"] == "Pressed Enter."
 
 
 @pytest.mark.asyncio

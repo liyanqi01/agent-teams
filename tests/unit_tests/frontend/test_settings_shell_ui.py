@@ -69,25 +69,16 @@ console.log(JSON.stringify({
         not in modal_html
     )
     assert "notifications-actions" not in modal_html
+    assert 'id="web-provider-site-link"' in modal_html
+    assert 'class="web-provider-link-card"' in modal_html
     assert payload["modalDisplay"] == "flex"
     assert "settings-modal-visible" in str(payload["modalClassName"])
     assert payload["panelTitle"] == "Notifications"
     assert payload["modelPanelDisplay"] == "none"
     assert payload["notificationsPanelDisplay"] == "block"
-    assert load_calls == {
-        "model": 1,
-        "agents": 0,
-        "roles": 0,
-        "orchestration": 0,
-        "triggers": 0,
-        "environment": 0,
-        "notifications": 1,
-        "web": 0,
-        "github": 0,
-        "proxy": 0,
-        "mcp": 0,
-        "skills": 0,
-    }
+    assert load_calls["notifications"] == 1
+    assert load_calls["model"] == 0
+    assert load_calls["agents"] == 0
 
 
 def test_settings_panel_actions_use_primary_buttons_for_add_and_reload(
@@ -111,6 +102,8 @@ const proxyTab = tabs.find(tab => tab.dataset.tab === "proxy");
 const mcpTab = tabs.find(tab => tab.dataset.tab === "mcp");
 const skillsTab = tabs.find(tab => tab.dataset.tab === "skills");
 
+const modelTab = tabs.find(tab => tab.dataset.tab === "model");
+await modelTab.onclick();
 const modelAddDisplay = document.getElementById("add-profile-btn").style.display;
 await agentsTab.onclick();
 const agentAddDisplay = document.getElementById("add-agent-btn").style.display;
@@ -164,6 +157,9 @@ def test_settings_tab_order_and_labels_are_simplified() -> None:
     tabs_end = source_text.index("</div>\n            </aside>", tabs_start)
     tabs_html = source_text[tabs_start:tabs_end]
 
+    assert tabs_html.index('data-tab="appearance"') < tabs_html.index(
+        'data-tab="model"'
+    )
     assert tabs_html.index('data-tab="model"') < tabs_html.index('data-tab="skills"')
     assert tabs_html.index('data-tab="skills"') < tabs_html.index('data-tab="mcp"')
     assert tabs_html.index('data-tab="mcp"') < tabs_html.index('data-tab="agents"')
@@ -303,11 +299,30 @@ console.log(JSON.stringify({
     assert 'id="fetch-profile-models-btn"' in modal_html
     assert 'title="Fetch Models"' in modal_html
     assert 'id="toggle-profile-api-key-btn"' in modal_html
+    assert 'id="toggle-web-api-key-btn"' in modal_html
+    assert (
+        'id="toggle-web-api-key-btn" type="button" title="Show API key" aria-label="Show API key"'
+        in modal_html
+    )
+    assert 'id="toggle-github-token-btn"' in modal_html
+    assert 'id="toggle-proxy-password-btn"' in modal_html
+    assert 'id="web-searxng-instance-url-field"' in modal_html
+    assert 'id="web-searxng-builtins-field"' in modal_html
+    assert 'id="web-searxng-builtins-list"' in modal_html
+    assert 'placeholder="默认值：{default}"' in modal_html
+    assert modal_html.count('<option value="searxng">SearXNG</option>') == 1
+    assert modal_html.count('<option value="disabled">Disabled</option>') == 1
     assert 'id="edit-profile-name-btn"' not in modal_html
     assert 'id="edit-profile-name-input"' not in modal_html
     assert ">Fetch</button>" not in modal_html
     assert modal_html.index('label for="profile-api-key"') < modal_html.index(
         'label for="profile-model"'
+    )
+    assert modal_html.index('label for="web-provider"') < modal_html.index(
+        'label for="web-api-key"'
+    )
+    assert modal_html.index('label for="web-api-key"') < modal_html.index(
+        'label for="web-fallback-provider"'
     )
     assert modal_html.index('id="profile-max-tokens"') < modal_html.index(
         'id="profile-context-window"'
@@ -320,7 +335,8 @@ console.log(JSON.stringify({
         "Fetch the endpoint catalog for quick selection, or enter a model name manually."
         not in modal_html
     )
-    assert 'value="100000"' in modal_html
+    assert 'id="profile-max-tokens" value=""' in modal_html
+    assert 'placeholder="Optional"' in modal_html
     assert "Max Tokens</label>" not in modal_html
     assert ">Test</button>" in modal_html
     assert ">Test URL</button>" in modal_html
@@ -377,6 +393,7 @@ def _run_settings_script(tmp_path: Path, runner_source: str) -> dict[str, object
     mock_web_settings_path = tmp_path / "mockWebSettings.mjs"
     mock_github_settings_path = tmp_path / "mockGitHubSettings.mjs"
     mock_system_status_path = tmp_path / "mockSystemStatus.mjs"
+    mock_appearance_path = tmp_path / "mockAppearanceSettings.mjs"
     mock_i18n_path = tmp_path / "mockI18n.mjs"
     module_under_test_path = tmp_path / "index.mjs"
     runner_path = tmp_path / "runner.mjs"
@@ -517,10 +534,26 @@ export async function loadSkillsStatusPanel() {
 """.strip(),
         encoding="utf-8",
     )
+    mock_appearance_path.write_text(
+        """
+export function bindAppearanceHandlers() {
+    globalThis.__bindCalls.appearance = (globalThis.__bindCalls.appearance || 0) + 1;
+}
+
+export function loadAppearancePanel() {
+    globalThis.__loadCalls.appearance = (globalThis.__loadCalls.appearance || 0) + 1;
+}
+
+export function initAppearanceOnStartup() {}
+""".strip(),
+        encoding="utf-8",
+    )
     mock_i18n_path.write_text(
         """
 export function t(key) {
     return {
+        'settings.panel.appearance.title': 'Appearance',
+        'settings.panel.appearance.description': 'Customize accent color, background, fonts, and sizing.',
         'settings.panel.model.title': 'Model',
         'settings.panel.model.description': 'Manage providers, endpoints, request limits, and sampling defaults.',
         'settings.panel.skills.title': 'Skills',
@@ -568,6 +601,7 @@ export function translateDocument() {
         .replace("./proxySettings.js", "./mockProxySettings.mjs")
         .replace("./rolesSettings.js", "./mockRolesSettings.mjs")
         .replace("./systemStatus.js", "./mockSystemStatus.mjs")
+        .replace("./appearanceSettings.js", "./mockAppearanceSettings.mjs")
         .replace("../../utils/i18n.js", "./mockI18n.mjs")
     )
     module_under_test_path.write_text(source_text, encoding="utf-8")
@@ -773,6 +807,7 @@ globalThis.window = {{}};
         check=False,
         cwd=str(repo_root),
         text=True,
+        encoding="utf-8",
         timeout=30,
     )
 

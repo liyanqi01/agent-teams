@@ -170,12 +170,12 @@ Future backends may include an external runtime adapter similar to an `acpx`-sty
 
 Recommended new package layout:
 
-- `src/agent_teams/gateway/models/`
-- `src/agent_teams/gateway/session/`
-- `src/agent_teams/gateway/dispatch/`
-- `src/agent_teams/gateway/bridges/acp_stdio/`
-- `src/agent_teams/gateway/backends/internal_runtime/`
-- `src/agent_teams/gateway/cli.py`
+- `src/relay_teams/gateway/models/`
+- `src/relay_teams/gateway/session/`
+- `src/relay_teams/gateway/dispatch/`
+- `src/relay_teams/gateway/bridges/acp_stdio/`
+- `src/relay_teams/gateway/backends/internal_runtime/`
+- `src/relay_teams/gateway/cli.py`
 
 Suggested responsibilities:
 
@@ -206,6 +206,22 @@ Critical process rule:
 - logs must go to `stderr` or files
 
 This implies a runtime mode or logger configuration path separate from the current HTTP server defaults.
+
+### 6.1 Multimodal ACP Transport
+
+ACP stdio must project the same visible multimodal payloads used by the model and frontend.
+
+Rules:
+
+- advertise `promptCapabilities.image = true`
+- advertise `promptCapabilities.audio = true`
+- ACP does not expose a first-class video prompt capability; video input and output must use `resource` / `resource_link`
+- inbound ACP `image` and `audio` blocks are normalized into session-scoped media assets before entering the run layer
+- inbound ACP `resource` / `resource_link` blocks may represent image, audio, or video references; video stays reference-only
+- outbound text remains `agent_message_chunk`
+- outbound image and audio payloads should be emitted as ACP content blocks
+- outbound video payloads should be emitted as `resource_link`
+- native media-generation progress should be bridged as ACP-compatible progress/tool updates so ACP hosts can render long-running generation without custom extensions
 
 ## 7. Gateway Session Model
 
@@ -321,6 +337,12 @@ This affects at least:
 - provider factory wiring
 - task execution runtime
 
+Skill-routing note:
+
+- gateway ACP stdio continues to reuse the internal runtime prompt pipeline
+- routed skill candidates therefore appear only in the per-turn user prompt appendix
+- gateway ACP must not add protocol fields just to carry skill-routing metadata
+
 ## 10. Bridge Strategy for MCP-over-ACP
 
 The current execution stack is not ACP-native.
@@ -354,6 +376,14 @@ Responsibilities:
 - external session identity
 - channel-specific presentation or approval UX
 - resume and follow-up behavior
+
+ACP-specific paused run behavior:
+
+- `session/prompt` should treat `run_paused` as the end of the current turn, not as a protocol error.
+- gateway session state must keep `active_run_id` while a run is paused for `awaiting_recovery`.
+- `session/resume` resumes the gateway session's active recoverable run and starts a new event watch cycle.
+- if the runtime replays already-emitted text while re-attaching the resumed watcher, the ACP bridge must suppress the previously delivered prefix and only forward the new continuation tail to the host.
+- the resume stream contract is "continue from the interruption point", not "re-send the already rendered answer".
 
 ### 11.2 Event Sources
 

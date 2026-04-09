@@ -25,26 +25,24 @@ Windows:
 
 ```powershell
 .\setup.bat
-uv sync --extra dev
 ```
 
 Linux/macOS:
 
 ```bash
 sh setup.sh
-uv sync --extra dev
 ```
 
 ### 3.2 Configure runtime files
 
 At minimum, complete the normal Agent Teams runtime setup first:
 
-- `~/.agent-teams/model.json`
-- optionally `~/.agent-teams/.env`
-- optionally `~/.agent-teams/secrets.json` when the machine has no usable keyring backend
-- optionally `~/.agent-teams/prompts.json`
+- `~/.relay-teams/model.json` by default, or the same files under `RELAY_TEAMS_CONFIG_DIR`
+- optionally `~/.relay-teams/.env`
+- optionally `~/.relay-teams/secrets.json` when the machine has no usable keyring backend
+- optionally `~/.relay-teams/prompts.json`
 - optionally one global instruction file:
-  - `~/.agent-teams/AGENTS.md`
+  - `~/.relay-teams/AGENTS.md`
   - otherwise `~/.claude/CLAUDE.md`
   - otherwise `~/.gemini/GEMINI.md`
 
@@ -72,6 +70,12 @@ Windows example:
 
 ```powershell
 uv --directory D:/openworkspace/agent_teams run agent-teams gateway acp stdio
+```
+
+To start ACP with a specific normal-mode role instead of the default `MainAgent`:
+
+```powershell
+uv --directory D:/openworkspace/agent_teams run agent-teams gateway acp stdio --role Crafter
 ```
 
 If the process starts and stays attached to the terminal, the ACP stdio gateway is up. Stop it with `Ctrl+C` after the check.
@@ -111,7 +115,9 @@ Typical user settings locations:
         "agent-teams",
         "gateway",
         "acp",
-        "stdio"
+        "stdio",
+        "--role",
+        "Crafter"
       ],
       "env": {
         "AGENT_LOG_LEVEL": "info"
@@ -135,7 +141,9 @@ Typical user settings locations:
         "agent-teams",
         "gateway",
         "acp",
-        "stdio"
+        "stdio",
+        "--role",
+        "Crafter"
       ],
       "env": {
         "AGENT_LOG_LEVEL": "info"
@@ -149,6 +157,8 @@ Notes:
 
 - `command` uses `uv`, and Zed launches the ACP agent as a stdio subprocess.
 - `--directory` pins the command to this repository so `uv run` does not depend on the currently opened Zed project directory.
+- optional `--role <role_id>` sets the default normal-mode root role for new ACP sessions created by that gateway process.
+- if `--role` is omitted, ACP-created sessions keep the default `MainAgent` behavior.
 - `env` is optional and mainly useful for debugging.
 - the stdio gateway already suppresses stdout console logging internally, so normal logs do not corrupt ACP responses
 
@@ -184,6 +194,8 @@ Example:
 
 Once the MCP server is active in Zed, `agent-teams` can receive it from ACP session setup, typically through `session/new` or `session/load`. Depending on how Zed provides that server, it may arrive as an ACP transport server or as a host-provided `stdio` server definition. No extra `agent-teams` bridge process or MCP config file is required for that Zed-provided server.
 
+When Zed supplies `cwd` on ACP session setup, `agent-teams` resolves it to an absolute workspace root. `session/new.cwd` binds the new internal session to that workspace. `session/load.cwd` reuses the same workspace when it points at the current root, or rebinds the loaded session to a different workspace when no active or recoverable run is attached.
+
 For Context7 specifically, prefer a custom context server entry such as:
 
 ```json
@@ -203,6 +215,8 @@ During a normal prompt turn, Zed should display:
 
 - streamed assistant output as it arrives
 - intermediate progress updates before the final answer text
+- image and audio outputs inline when the agent returns typed media content
+- video outputs as linked resources rather than inline ACP video blocks
 - tool call progress updates
 - raw tool input when the tool call includes arguments, including shell-style string arguments
 - MCP tools provided by Zed as normal tool calls when the model decides to use them
@@ -210,6 +224,8 @@ During a normal prompt turn, Zed should display:
 Zed renders your own user message itself, so the gateway does not send a second user echo in Zed mode.
 
 Formatting of streamed assistant text is preserved. Multi-line answers, indentation, and blank lines should render correctly in a new thread after upgrading.
+
+If a run is interrupted, a later ACP `session/resume` or any subsequent non-empty `session/prompt` should continue from the last visible breakpoint. Already rendered text must not be replayed from the top again.
 
 ## 8. Verifying MCP-over-ACP in Zed
 
@@ -230,6 +246,7 @@ When MCP-over-ACP is working, you should see:
 - the MCP tool name appear in the thread
 - the raw tool input rendered in Zed
 - the tool result streamed back into the reply
+- resumed follow-up output continue from the interruption point rather than replaying the whole prior answer
 
 For example, a Zed-provided Context7 server should surface runtime tool names such as `mcp-server-context7_resolve-library-id` and `mcp-server-context7_query-docs` inside an `agent-teams` thread.
 
@@ -280,7 +297,7 @@ If Zed cannot find `uv`:
 If the agent exits immediately:
 
 - check `model.json`, `.env`, and `secrets.json`
-- then confirm `uv sync --extra dev` was completed in this repository
+- then prefer `uv run --extra dev ...` for repository commands so Zed uses the project environment
 
 ## 10. Current implementation limits
 

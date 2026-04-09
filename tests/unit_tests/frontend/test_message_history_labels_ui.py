@@ -26,6 +26,7 @@ def test_message_history_uses_task_prompt_override_for_user_messages(
         source_path.read_text(encoding="utf-8")
         .replace("./helpers.js", "./mockHelpers.mjs")
         .replace("../../core/state.js", "./mockState.mjs")
+        .replace("../../utils/i18n.js", "./mockI18n.mjs")
     )
     module_under_test_path.write_text(source_text, encoding="utf-8")
 
@@ -129,6 +130,10 @@ export function resolvePendingToolBlock() {
     return null;
 }
 
+export function setToolStatus() {
+    return undefined;
+}
+
 export function setToolValidationFailureState() {
     return undefined;
 }
@@ -137,8 +142,16 @@ export function setToolValidationFailureState() {
     )
     (tmp_path / "mockState.mjs").write_text(
         """
-export function getPrimaryRoleLabel() {
-    return 'Coordinator';
+export function isRunPrimaryRoleId() {
+    return false;
+}
+""".strip(),
+        encoding="utf-8",
+    )
+    (tmp_path / "mockI18n.mjs").write_text(
+        """
+export function formatMessage(key) {
+    return key;
 }
 """.strip(),
         encoding="utf-8",
@@ -149,15 +162,19 @@ globalThis.__renderCalls = [];
 
 const { renderHistoricalMessageList } = await import('./history.mjs');
 
-renderHistoricalMessageList(
-    {
-        querySelector() {
-            return null;
+    renderHistoricalMessageList(
+        {
+            dataset: {},
+            querySelector() {
+                return null;
+            },
+            querySelectorAll() {
+                return [];
+            },
+            appendChild() {
+                return undefined;
+            },
         },
-        appendChild() {
-            return undefined;
-        },
-    },
     [
         {
             role: 'user',

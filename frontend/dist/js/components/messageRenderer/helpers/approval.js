@@ -3,6 +3,7 @@
  * Approval rendering and status helpers.
  */
 import { parseMarkdown } from '../../../utils/markdown.js';
+import { t } from '../../../utils/i18n.js';
 
 export function decoratePendingApprovalBlock(toolBlock, approval) {
     if (approval?.tool_call_id) {
@@ -10,18 +11,17 @@ export function decoratePendingApprovalBlock(toolBlock, approval) {
     }
 
     const statusEl = toolBlock.querySelector('.tool-status');
-    const resultEl = toolBlock.querySelector('.tool-result');
+    const outputEl = toolBlock.querySelector('.tool-output');
     if (statusEl) {
-        statusEl.innerHTML = `<svg class="status-icon status-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.29 3.86l-8.2 14.2A2 2 0 0 0 3.8 21h16.4a2 2 0 0 0 1.73-2.94l-8.2-14.2a2 2 0 0 0-3.46 0z"/></svg>`;
+        statusEl.innerHTML = `<svg class="status-icon status-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.29 3.86l-8.2 14.2A2 2 0 0 0 3.8 21h16.4a2 2 0 0 0 1.73-2.94l-8.2-14.2a2 2 0 0 0-3.46 0z"/></svg>`;
     }
-    if (resultEl) {
-        resultEl.classList.remove('error-text');
-        resultEl.classList.add('warning-text');
-        resultEl.innerHTML = parseMarkdown(formatPendingApprovalResult(approval));
+    if (outputEl) {
+        outputEl.classList.remove('error-text');
+        outputEl.classList.add('warning-text');
+        outputEl.innerHTML = parseMarkdown(formatPendingApprovalResult(approval));
     }
     if (String(approval?.status || 'requested').toLowerCase() === 'requested') {
-        const body = toolBlock.querySelector('.tool-body');
-        if (body) body.classList.add('open');
+        toolBlock.open = true;
     }
 
     let approvalEl = toolBlock.querySelector('.tool-approval-inline');
@@ -29,11 +29,14 @@ export function decoratePendingApprovalBlock(toolBlock, approval) {
         approvalEl = document.createElement('div');
         approvalEl.className = 'tool-approval-inline';
         approvalEl.innerHTML = `<div class="tool-approval-state"></div>`;
-        const body = toolBlock.querySelector('.tool-body');
-        if (body && resultEl) {
-            body.insertBefore(approvalEl, resultEl);
-        } else if (body) {
-            body.appendChild(approvalEl);
+        const detail = toolBlock.querySelector('.tool-detail');
+        if (detail && outputEl) {
+            const card = toolBlock.querySelector('.tool-detail-card');
+            if (card) {
+                card.insertBefore(approvalEl, outputEl);
+            }
+        } else if (detail) {
+            detail.appendChild(approvalEl);
         }
     }
     const stateEl = approvalEl.querySelector('.tool-approval-state');
@@ -62,12 +65,12 @@ export function syncApprovalStateFromEnvelope(toolBlock, envelope) {
         approvalEl = document.createElement('div');
         approvalEl.className = 'tool-approval-inline';
         approvalEl.innerHTML = `<div class="tool-approval-state"></div>`;
-        const body = toolBlock.querySelector('.tool-body');
-        const resultEl = toolBlock.querySelector('.tool-result');
-        if (body && resultEl) {
-            body.insertBefore(approvalEl, resultEl);
-        } else if (body) {
-            body.appendChild(approvalEl);
+        const card = toolBlock.querySelector('.tool-detail-card');
+        const outputEl = toolBlock.querySelector('.tool-output');
+        if (card && outputEl) {
+            card.insertBefore(approvalEl, outputEl);
+        } else if (card) {
+            card.appendChild(approvalEl);
         }
     }
 
@@ -78,24 +81,32 @@ export function syncApprovalStateFromEnvelope(toolBlock, envelope) {
 
 function historicalApprovalLabel(status) {
     const normalized = String(status || 'requested').toLowerCase();
-    if (normalized === 'approve') return 'Approval APPROVE';
-    if (normalized === 'deny') return 'Approval DENY';
-    if (normalized === 'timeout') return 'Approval TIMEOUT';
-    return 'Approval requested';
+    if (normalized === 'approve') return t('approval.state.approve');
+    if (normalized === 'deny') return t('approval.state.deny');
+    if (normalized === 'timeout') return t('approval.state.timeout');
+    return t('approval.state.requested');
 }
 
 function formatPendingApprovalResult(approval) {
+    const details = [
+        approval?.source ? `source: ${approval.source}` : '',
+        approval?.risk_level ? `risk: ${approval.risk_level}` : '',
+        approval?.permission_scope ? `scope: ${approval.permission_scope}` : '',
+        approval?.target_summary ? `target: ${approval.target_summary}` : '',
+    ].filter(Boolean).join('\n');
     const status = String(approval?.status || 'requested').toLowerCase();
     if (status === 'deny') {
-        return 'Approval denied. Tool was not executed.';
+        return details ? `${t('approval.result.denied')}\n\n${details}` : t('approval.result.denied');
     }
     if (status === 'timeout') {
-        return 'Approval timed out. Tool was not executed.';
+        return details ? `${t('approval.result.timeout')}\n\n${details}` : t('approval.result.timeout');
     }
     if (status === 'approve') {
-        return 'Approval approved, but no tool result was recorded. Run may have been interrupted.';
+        return details
+            ? `${t('approval.result.approved_no_result')}\n\n${details}`
+            : t('approval.result.approved_no_result');
     }
-    return 'Approval is pending. Approve or deny to continue.';
+    return details ? `${t('approval.result.pending')}\n\n${details}` : t('approval.result.pending');
 }
 
 function extractApprovalMeta(envelope) {
@@ -109,9 +120,9 @@ function extractApprovalMeta(envelope) {
 }
 
 function approvalStateLabel(status) {
-    if (status === 'approve') return 'Approval APPROVE';
-    if (status === 'deny') return 'Approval DENY';
-    if (status === 'timeout') return 'Approval TIMEOUT';
-    if (status === 'not_required') return 'Approval not required';
-    return 'Approval required';
+    if (status === 'approve') return t('approval.state.approve');
+    if (status === 'deny') return t('approval.state.deny');
+    if (status === 'timeout') return t('approval.state.timeout');
+    if (status === 'not_required') return t('approval.state.not_required');
+    return t('approval.state.required');
 }

@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from agent_teams.automation import (
+from relay_teams.automation import (
     AutomationDeliveryEvent,
     AutomationFeishuBinding,
     AutomationFeishuBindingCandidate,
@@ -17,8 +17,8 @@ from agent_teams.automation import (
     AutomationRunConfig,
     AutomationScheduleMode,
 )
-from agent_teams.interfaces.server.deps import get_automation_service
-from agent_teams.interfaces.server.routers import automation
+from relay_teams.interfaces.server.deps import get_automation_service
+from relay_teams.interfaces.server.routers import automation
 
 
 class _FakeAutomationService:
@@ -82,6 +82,7 @@ class _FakeAutomationService:
                 trigger_id="trg_feishu",
                 tenant_key="tenant-1",
                 chat_id="oc_123",
+                session_id="session-im-1",
                 chat_type="group",
                 source_label="Release Updates",
             ),
@@ -120,11 +121,14 @@ class _FakeAutomationService:
             raise KeyError(f"Unknown automation_project_id: {automation_project_id}")
         self.deleted_project_ids.append(automation_project_id)
 
-    def run_now(self, automation_project_id: str) -> dict[str, str]:
+    def run_now(self, automation_project_id: str) -> dict[str, str | bool | None]:
         self.run_calls.append(automation_project_id)
         return {
             "automation_project_id": automation_project_id,
             "session_id": "session-automation-1",
+            "run_id": "run-automation-1",
+            "queued": False,
+            "reused_bound_session": False,
         }
 
     def set_project_status(
@@ -132,6 +136,8 @@ class _FakeAutomationService:
         automation_project_id: str,
         status: AutomationProjectStatus,
     ) -> AutomationProjectRecord:
+        if automation_project_id == "invalid":
+            raise ValueError("Unknown workspace: missing-workspace")
         if automation_project_id != "aut_1":
             raise KeyError(f"Unknown automation_project_id: {automation_project_id}")
         self.status_calls.append((automation_project_id, status))
@@ -215,6 +221,26 @@ def test_create_project_route_maps_name_conflict_to_409() -> None:
     assert "already exists" in response.json()["detail"]
 
 
+def test_create_project_route_rejects_none_like_workspace_id() -> None:
+    fake_service = _FakeAutomationService()
+    client = _client(fake_service)
+
+    response = client.post(
+        "/api/automation/projects",
+        json={
+            "name": "daily-briefing",
+            "workspace_id": "None",
+            "prompt": "Summarize the day.",
+            "schedule_mode": "cron",
+            "cron_expression": "0 9 * * *",
+            "timezone": "UTC",
+        },
+    )
+
+    assert response.status_code == 422
+    assert fake_service.created_payloads == []
+
+
 def test_list_projects_route_returns_records() -> None:
     client = _client(_FakeAutomationService())
 
@@ -225,6 +251,7 @@ def test_list_projects_route_returns_records() -> None:
     assert payload[0]["automation_project_id"] == "aut_1"
     assert payload[0]["schedule_mode"] == "cron"
     assert payload[0]["delivery_binding"]["chat_id"] == "oc_123"
+    assert payload[0]["delivery_binding"]["session_id"] == "session-im-1"
     assert payload[0]["delivery_events"] == ["started", "completed", "failed"]
 
 
@@ -250,6 +277,14 @@ def test_get_project_route_returns_record() -> None:
     assert response.json()["automation_project_id"] == "aut_1"
 
 
+def test_get_project_route_rejects_none_like_path_identifier() -> None:
+    client = _client(_FakeAutomationService())
+
+    response = client.get("/api/automation/projects/None")
+
+    assert response.status_code == 422
+
+
 def test_run_project_route_returns_session_id() -> None:
     fake_service = _FakeAutomationService()
     client = _client(fake_service)
@@ -260,6 +295,9 @@ def test_run_project_route_returns_session_id() -> None:
     assert response.json() == {
         "automation_project_id": "aut_1",
         "session_id": "session-automation-1",
+        "run_id": "run-automation-1",
+        "queued": False,
+        "reused_bound_session": False,
     }
     assert fake_service.run_calls == ["aut_1"]
 
@@ -284,6 +322,15 @@ def test_enable_project_route_returns_enabled_record() -> None:
     assert response.status_code == 200
     assert response.json()["status"] == "enabled"
     assert fake_service.status_calls == [("aut_1", AutomationProjectStatus.ENABLED)]
+
+
+def test_enable_project_route_maps_validation_error_to_422() -> None:
+    client = _client(_FakeAutomationService())
+
+    response = client.post("/api/automation/projects/invalid:enable")
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Unknown workspace: missing-workspace"
 
 
 def test_disable_project_route_returns_disabled_record() -> None:

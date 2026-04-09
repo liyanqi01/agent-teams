@@ -7,9 +7,9 @@ import json
 from pathlib import Path
 from typing import cast
 
-from agent_teams.providers.model_config import DEFAULT_LLM_CONNECT_TIMEOUT_SECONDS
-from agent_teams.providers.model_config_manager import ModelConfigManager
-from agent_teams.secrets import AppSecretStore
+from relay_teams.providers.model_config import DEFAULT_LLM_CONNECT_TIMEOUT_SECONDS
+from relay_teams.providers.model_config_manager import ModelConfigManager
+from relay_teams.secrets import AppSecretStore
 
 
 class _FileOnlySecretStore(AppSecretStore):
@@ -70,6 +70,93 @@ def test_save_model_profile_and_get_model_profiles(tmp_path: Path) -> None:
     ]
 
 
+def test_save_model_profile_and_get_model_profiles_with_secret_headers(
+    tmp_path: Path,
+) -> None:
+    manager = ModelConfigManager(
+        config_dir=tmp_path,
+        secret_store=_FileOnlySecretStore(),
+    )
+
+    manager.save_model_profile(
+        "default",
+        {
+            "provider": "openai_compatible",
+            "model": "gpt-4o-mini",
+            "base_url": "https://example.test/v1",
+            "headers": [
+                {
+                    "name": "Authorization",
+                    "value": "Bearer header-secret",
+                    "secret": True,
+                }
+            ],
+        },
+    )
+
+    profiles = manager.get_model_profiles()
+
+    assert profiles["default"]["api_key"] == ""
+    assert profiles["default"]["has_api_key"] is False
+    headers = cast(list[dict[str, JsonValue]], profiles["default"]["headers"])
+    assert headers[0]["name"] == "Authorization"
+    assert headers[0]["value"] == "Bearer header-secret"
+    model_payload = json.loads((tmp_path / "model.json").read_text(encoding="utf-8"))
+    assert model_payload["default"]["headers"] == [
+        {
+            "name": "Authorization",
+            "secret": True,
+            "configured": False,
+        }
+    ]
+
+
+def test_save_model_profile_preserves_existing_secret_header_when_blank(
+    tmp_path: Path,
+) -> None:
+    manager = ModelConfigManager(
+        config_dir=tmp_path,
+        secret_store=_FileOnlySecretStore(),
+    )
+    manager.save_model_profile(
+        "default",
+        {
+            "provider": "openai_compatible",
+            "model": "gpt-4o-mini",
+            "base_url": "https://example.test/v1",
+            "headers": [
+                {
+                    "name": "Authorization",
+                    "value": "Bearer first-secret",
+                    "secret": True,
+                }
+            ],
+        },
+    )
+
+    manager.save_model_profile(
+        "default",
+        {
+            "provider": "openai_compatible",
+            "model": "kimi-k2.5",
+            "base_url": "https://api.moonshot.cn/v1",
+            "headers": [
+                {
+                    "name": "Authorization",
+                    "secret": True,
+                    "configured": True,
+                }
+            ],
+        },
+    )
+
+    config = manager.get_model_config()
+    saved_profile = cast(dict[str, JsonValue], config["default"])
+    saved_headers = cast(list[dict[str, JsonValue]], saved_profile["headers"])
+    assert saved_profile["model"] == "kimi-k2.5"
+    assert saved_headers[0]["value"] == "Bearer first-secret"
+
+
 def test_get_model_profiles_uses_default_connect_timeout_when_missing(
     tmp_path: Path,
 ) -> None:
@@ -95,6 +182,53 @@ def test_get_model_profiles_uses_default_connect_timeout_when_missing(
         profiles["default"]["connect_timeout_seconds"]
         == DEFAULT_LLM_CONNECT_TIMEOUT_SECONDS
     )
+    assert profiles["default"]["max_tokens"] is None
+
+
+def test_get_model_profiles_infers_known_context_window_when_missing(
+    tmp_path: Path,
+) -> None:
+    manager = ModelConfigManager(config_dir=tmp_path)
+    model_file = tmp_path / "model.json"
+    model_file.write_text(
+        json.dumps(
+            {
+                "default": {
+                    "provider": "openai_compatible",
+                    "model": "gpt-4o-mini",
+                    "base_url": "https://example.test/v1",
+                    "api_key": "secret-key",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    profiles = manager.get_model_profiles()
+
+    assert profiles["default"]["context_window"] == 128000
+
+
+def test_save_model_profile_omits_max_tokens_when_unset(tmp_path: Path) -> None:
+    manager = ModelConfigManager(config_dir=tmp_path)
+
+    manager.save_model_profile(
+        "default",
+        {
+            "provider": "openai_compatible",
+            "model": "gpt-4.1",
+            "base_url": "https://example.test/v1",
+            "api_key": "secret-key",
+            "temperature": 0.2,
+            "top_p": 1.0,
+            "max_tokens": None,
+        },
+    )
+
+    config = manager.get_model_config()
+    saved_profile = cast(dict[str, JsonValue], config["default"])
+
+    assert "max_tokens" not in saved_profile
 
 
 def test_delete_model_profile_removes_entry(tmp_path: Path) -> None:
@@ -169,6 +303,30 @@ def test_save_model_profile_preserves_existing_api_key_when_blank(
     assert saved_profile["model"] == "kimi-k2.5"
     assert saved_profile["top_p"] == 0.95
     assert saved_profile["api_key"] == "secret-key"
+
+
+def test_save_model_profile_persists_inferred_context_window_when_missing(
+    tmp_path: Path,
+) -> None:
+    manager = ModelConfigManager(config_dir=tmp_path)
+
+    manager.save_model_profile(
+        "default",
+        {
+            "provider": "openai_compatible",
+            "model": "gpt-4.1",
+            "base_url": "https://example.test/v1",
+            "api_key": "secret-key",
+            "temperature": 0.2,
+            "top_p": 1.0,
+            "max_tokens": 1024,
+        },
+    )
+
+    config = manager.get_model_config()
+    saved_profile = cast(dict[str, JsonValue], config["default"])
+
+    assert saved_profile["context_window"] == 1000000
 
 
 def test_save_model_profile_renames_and_preserves_existing_api_key(

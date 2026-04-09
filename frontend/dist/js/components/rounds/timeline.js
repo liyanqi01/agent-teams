@@ -23,6 +23,7 @@ import { applyRoundPage, fetchInitialRoundsPage, fetchOlderRoundsPage } from './
 import { roundsState } from './state.js';
 import { roundSectionId, esc, roundStateLabel, roundStateTone } from './utils.js';
 import { errorToPayload, logError } from '../../utils/logger.js';
+import { formatMessage, t } from '../../utils/i18n.js';
 
 export let currentRounds = [];
 export let currentRound = null;
@@ -242,6 +243,14 @@ function renderSessionTimeline(rounds, opts = { preserveScroll: true }) {
     if (!container) return;
 
     const oldScroll = container.scrollTop;
+
+    // Hide container during render to prevent flash of content at wrong
+    // scroll position before we reposition.
+    const shouldHideDuringRender = !opts.preserveScroll;
+    if (shouldHideDuringRender) {
+        container.style.visibility = 'hidden';
+    }
+
     container.innerHTML = '';
 
     clearAllStreamState({ preserveOverlay: true });
@@ -259,6 +268,9 @@ function renderSessionTimeline(rounds, opts = { preserveScroll: true }) {
         setRoundPendingApprovals('', [], {});
         renderRoundNavigator([], selectRound);
         syncRetryTimelineTimer();
+        if (shouldHideDuringRender) {
+            container.style.visibility = '';
+        }
         return;
     }
 
@@ -304,6 +316,11 @@ function renderSessionTimeline(rounds, opts = { preserveScroll: true }) {
         container.scrollTop = container.scrollHeight;
         activateLatestRound(rounds);
     }
+
+    if (shouldHideDuringRender) {
+        container.style.visibility = '';
+    }
+
     schedulePostLayoutRoundSync(container);
     syncRetryTimelineTimer();
 }
@@ -385,6 +402,7 @@ function renderRoundSection(round, index) {
     section.className = 'session-round-section';
     section.dataset.runId = round.run_id;
     section.id = roundSectionId(round.run_id);
+    if (round.created_at) section.dataset.roundCreatedAt = round.created_at;
 
     const time = new Date(round.created_at).toLocaleString();
     const stateLabel = roundStateLabel(round);
@@ -397,15 +415,18 @@ function renderRoundSection(round, index) {
             <div class="round-detail-mainline">
                 <div class="round-detail-label">Round ${index + 1}${round.run_status === 'running' ? ' <span class="live-badge">LIVE</span>' : ''}</div>
                 <div class="round-detail-meta">
-                    <div class="round-detail-time">${time}</div>
+                <div class="round-detail-time">${time}</div>
                     <div class="round-detail-token-host"></div>
                 </div>
             </div>
             <div class="round-detail-badges">${renderRoundBadges(round, stateLabel, stateTone, approvalCount)}</div>
-        </div>
-        <div class="round-detail-intent">${esc(round.intent || 'No intent')}</div>`;
+        </div>`;
+    header.appendChild(buildRoundIntentBlock(round.intent || t('rounds.no_intent')));
     section.appendChild(header);
     renderRoundRetryEvents(section, round.retry_events || []);
+    if (round.compaction_marker_before) {
+        section.appendChild(renderRoundHistoryDivider(round.compaction_marker_before));
+    }
 
     const pendingCoordinatorApprovals = (round.pending_tool_approvals || []).filter(item => {
         const roleId = item?.role_id || '';
@@ -413,25 +434,36 @@ function renderRoundSection(round, index) {
     });
     const coordinatorOverlay = getCoordinatorStreamOverlay(round.run_id);
     const primaryRoleLabel = getRunPrimaryRoleLabel(round.run_id);
+    const isLatestRound = index === roundsState.currentRounds.length - 1;
 
     if (round.coordinator_messages?.length > 0) {
         renderHistoricalMessageList(section, round.coordinator_messages, {
+            collapsibleUserPrompts: true,
             pendingToolApprovals: pendingCoordinatorApprovals,
             primaryRoleLabel,
             runId: round.run_id,
+            runStatus: round.run_status,
+            runPhase: round.run_phase,
+            isLatestRound,
             streamOverlayEntry: coordinatorOverlay,
         });
     } else if (pendingCoordinatorApprovals.length > 0 || coordinatorOverlay) {
         renderHistoricalMessageList(section, [], {
+            collapsibleUserPrompts: true,
             pendingToolApprovals: pendingCoordinatorApprovals,
             primaryRoleLabel,
             runId: round.run_id,
+            runStatus: round.run_status,
+            runPhase: round.run_phase,
+            isLatestRound,
             streamOverlayEntry: coordinatorOverlay,
         });
     } else if (!round.has_user_messages) {
         const empty = document.createElement('div');
         empty.className = 'panel-empty';
-        empty.textContent = `No ${primaryRoleLabel.toLowerCase()} messages in this round.`;
+        empty.textContent = formatMessage('rounds.no_messages', {
+            role: primaryRoleLabel.toLowerCase(),
+        });
         section.appendChild(empty);
     }
 
@@ -442,11 +474,15 @@ function renderRoundSection(round, index) {
             const fmt = n => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
             const pill = document.createElement('div');
             pill.className = 'round-token-summary';
-            pill.title = `Input: ${usage.total_input_tokens} | Output: ${usage.total_output_tokens} | Requests: ${usage.total_requests}`;
+            pill.title = formatMessage('rounds.token_title', {
+                input: usage.total_input_tokens,
+                output: usage.total_output_tokens,
+                requests: usage.total_requests,
+            });
             pill.innerHTML = `
-                <span class="token-in">In ${fmt(usage.total_input_tokens)}</span>
-                <span class="token-out">Out ${fmt(usage.total_output_tokens)}</span>
-                ${usage.total_tool_calls > 0 ? `<span class="token-tools">Tools ${usage.total_tool_calls}</span>` : ''}
+                <span class="token-in">${esc(formatMessage('rounds.token_in', { value: fmt(usage.total_input_tokens) }))}</span>
+                <span class="token-out">${esc(formatMessage('rounds.token_out', { value: fmt(usage.total_output_tokens) }))}</span>
+                ${usage.total_tool_calls > 0 ? `<span class="token-tools">${esc(formatMessage('rounds.token_tools', { value: usage.total_tool_calls }))}</span>` : ''}
             `;
             const tokenHost = headerEl.querySelector('.round-detail-token-host');
             if (tokenHost) {
@@ -456,6 +492,57 @@ function renderRoundSection(round, index) {
     }
 
     return section;
+}
+
+function buildRoundIntentBlock(intentText) {
+    const normalized = normalizeRoundIntentText(intentText);
+
+    const block = document.createElement('details');
+    block.className = 'round-detail-intent';
+    block.innerHTML = `
+        <summary class="round-detail-intent-summary">
+            <span class="round-detail-intent-preview"></span>
+            <span class="round-detail-intent-toggle"></span>
+        </summary>
+        <div class="round-detail-intent-body">
+            <div class="round-detail-intent-content"></div>
+            <div class="round-detail-intent-actions">
+                <button type="button" class="round-detail-intent-collapse"></button>
+            </div>
+        </div>
+    `;
+
+    const previewEl = block.querySelector('.round-detail-intent-preview');
+    const toggleEl = block.querySelector('.round-detail-intent-toggle');
+    const bodyEl = block.querySelector('.round-detail-intent-content');
+    const collapseBtn = block.querySelector('.round-detail-intent-collapse');
+    if (previewEl) {
+        previewEl.textContent = normalized;
+    }
+    if (toggleEl) {
+        toggleEl.textContent = t('rounds.expand');
+    }
+    if (bodyEl) {
+        bodyEl.textContent = normalized;
+    }
+    if (collapseBtn) {
+        collapseBtn.textContent = t('rounds.collapse');
+        collapseBtn.addEventListener('click', event => {
+            event.preventDefault();
+            block.open = false;
+        });
+    }
+    block.addEventListener('toggle', () => {
+        if (toggleEl) {
+            toggleEl.textContent = t('rounds.expand');
+        }
+    });
+    return block;
+}
+
+function normalizeRoundIntentText(intentText) {
+    const normalized = String(intentText || '').replace(/\r\n?/g, '\n').trim();
+    return normalized || t('rounds.no_intent');
 }
 
 function splitRoundsByHistoryMarkers(rounds) {
@@ -511,6 +598,18 @@ function renderClearDivider(segment, isExpanded) {
         toggleHistorySegment(segment.segmentId);
     });
     return button;
+}
+
+function renderRoundHistoryDivider(marker) {
+    const divider = document.createElement('div');
+    divider.className = 'round-history-divider';
+    divider.dataset.markerType = String(marker?.marker_type || '');
+    divider.innerHTML = `
+        <span class="round-history-divider-line" aria-hidden="true"></span>
+        <span class="round-history-divider-chip">${esc(String(marker?.label || t('rounds.history_compacted')))}</span>
+        <span class="round-history-divider-line" aria-hidden="true"></span>
+    `;
+    return divider;
 }
 
 function toggleHistorySegment(segmentId, expanded) {
@@ -647,9 +746,11 @@ async function loadOlderRounds() {
         }
         applyRoundPage(page, { prepend: true });
         syncExportedState();
+        container.style.visibility = 'hidden';
         renderSessionTimeline(roundsState.currentRounds, { preserveScroll: true });
         const newHeight = container.scrollHeight;
         container.scrollTop = newHeight - oldHeight + oldTop;
+        container.style.visibility = '';
     } catch (e) {
         logError(
             'frontend.rounds.load_older_failed',
@@ -744,10 +845,35 @@ function patchAllActiveRetryEvents() {
 }
 
 function renderRoundBadges(round, stateLabel, stateTone, approvalCount) {
+    const microcompactBadge = renderMicrocompactBadge(round?.microcompact);
     return `
         ${stateLabel ? `<span class="round-state-pill round-state-${stateTone}">${esc(stateLabel)}</span>` : ''}
-        ${approvalCount > 0 ? `<span class="round-state-pill round-state-warning">${approvalCount} approval${approvalCount === 1 ? '' : 's'}</span>` : ''}
+        ${approvalCount > 0 ? `<span class="round-state-pill round-state-warning">${esc(t('rounds.pending_approvals').replace('{count}', String(approvalCount)))}</span>` : ''}
+        ${microcompactBadge}
     `;
+}
+
+function renderMicrocompactBadge(microcompact) {
+    if (!microcompact || microcompact.applied !== true) {
+        return '';
+    }
+    const before = formatRoundTokenCount(microcompact.estimated_tokens_before);
+    const after = formatRoundTokenCount(microcompact.estimated_tokens_after);
+    const messageCount = Number(microcompact.compacted_message_count || 0);
+    const partCount = Number(microcompact.compacted_part_count || 0);
+    const label = formatMessage('rounds.microcompact_badge', { before, after });
+    const title = formatMessage('rounds.microcompact_title', {
+        before: String(Number(microcompact.estimated_tokens_before || 0)),
+        after: String(Number(microcompact.estimated_tokens_after || 0)),
+        messages: String(messageCount),
+        parts: String(partCount),
+    });
+    return `<span class="round-state-pill round-state-idle" title="${esc(title)}">${esc(label)}</span>`;
+}
+
+function formatRoundTokenCount(value) {
+    const normalized = Math.max(0, Number(value || 0));
+    return normalized >= 1000 ? `${(normalized / 1000).toFixed(1)}k` : String(normalized);
 }
 
 function renderRoundRetryEvents(section, retryEvents) {

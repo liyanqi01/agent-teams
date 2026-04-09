@@ -15,6 +15,10 @@ Common status codes:
 - `409`: runtime conflict
 - `422`: request validation error
 
+Common validation rules:
+- Identifier and reference fields reject blank strings, whitespace-only strings, and the explicit string values `"None"` and `"null"` with `422`.
+- Optional identifier fields still accept real JSON `null`.
+
 ## Core Concepts
 
 - A run starts from one root task.
@@ -43,6 +47,36 @@ Task status values:
 
 Returns service health.
 
+Response fields:
+- `status`
+- `version`
+- `python_executable`
+- `package_root`
+- `config_dir`
+- `builtin_roles_dir`
+- `builtin_skills_dir`
+- `role_registry_sanity`
+  - `builtin_role_count`
+  - `builtin_role_ids`
+  - `has_builtin_coordinator`
+  - `has_builtin_main_agent`
+- `skill_registry_sanity`
+  - `builtin_skill_count`
+  - `builtin_skill_refs`
+  - `has_builtin_deepresearch`
+- `tool_registry_sanity`
+  - `available_tool_count`
+  - `available_tool_names`
+  - `unavailable_tool_count`
+  - `unavailable_tools[]`
+    - `name`
+    - `error_type`
+    - `message`
+
+Notes:
+- Health stays `200 ok` for a reachable server even when builtin roles or local
+  tools are degraded; inspect the `*_sanity` fields for diagnosis.
+
 ### `GET /system/configs`
 
 Returns runtime config load status for model, MCP, skills, and effective proxy settings.
@@ -62,23 +96,26 @@ Request field:
 ### `GET /system/configs/model`
 
 Returns the persisted model config with secret-backed profile API keys rehydrated for UI editing.
-Literal profile `api_key` values are migrated out of `model.json` into the unified secret store on read.
+Literal profile `api_key` values and secret header values are migrated out of `model.json` into the unified secret store on read.
 
 ### `GET /system/configs/model/profiles`
 
 Returns normalized model profiles.
-Each profile includes `has_api_key`, the currently stored `api_key` value so the web UI can mask it by default and reveal it on demand, `is_default` to mark the runtime fallback profile, and optional `context_window` for next-send context preview UI.
+Each profile includes `has_api_key`, the currently stored `api_key` value so the web UI can mask it by default and reveal it on demand, `headers[]` for additional request headers, `is_default` to mark the runtime fallback profile, and optional `context_window` for next-send context preview UI.
 `provider` currently supports `openai_compatible`, `bigmodel`, and the internal/testing-only `echo`.
 When no profile is explicitly marked default, the backend resolves the default in this order: a profile named `default`, the only configured profile, then the first profile by name.
 
 ### `PUT /system/configs/model/profiles/{name}`
 
 Upserts a model profile.
-Request body may include optional `source_name` to rename an existing profile while preserving its stored API key when `api_key` is omitted.
+Request body may include optional `source_name` to rename an existing profile while preserving its stored API key and secret headers when `api_key` and `headers` are omitted.
 `provider` accepts `openai_compatible`, `bigmodel`, and `echo`.
 Profiles may also include optional `ssl_verify` to override the global outbound TLS verification default for that model only.
 Profiles may include `is_default` to promote that profile to the runtime default; saving one default clears the flag from all others.
-Profiles may include optional `context_window` to declare the total model context limit separately from `max_tokens`, which remains the output-token cap.
+Profiles may include optional `context_window` to declare the total model context limit separately from `max_tokens`, which remains the output-token cap when explicitly set. If `max_tokens` is omitted, the backend preserves that unset state and lets the provider decide the default output cap for primary LLM requests.
+Profiles may include `headers[]`, where each item has `name`, optional `value`, optional `secret`, and optional `configured`.
+Profiles must provide at least one auth source: `api_key` or one configured header.
+When `context_window` is omitted and the backend recognizes the provider/model pair, it may auto-fill a known context limit during save and runtime load.
 
 ### `DELETE /system/configs/model/profiles/{name}`
 
@@ -88,21 +125,28 @@ If the deleted profile was the current default and other profiles remain, the ba
 ### `PUT /system/configs/model`
 
 Replaces the full model config object.
-Literal profile `api_key` values are moved into the unified secret store before `model.json` is written.
+Literal profile `api_key` values and secret header values are moved into the unified secret store before `model.json` is written.
 
 ### `POST /system/configs/model:probe`
 
 Tests model connectivity for a saved profile and/or draft override.
-Draft overrides may include optional `ssl_verify`; effective TLS verification resolves as `override.ssl_verify` -> global `SSL_VERIFY` -> default `true`.
+Draft overrides may include optional `ssl_verify`; effective TLS verification resolves as `override.ssl_verify` -> global `SSL_VERIFY` -> default `false`.
+Draft overrides may include `headers[]` and may omit `api_key` when headers are provided.
 If `timeout_ms` is omitted, the backend uses the resolved profile `connect_timeout_seconds` value, or `15s` when no saved profile is involved.
 
 ### `POST /system/configs/model:discover`
 
 Fetches the available model catalog for a saved profile and/or draft override.
-Draft overrides may omit `model`, but must provide `base_url` and `api_key` when `profile_name` is omitted.
-When `profile_name` is provided, the request may override `base_url`, `api_key`, and `ssl_verify` while reusing the saved credentials for any omitted fields.
+Draft overrides may omit `model`, but must provide `base_url` and `api_key` or `headers` when `profile_name` is omitted.
+When `profile_name` is provided, the request may override `base_url`, `api_key`, `headers`, and `ssl_verify` while reusing the saved credentials for any omitted fields.
 If `timeout_ms` is omitted, the backend uses the resolved profile `connect_timeout_seconds` value, or `15s` when no saved profile is involved.
 `openai_compatible` and `bigmodel` both map this call to `GET {base_url}/models` and return the normalized `models` list sorted and deduplicated.
+When the provider exposes per-model context-limit metadata in the catalog payload, the response also includes `model_entries[]` with:
+- `model`
+- optional `context_window`
+
+The settings UI uses `model_entries[].context_window` to auto-fill the profile context window field after model discovery. Providers that return only model ids will still populate `models[]`, but `context_window` remains user-specified.
+For a small set of known provider/model pairs, the backend also applies a built-in context-window fallback when the provider returns only model ids.
 
 ### `POST /system/configs/model:reload`
 
@@ -110,7 +154,7 @@ Reloads model config into runtime.
 
 ### `GET /system/configs/proxy`
 
-Returns the saved proxy configuration assembled from app `~/.agent-teams/.env` plus the unified secret store.
+Returns the saved proxy configuration assembled from app `.env` in the resolved config dir, by default `~/.relay-teams/.env`, plus the unified secret store.
 Fields: `http_proxy`, `https_proxy`, `all_proxy`, `no_proxy`, `proxy_username`, `proxy_password`, `ssl_verify`.
 Saved proxy URLs are returned without embedded credentials when the configured proxy URLs share the same username/password pair.
 If the password was persisted through the secret store, the API rehydrates it into `proxy_password` for editing.
@@ -118,12 +162,12 @@ If a user manually forces `user:password@host` into `.env`, runtime loading stil
 
 ### `PUT /system/configs/proxy`
 
-Saves proxy values into app `~/.agent-teams/.env` and the unified secret store, then reloads runtime proxy state immediately.
+Saves proxy values into app `.env` in the resolved config dir, by default `~/.relay-teams/.env`, and the unified secret store, then reloads runtime proxy state immediately.
 Blank values remove the corresponding proxy key.
 `proxy_username` and `proxy_password` are optional shared credentials.
 `ssl_verify` controls the default TLS certificate verification policy for Agent Teams outbound HTTP clients.
-When omitted or `null`, the backend removes `SSL_VERIFY` from `.env` and falls back to strict verification by default.
-On save, proxy passwords are persisted through the unified secret store. When a usable system keyring backend exists, the secret store uses keyring; otherwise it falls back to `~/.agent-teams/secrets.json`.
+When omitted or `null`, the backend removes `SSL_VERIFY` from `.env` and falls back to skipping certificate verification by default.
+On save, proxy passwords are persisted through the unified secret store. When a usable system keyring backend exists, the secret store uses keyring; otherwise it falls back to `secrets.json` in the resolved config dir, by default `~/.relay-teams/secrets.json`.
 The `.env` file stores proxy URLs without the password portion.
 Runtime loading still supports manual `.env` proxy URLs that already contain embedded passwords.
 `no_proxy` accepts both comma-separated and semicolon-separated entries. Wildcard host patterns such as `127.*`, `192.168.*`, and the special token `<local>` are supported.
@@ -132,17 +176,22 @@ Runtime loading still supports manual `.env` proxy URLs that already contain emb
 
 Returns the saved web tool configuration.
 Fields:
-- `provider`: currently only `exa`
-- `api_key`: optional value rehydrated from the unified secret store
+- `provider`: always `exa`
+- `exa_api_key`: optional Exa key rehydrated from the unified secret store
+- `fallback_provider`: `searxng` by default, or `disabled` when automatic fallback is explicitly turned off
+- `searxng_instance_url`: the SearXNG base URL used for fallback, defaulting to `https://search.mdosch.de/`
+- `searxng_instance_seeds`: the built-in SearXNG seed instances exposed read-only for the settings UI
 
-The web settings UI intentionally stays minimal. All other `websearch` and `webfetch` behavior is fixed in code, including the Exa MCP endpoint, fetch size limit, and temp file location under `~/.agent-teams/.../tmp`.
+`websearch` returns structured search hits and accepts optional allow/block domain filters at tool-call time. Exa remains the primary hosted search backend. By default, Exa quota and rate-limit failures automatically retry against SearXNG. Setting `fallback_provider=disabled` explicitly turns that retry path off. The runtime uses `searxng_instance_url` as the first candidate and, when that URL is the shared default, continues through a built-in public SearXNG instance pool sourced from `searx.space` and seed URLs, with short-lived per-instance cooldowns for failing endpoints. Persisted tool state stores only sanitized host/tool metadata and must not retain API-key-bearing URLs. `webfetch` keeps a fixed `5 MiB` limit for textual responses, while binary responses are streamed to the workspace temp directory with a fixed `512 MiB` cap. When the upstream origin proves `Range` support through a valid byte-range probe and returns a strong validator such as `ETag` or `Last-Modified`, binary downloads use segmented fetching and workspace-scoped resume state to continue later calls from the last completed offset.
 
 ### `PUT /system/configs/web`
 
 Saves the web tool configuration.
-`provider` is currently fixed to `exa`.
-`api_key` is optional because Exa hosted MCP can be used without a key; providing one only raises the rate-limit ceiling.
-The backend persists the API key only through the unified secret store and does not write it back to `.env`.
+`provider` accepts only `exa`.
+`exa_api_key` remains optional because Exa hosted MCP can be used without a key; providing one only raises the rate-limit ceiling.
+`fallback_provider` defaults to `searxng`. Set it to `disabled` to opt out of automatic retry after Exa quota and rate-limit failures.
+`searxng_instance_url` defaults to `https://search.mdosch.de/`.
+The backend persists the Exa API key only through the unified secret store and does not write it back to `.env`.
 
 ### `GET /system/configs/github`
 
@@ -235,6 +284,7 @@ Response fields:
 ### `POST /system/configs/proxy:reload`
 
 Reloads effective proxy env into runtime.
+The reload source is the current effective merged environment, not only app-saved `.env` values.
 This updates process-level proxy variables for future HTTP requests and shell/MCP subprocesses, clears removed proxy keys, and refreshes MCP runtime state.
 
 ### `POST /system/configs/mcp:reload`
@@ -287,7 +337,7 @@ Rules:
 
 Returns environment variables grouped by `system` and `app` scope.
 `system` is read-only and reflects the effective runtime environment currently visible to the Agent Teams server and newly spawned child processes.
-`app` is editable and is stored across `~/.agent-teams/.env` and the unified secret store.
+`app` is editable and is stored across `.env` in the resolved config dir, by default `~/.relay-teams/.env`, and the unified secret store.
 Sensitive-looking app keys such as `*_API_KEY`, `*_TOKEN`, `*_SECRET`, and `*_PASSWORD` are stored in the secret store and excluded from `.env`.
 Each record includes `key`, `value`, `scope`, and `value_kind` (`string` or `expandable`).
 
@@ -301,6 +351,8 @@ Request body fields:
 `app` writes preserve unrelated `.env` lines and comments where possible.
 Sensitive app keys are written to the secret store instead of `.env`, and any managed plaintext copy is removed from `.env`.
 The backend preserves the existing value kind on edit or rename when possible, otherwise it infers `expandable` when the value contains `%NAME%` placeholders.
+Saving an app variable also reloads runtime model config immediately, so `model.json` placeholders such as `${OPENAI_API_KEY}` take effect without a restart.
+Changes to `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, or `SSL_VERIFY` also trigger the same proxy runtime refresh side effects as the dedicated proxy settings API.
 `system` scope is read-only and returns a user-facing validation error on mutation.
 
 ### `DELETE /system/configs/environment-variables/{scope}/{key}`
@@ -336,6 +388,7 @@ Notes:
 - New sessions default to `session_mode = "normal"`.
 - New sessions default to `normal_root_role_id = "MainAgent"`.
 - New sessions also store the current default orchestration preset id so they can be switched to orchestration before the first run.
+- Omitting `session_id` or sending `session_id = null` auto-generates a session id. Sending `"None"` or `"null"` as a string is rejected with `422`.
 
 ### `GET /sessions`
 
@@ -431,11 +484,24 @@ Response shape:
       "run_status": "running",
       "run_phase": "idle",
       "is_recoverable": true,
+      "microcompact": {
+        "applied": true,
+        "estimated_tokens_before": 139920,
+        "estimated_tokens_after": 9009,
+        "compacted_message_count": 1,
+        "compacted_part_count": 3
+      },
       "clear_marker_before": {
         "marker_id": "marker-1",
         "marker_type": "clear",
         "created_at": "2026-03-11T11:59:30Z",
         "label": "History cleared"
+      },
+      "compaction_marker_before": {
+        "marker_id": "marker-2",
+        "marker_type": "compaction",
+        "created_at": "2026-03-11T12:10:00Z",
+        "label": "History compacted (rolling summary)"
       }
     }
   ],
@@ -451,7 +517,14 @@ Notes:
 - `retry_events` reflects the current retry card for the run timeline. The array is empty when no retry state should be shown and contains at most one entry.
 - Active retry countdowns are anchored to the event `occurred_at` timestamp, not to the browser receive time.
 - `retry_events[].phase` is `scheduled` while backoff is pending and `failed` when retries have been exhausted.
+- `microcompact` is present when the run used request-level prompt-view compaction. It is not a persisted history boundary and does not imply that a history marker was written.
+- `microcompact.estimated_tokens_before/after` reflects history-token estimates around the request-level microcompact pass, not the full prompt token total.
+- `microcompact` reflects the latest model-step payload for that run. If a later attempt in the same run reports `microcompact_applied = false`, the round projection clears the stale badge state instead of keeping the older value.
 - `clear_marker_before` is present on the first round after a session history clear boundary. The frontend uses it to render a divider and collapse older segments by default.
+- `compaction_marker_before` is present on the first round whose coordinator conversation continues after an automatic history compaction boundary. The frontend uses it to render a non-collapsing divider.
+- `compaction_marker_before.label` is `History compacted (rolling summary)` when the marker metadata reports `compaction_strategy = rolling_summary`; older markers without strategy metadata may still render as `History compacted`.
+- `microcompact` and `compaction_marker_before` may both be present on the same round. In that case the request first used microcompact and then also crossed a persisted full-compaction boundary.
+- Automatic history compaction is logical only. Older messages are marked hidden-from-context for model reads, but remain available to raw/history endpoints.
 - When legacy destructive clear behavior left a completed run with no persisted coordinator message rows, the round projection may synthesize one assistant text message from the persisted `run_completed.output`.
 
 ### `GET /sessions/{session_id}/rounds/{run_id}`
@@ -460,17 +533,40 @@ Gets one round projection.
 
 ### `GET /sessions/{session_id}/recovery`
 
-Returns active run recovery state, pending tool approvals, paused subagent state, and round snapshot.
+Returns active run recovery state, pending tool approvals, managed background task state, paused subagent state, and round snapshot.
 
 `active_run` also includes:
 - `last_event_id`
 - `checkpoint_event_id`
+- `background_task_count`
 - `stream_connected`
 - `should_show_recover`
 - `primary_role_id`
 
 For `running` or `queued` recoverable runs, the frontend uses these event ids to automatically reconnect the SSE stream without a manual "Connect Stream" action.
 `round_snapshot` mirrors the same round projection contract as `/sessions/{session_id}/rounds/{run_id}`, including `primary_role_id`.
+`round_snapshot.background_task_count` mirrors the current managed background task count for the active run.
+
+`background_tasks[]` entries include:
+- `background_task_id`
+- `run_id`
+- `session_id`
+- `instance_id`
+- `role_id`
+- `tool_call_id`
+- `command`
+- `cwd`
+- `execution_mode = "background"`
+- `status`: `running | blocked | stopped | failed | completed`
+- `tty`
+- `timeout_ms`
+- `exit_code`
+- `recent_output[]`
+- `output_excerpt`
+- `log_path`
+- `created_at`
+- `updated_at`
+- `completed_at`
 
 ### `GET /sessions/{session_id}/agents`
 
@@ -493,11 +589,18 @@ Lists persisted business events in the session.
 
 ### `GET /sessions/{session_id}/messages`
 
-Lists persisted messages in the active session segment only. Rows before the latest logical `clear` marker are excluded from this endpoint.
+Lists persisted messages in the active session segment only. Rows before the latest logical `clear` marker are excluded from this endpoint, and rows marked hidden-from-context by automatic compaction are also excluded.
 
 ### `GET /sessions/{session_id}/agents/{instance_id}/messages`
 
-Lists messages for one agent instance in the active session segment only.
+Lists the raw history timeline for one agent instance, including:
+- original message rows, even when they were marked hidden-from-context by automatic compaction
+- session `clear` dividers
+- conversation-local `compaction` dividers
+
+Response entries are ordered oldest to newest and use `entry_type`:
+- `message`: original persisted message row. Includes `hidden_from_context`, `hidden_reason`, `hidden_at`, and `hidden_marker_id`.
+- `marker`: logical history divider with `marker_id`, `marker_type`, `created_at`, and `label`.
 
 ### `GET /sessions/{session_id}/agents/{instance_id}/reflection`
 
@@ -513,7 +616,7 @@ Response fields:
 
 ### `POST /sessions/{session_id}/agents/{instance_id}/reflection:refresh`
 
-Triggers reflection recomputation for one subagent instance and returns the refreshed summary. This uses the same compaction/reflection strategy as automatic context compaction.
+Triggers reflection recomputation for one subagent instance and returns the refreshed summary. Reflection memory is separate from automatic conversation compaction summaries.
 
 ### `PATCH /sessions/{session_id}/agents/{instance_id}/reflection`
 
@@ -543,6 +646,31 @@ Returns aggregated token usage for the active session segment, grouped by `role_
 
 Returns token usage for a single run, grouped by agent instance. Response totals expose `total_cached_input_tokens` and `total_reasoning_output_tokens` alongside the existing input/output/request counters. Legacy local rows with missing or `NULL` counters are normalized to `0` before aggregation.
 
+### `GET /sessions/{session_id}/media`
+
+Lists session-scoped media assets as normalized `media_ref` content parts.
+
+### `POST /sessions/{session_id}/media`
+
+Uploads one image, audio, or video file into the session media store.
+
+Response fields mirror a typed content part:
+- `kind = "media_ref"`
+- `asset_id`
+- `session_id`
+- `modality = "image" | "audio" | "video"`
+- `mime_type`
+- `url`
+- optional metadata such as `size_bytes`, `width`, `height`, and `duration_ms`
+
+### `GET /sessions/{session_id}/media/{asset_id}`
+
+Returns media metadata as the same normalized `media_ref` content part used by runs, ACP, and the frontend.
+
+### `GET /sessions/{session_id}/media/{asset_id}/file`
+
+Streams a locally stored session media file or redirects to the saved remote URL for remote references.
+
 ## Run APIs
 
 ### `POST /runs`
@@ -553,8 +681,15 @@ Request:
 
 ```json
 {
-  "intent": "Implement endpoint X",
   "session_id": "session-1",
+  "input": [
+    {
+      "kind": "text",
+      "text": "Implement endpoint X"
+    }
+  ],
+  "run_kind": "conversation",
+  "generation_config": null,
   "execution_mode": "ai",
   "yolo": false,
   "target_role_id": "Architect",
@@ -567,15 +702,30 @@ Request:
 
 Notes:
 
+- `input` is now the canonical run payload. It is an ordered array of typed content parts:
+  - `{"kind":"text","text":"..."}`
+  - `{"kind":"media_ref", ...}`
+  - `{"kind":"inline_media", ...}` for small ingress-only image/audio payloads that are normalized immediately into stored `media_ref` assets
+- `run_kind` supports:
+  - `conversation`
+  - `generate_image`
+  - `generate_audio`
+  - `generate_video`
+- Native media generation also enters through `/api/runs`; the backend chooses the provider-native generation branch from `run_kind`.
+- `generation_config` is optional and modality-specific:
+  - image: `kind`, `count`, `size`, `seed`
+  - audio: `kind`, `count`, `voice`, `format`, `duration_ms`, `seed`
+  - video: `kind`, `count`, `resolution`, `duration_ms`, `seed`
 - `yolo` is optional.
 - `yolo: false` preserves the existing tool approval flow.
-- `yolo: true` skips tool approval for all tools in that run, including resumed recoverable runs.
+- `yolo: true` skips human tool approval for that run, including resumed recoverable runs, but tool-local validation still applies.
 - `thinking` is optional.
 - `thinking.enabled` enables model thinking streams for providers that emit thinking parts.
 - `thinking.effort` optionally sets provider reasoning effort (`minimal`, `low`, `medium`, `high`); when set, it is forwarded to OpenAI-compatible providers as `openai_reasoning_effort`.
 - `target_role_id` is optional. When set, that run starts from the specified role instead of the session-default root role, without mutating the saved session topology.
 - `target_role_id` may point to `Coordinator`, `MainAgent`, or any normal role known to the role registry.
 - The backend resolves the session mode at run creation time and snapshots the chosen root topology into the run intent for queued and recoverable resume flows.
+- `session_id`, `target_role_id`, `run_id`, and other identifier-style request fields follow the common identifier validation rules above.
 
 Response:
 
@@ -587,6 +737,10 @@ Response:
 
 Streams run events via SSE.
 
+Multimodal events:
+- `output_delta`: payload includes `output`, an array of typed content parts. Text streaming may still emit `text_delta`; media outputs are emitted through `output_delta`.
+- `generation_progress`: payload includes `run_kind`, `phase`, `progress`, and optional `preview_asset_id` for provider-native image/audio/video generation runs.
+
 Thinking events:
 - `thinking_started`: payload includes `part_index`, `role_id`, `instance_id`.
 - `thinking_delta`: payload includes `part_index`, `text`, `role_id`, `instance_id`.
@@ -595,13 +749,24 @@ Thinking events:
 Retry events:
 - `llm_retry_scheduled`: payload includes `instance_id`, `role_id`, `attempt_number`, `total_attempts`, `retry_in_ms`, `error_code`, and `error_message`.
 - `llm_retry_exhausted`: payload includes `instance_id`, `role_id`, `attempt_number`, `total_attempts`, `error_code`, and `error_message`.
+- `run_paused`: payload includes `task_id`, `instance_id`, `role_id`, `error_code`, `error_message`, `retries_used`, `total_attempts`, and `phase="awaiting_recovery"`. For `model_tool_args_invalid_json`, the payload also includes `auto_recovery_exhausted`, `attempt`, and `max_attempts`.
+- `run_resumed`: payload always includes `session_id` and `reason`. When the backend auto-recovers a malformed tool-arguments response, `reason="auto_recovery_invalid_tool_args_json"` and the payload also includes `attempt` and `max_attempts`.
+- Background task lifecycle events:
+  - `background_task_started`
+  - `background_task_updated`
+  - `background_task_completed`
+  - `background_task_stopped`
+  Each payload is the current background task snapshot, including `background_task_id`, `status`, `command`, `cwd`, `recent_output[]`, `output_excerpt`, and `log_path`.
 
 Frontend behavior:
 - The web UI uses `llm_retry_scheduled` to render one active retry card in the round timeline and keep its countdown live while the retry backoff window is active.
 - Retry countdowns are computed from the SSE event `occurred_at` timestamp plus `retry_in_ms`, so delayed delivery or page refresh does not restart the timer.
 - Later retry events replace the same card instead of stacking multiple historical cards.
 - Once a retried model attempt produces successful output, the retry card is removed.
-- If the run still fails after retries are exhausted, `llm_retry_exhausted` leaves the retry card visible as the final failed retry state.
+- If a model emits malformed tool arguments JSON after a safe checkpoint, the backend may emit `run_resumed` with `reason="auto_recovery_invalid_tool_args_json"` and continue the same stream without surfacing `run_paused`.
+- If the run still cannot continue safely after retries are exhausted, `llm_retry_exhausted` is followed by `run_paused` and the SSE stream closes for that turn.
+- `run_paused` represents a recoverable interruption, not a terminal failure. Public run phase becomes `awaiting_recovery`.
+- Background task events are operator/UI continuity signals only. They update recovery state and `/ps`-style UI surfaces, but do not become model-visible conversation messages.
 
 ### `POST /runs/{run_id}/inject`
 
@@ -610,6 +775,52 @@ Injects follow-up content to active agents in a run.
 ### `GET /runs/{run_id}/tool-approvals`
 
 Lists pending tool approvals.
+
+### `GET /runs/{run_id}/background-tasks`
+
+Lists managed background tasks bound to the run.
+
+Response:
+
+```json
+{
+  "items": [
+    {
+      "background_task_id": "exec_a1b2c3d4e5f6",
+      "run_id": "run-1",
+      "session_id": "session-1",
+      "command": "sleep 30",
+      "cwd": "/workspace/project",
+      "execution_mode": "background",
+      "status": "running",
+      "tty": false,
+      "timeout_ms": 1800000,
+      "exit_code": null,
+      "recent_output": [],
+      "output_excerpt": "",
+      "log_path": "tmp/background_tasks/exec_a1b2c3d4e5f6.log",
+      "created_at": "2026-03-31T10:00:00Z",
+      "updated_at": "2026-03-31T10:00:00Z",
+      "completed_at": null
+    }
+  ]
+}
+```
+
+### `GET /runs/{run_id}/background-tasks/{background_task_id}`
+
+Returns one managed background task snapshot for the run.
+
+### `POST /runs/{run_id}/background-tasks/{background_task_id}:stop`
+
+Stops one managed background task and returns its final snapshot.
+
+Notes:
+- Background tasks are scoped to the owning run. Cross-run access returns `404`.
+- The public API is intentionally read-mostly. Interactive stdin/resize remains tool-only, not a human-facing REST surface.
+- Runtime shell selection is internal, not part of the REST contract. Linux/macOS use the managed bash path; Windows prefers Git Bash and falls back to PowerShell when Git Bash is unavailable.
+- `tty=true` background tasks use a platform TTY backend: POSIX PTY on Linux/macOS and ConPTY via `pywinpty` on supported Windows hosts. When Windows TTY support is unavailable, only non-TTY background tasks remain available.
+- Unlike Codex's stricter unified-exec contract, Agent Teams keeps non-TTY `write_stdin` enabled for compatibility with existing pipe-style workflows.
 
 ### `POST /runs/{run_id}/tool-approvals/{tool_call_id}/resolve`
 
@@ -621,6 +832,17 @@ Request:
 {"action": "approve", "feedback": ""}
 ```
 
+Allowed `action` values:
+- `approve`: legacy one-time approval, equivalent to `approve_once`
+- `approve_once`: execute this pending tool call once
+- `approve_exact`: for shell, also save an exact reusable approval for the normalized command
+- `approve_prefix`: for shell, also save reusable prefix approvals such as `git status`
+- `deny`: deny the pending tool call
+
+Notes:
+- Shell exact/prefix approvals are project-scoped and shell-runtime-scoped. Git Bash approvals do not automatically apply to PowerShell, and vice versa.
+- Shell `workdir` values must stay inside the workspace writable roots even when the command itself targets external executables or scripts.
+
 ### `POST /runs/{run_id}/stop`
 
 Stops the full run or a specific subagent.
@@ -628,6 +850,10 @@ Stops the full run or a specific subagent.
 ### `POST /runs/{run_id}:resume`
 
 Resumes a recoverable run.
+
+Behavior:
+- Recoverable runs in `queued`, `paused`, or `stopped` may be resumed.
+- Runs paused for `awaiting_tool_approval` or `awaiting_subagent_followup` are not resumed by this endpoint; those flows still require their dedicated resolution action.
 
 ### `POST /runs/{run_id}/subagents/{instance_id}/inject`
 
@@ -748,15 +974,34 @@ Response fields:
   - `description`
 - `tools`
 - `mcp_servers`
-- `skills`
+- `skills[]`
+  - `ref`: canonical skill ref. Uses `builtin:<name>` for built-in skills and
+    `app:<name>` for user/app skills.
+  - `name`
+  - `description`
+  - `scope`: `builtin` or `app`
 - `agents[]`
   - `agent_id`
   - `name`
   - `transport`
 
+Notes:
+- Same-name builtin/app skills are both returned. Frontends must treat `ref` as
+  the stable identity and use `name` only for display.
+- Returns `503` when required builtin/system roles such as `Coordinator` or
+  `MainAgent` are unavailable in the current runtime.
+
 ### `GET /roles/configs`
 
 Lists editable role document summaries for the settings UI.
+
+Existing saved role files are still listed when they contain unknown `tools`,
+`mcp_servers`, or `skills`. Those stale capability references are ignored for
+read/reload flows so the settings UI can still load.
+
+When no builtin or app role files are available, this endpoint returns `200 []`
+instead of failing the whole request. If builtin role files are missing but app
+role files exist, the response contains the app-backed documents only.
 
 Response fields:
 - `role_id`
@@ -788,6 +1033,11 @@ Response fields:
 - `file_name`
 - `content`
 
+Notes:
+- `skills` in saved role documents are returned as canonical refs when they can
+  be resolved uniquely. Existing unknown saved values are preserved so the UI
+  can still display and edit the role.
+
 ### `PUT /roles/configs/{role_id}`
 
 Validates and saves one role document, then reloads the runtime role registry.
@@ -817,6 +1067,9 @@ Rules:
 - Path `role_id` must match body `role_id`.
 - Unknown tools, MCP servers, or skills are rejected.
 - Unknown `bound_agent_id` values are rejected.
+- Unrelated saved role files with stale `tools`, `mcp_servers`, or `skills` do
+  not block the reload after a successful save; those references are ignored
+  with warnings until they are cleaned up.
 - When `source_role_id` is omitted and the file does not exist yet, a new role file is created.
 - Renaming a role writes a new file and removes the previous file when validation succeeds.
 - When `bound_agent_id` is set, that role executes through the external ACP provider instead of the local model provider chain.
@@ -828,6 +1081,8 @@ Validates role files against registered tools and skills.
 
 Constraint:
 - `depends_on` is invalid in role front matter. Ordering is runtime task orchestration state, not role metadata.
+- Returns `503` when required builtin/system roles are unavailable in the
+  current runtime.
 
 ### `POST /roles:validate-config`
 
@@ -860,6 +1115,7 @@ Rules:
 - `root_path` must already exist.
 - `root_path` must be a directory.
 - `workspace_id` must be unique.
+- `workspace_id` follows the common identifier validation rules above.
 
 ### `GET /workspaces/{workspace_id}`
 
@@ -934,14 +1190,17 @@ Request:
 
 ```json
 {
-  "name": "alpha-project-fork"
+  "name": "alpha-project-fork",
+  "start_ref": "origin/main"
 }
 ```
 
 Rules:
 - Source workspace must exist and its `root_path` must be inside a Git repository.
 - The backend normalizes `name` into the new `workspace_id`.
-- The fork creates branch `fork/{workspace_id}` from the source workspace current `HEAD`.
+- `start_ref` is optional. When omitted, the backend fetches `origin main` and forks from the resolved `origin/main` commit.
+- When `start_ref` is provided, the backend resolves that ref and forks from the resolved commit.
+- The fork creates branch `fork/{workspace_id}` from the resolved start commit.
 - The worktree directory is created under the managed workspace storage directory and becomes the new workspace `root_path`.
 - The returned workspace profile uses `file_scope.backend = "git_worktree"` and includes `source_root_path`, `branch_name`, and `forked_from_workspace_id`.
 
@@ -1011,7 +1270,7 @@ Rules:
 
 ### `POST /prompts:preview`
 
-Builds prompt preview payload for a specific role. Coordinator role IDs are resolved from the loaded role files and are not hardcoded to `coordinator_agent`.
+Builds prompt preview payload for a specific role. Coordinator role IDs are resolved from the loaded role files and are not hardcoded to any legacy identifier.
 
 Request:
 
@@ -1020,7 +1279,13 @@ Request:
   "role_id": "Coordinator",
   "workspace_id": "default",
   "objective": "Draft release note",
+  "orchestration_prompt": "Delegate by capability and finalize yourself.",
   "shared_state": {"lang": "zh-CN", "priority": 1},
+  "conversation_context": {
+    "source_provider": "feishu",
+    "source_kind": "im",
+    "feishu_chat_type": "group"
+  },
   "tools": ["dispatch_task"],
   "skills": ["time"]
 }
@@ -1029,10 +1294,25 @@ Request:
 Notes:
 - `objective` is optional.
 - `workspace_id` is optional.
+- `orchestration_prompt` is optional and participates in skill routing; coordinator preview also renders it into the prompt layers that normally receive runtime orchestration prompt context.
+- `conversation_context` is optional.
 - When `workspace_id` is provided, `runtime_system_prompt` resolves `Working Directory` from the workspace execution root using the same workspace path resolution as real agent execution.
-- `runtime_system_prompt` also includes any resolved instruction files loaded from the workspace/project chain, user-level prompt files, and `~/.agent-teams/prompts.json`.
+- `runtime_system_prompt` also includes any resolved instruction files loaded from the workspace/project chain, user-level prompt files, and `prompts.json` in the resolved config dir, by default `~/.relay-teams/prompts.json`.
+- When `conversation_context.source_provider = "feishu"` and `conversation_context.feishu_chat_type = "group"`, both `runtime_system_prompt` and `provider_system_prompt` append the extra Feishu-group instruction:
+  `当前对话来自飞书群聊；用户输入会包含发送者标识，你必须明确区分不同发送者，不要把群成员当作同一用户。`
+- Other contexts leave the role system prompt unchanged.
+- Skill requests accept canonical refs or unique plain names.
+- Prompt-facing preview output returns plain skill names.
+- Roles/settings/skills management APIs continue to use canonical refs so same-name
+  builtin/app skills remain distinguishable.
 - When `workspace_id` does not exist, the endpoint returns `404`.
-- When `objective` is omitted or blank, the preview response returns `objective: ""` and `user_prompt: ""`.
+- When the authorized skill count is `<= 8`, the preview injects the stable
+  skill catalog into `runtime_system_prompt` and `provider_system_prompt`, and
+  `user_prompt` stays as the objective only.
+- When the authorized skill count is `> 8`, routed skill candidates do not
+  appear in `runtime_system_prompt` or `provider_system_prompt`; they only
+  appear in `user_prompt`.
+- When `objective` is omitted or blank, the preview response returns `objective: ""` and `user_prompt: ""`, but `skill_routing` may still report the effective authorized and visible skill sets.
 
 Response:
 
@@ -1044,7 +1324,15 @@ Response:
   "skills": ["time"],
   "runtime_system_prompt": "...",
   "provider_system_prompt": "...",
-  "user_prompt": "..."
+  "user_prompt": "Draft release note",
+  "skill_routing": {
+    "mode": "passthrough",
+    "query_text": "Objective: Draft release note",
+    "authorized_count": 1,
+    "visible_skills": ["time"],
+    "candidates": [],
+    "fallback_reason": null
+  }
 }
 ```
 
@@ -1077,6 +1365,7 @@ Each record includes:
 ### `POST /gateway/feishu/accounts`
 
 Creates a Feishu gateway account and persists its secret config.
+The request `name` and all `account_id` path parameters follow the common identifier validation rules above.
 
 ### `PATCH /gateway/feishu/accounts/{account_id}`
 
@@ -1108,9 +1397,16 @@ Behavior:
 - For `group` chats configured with `trigger_rule = "mention_only"`, only messages whose mention list includes the configured application name create runs.
 - For `p2p` chats, any text message creates a run and `mention_only` does not require an application mention.
 - Persists accepted inbound messages in a local message pool before execution.
+- Resolves group sender names when possible and injects the actual run intent as
+  `收到来自 {sender_name} 的飞书消息：{message}` with `sender_open_id` fallback.
 - Deduplicates delivery using Feishu `message_id`, falling back to `event_id`.
 - Same-chat inbound messages are processed in queue order.
-- Acknowledgement text reflects the current chat backlog.
+- Inbound Feishu messages enter the shared gateway session ingress path and start
+  detached runs only when the bound internal session is idle.
+- A Feishu message never implicitly attaches to an already running session run.
+- Accepted group messages use a Feishu reaction acknowledgement with emoji `eyes`.
+- Only queued messages send a separate text reply: `已进入队列，前面还有 N 条消息。`
+- Group command responses and group final run replies use Feishu reply-to-message on the triggering message.
 - Reuses one internal session per `account_id + tenant_key + chat_id`.
 - Requires no public callback URL.
 - Runs one SDK long connection per enabled Feishu gateway account whose credentials are ready.
@@ -1206,6 +1502,9 @@ Each record includes:
 Notes:
 - WeChat is managed as a long-lived conversational gateway, not as a trigger.
 - Current implementation handles direct chat only. Group chat routing is reserved for later expansion.
+- Accepted WeChat direct messages are persisted into a local inbound queue before run start.
+- WeChat inbound messages also use the shared gateway session ingress path, so busy
+  sessions queue later messages instead of auto-attaching them to the active run.
 
 ### `POST /gateway/wechat/login/start`
 
@@ -1236,6 +1535,7 @@ Response fields:
 
 Notes:
 - On success, the backend stores the returned bot token in the unified secret store and upserts the account into `wechat_accounts`.
+- `session_key` and `account_id` follow the common identifier validation rules above.
 - Newly connected accounts default to `workspace_id = "default"` and `session_mode = "normal"` unless a previous record already exists for that account id.
 
 ### `PATCH /gateway/wechat/accounts/{account_id}`
@@ -1287,9 +1587,38 @@ Reloads all WeChat gateway workers against the current persisted account set.
 
 Returns observability KPIs and trend buckets for `scope=global|session|run`. Non-global scopes require `scope_id`.
 
+Overview KPIs include:
+- `steps`
+- `input_tokens`
+- `cached_input_tokens`
+- `uncached_input_tokens`
+- `output_tokens`
+- `cached_token_ratio`
+- `tool_calls`
+- `tool_success_rate`
+- `tool_avg_duration_ms`
+- `skill_calls`
+- `mcp_calls`
+- `retrieval_searches`
+- `retrieval_failure_rate`
+- `retrieval_avg_duration_ms`
+- `retrieval_document_count`
+- `gateway_calls`
+- `gateway_failure_rate`
+- `gateway_avg_duration_ms`
+- `gateway_prompt_avg_start_ms`
+- `gateway_prompt_avg_first_update_ms`
+- `gateway_mcp_calls`
+- `gateway_cold_start_calls`
+
 ### `GET /observability/breakdowns`
 
 Returns tool-level breakdown rows for `scope=global|session|run`. Non-global scopes require `scope_id`.
+
+Breakdown payload includes:
+- `rows`: tool-level call/failure/latency breakdown
+- `role_rows`: role-level token/cache/tool-failure breakdown
+- `gateway_rows`: gateway ACP and MCP operation call/failure/latency breakdown grouped by operation, phase, and transport
 
 ## Automation APIs
 
@@ -1349,6 +1678,7 @@ Request fields:
   - `trigger_id`
   - `tenant_key`
   - `chat_id`
+  - `session_id`
   - `chat_type`
   - `source_label`
 - `delivery_events[]` optional
@@ -1356,7 +1686,10 @@ Request fields:
 
 Notes:
 - `delivery_binding` must reference an existing Feishu IM chat binding returned by `GET /automation/feishu-bindings`.
+- `delivery_binding.session_id` is required for explicit create/update requests and binds the automation project to that exact saved session.
 - When `delivery_binding` is present and `delivery_events` is omitted, the backend defaults to `started`, `completed`, and `failed`.
+- When a bound session cannot be resolved at run time, the run fails instead of falling back to a fresh automation session.
+- `workspace_id`, `automation_project_id`, and delivery-binding identifiers follow the common identifier validation rules above.
 
 ### `GET /automation/projects/{automation_project_id}`
 
@@ -1372,10 +1705,17 @@ Deletes the automation project and its backing trigger. Historical sessions are 
 
 ### `POST /automation/projects/{automation_project_id}:run`
 
-Creates a new session for that automation project and starts the run immediately.
+Starts the automation project immediately. Unbound projects create a fresh automation
+session; projects with a Feishu delivery binding reuse the exact saved bound session.
 Response fields:
 - `automation_project_id`
 - `session_id`
+
+Behavior notes:
+- Bound-session automation execution also goes through the shared gateway session
+  ingress path and always starts detached runs.
+- If the bound session is busy, the automation job queues behind the current
+  session backlog instead of inserting prompt text into the active run.
 
 ### `POST /automation/projects/{automation_project_id}:enable`
 

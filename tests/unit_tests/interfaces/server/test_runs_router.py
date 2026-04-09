@@ -4,17 +4,26 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from agent_teams.interfaces.server.deps import get_run_service
-from agent_teams.interfaces.server.routers import runs
-from agent_teams.sessions.runs.run_models import IntentInput
+from relay_teams.interfaces.server.deps import get_run_service
+from relay_teams.interfaces.server.routers import runs
+from relay_teams.sessions.runs.run_models import IntentInput
 
 
 class _FakeRunService:
     def __init__(self) -> None:
         self.resumed_run_ids: list[str] = []
         self.started_run_ids: list[str] = []
+        self.resolved_tool_approvals: list[tuple[str, str, str, str]] = []
         self.raise_on_tool_approval = False
         self.created_run_inputs: list[IntentInput] = []
+        self.background_tasks: dict[str, dict[str, object]] = {
+            "exec-1": {
+                "background_task_id": "exec-1",
+                "run_id": "run-1",
+                "status": "running",
+                "command": "sleep 30",
+            }
+        }
 
     def create_run(self, intent_input) -> tuple[str, str]:
         self.created_run_inputs.append(intent_input)
@@ -35,9 +44,39 @@ class _FakeRunService:
             raise RuntimeError(
                 "Run run-1 is stopped. Resume the run before resolving tool approval."
             )
+        self.resolved_tool_approvals.append((run_id, tool_call_id, action, feedback))
 
     def ensure_run_started(self, run_id: str) -> None:
         self.started_run_ids.append(run_id)
+
+    def list_background_tasks(self, run_id: str) -> tuple[dict[str, object], ...]:
+        _ = run_id
+        return tuple(self.background_tasks.values())
+
+    def get_background_task(
+        self,
+        *,
+        run_id: str,
+        background_task_id: str,
+    ) -> dict[str, object]:
+        _ = run_id
+        if background_task_id not in self.background_tasks:
+            raise KeyError(background_task_id)
+        return self.background_tasks[background_task_id]
+
+    async def stop_background_task(
+        self,
+        *,
+        run_id: str,
+        background_task_id: str,
+    ) -> dict[str, object]:
+        _ = run_id
+        background_task = self.get_background_task(
+            run_id=run_id,
+            background_task_id=background_task_id,
+        )
+        background_task["status"] = "stopped"
+        return background_task
 
 
 def _create_client(fake_service: _FakeRunService) -> TestClient:
@@ -71,7 +110,7 @@ def test_create_run_route_accepts_yolo() -> None:
         "/api/runs",
         json={
             "session_id": "session-1",
-            "intent": "hello",
+            "input": [{"kind": "text", "text": "hello"}],
             "execution_mode": "ai",
             "yolo": True,
         },
@@ -80,8 +119,26 @@ def test_create_run_route_accepts_yolo() -> None:
     assert response.status_code == 200
     assert response.json() == {"run_id": "run-1", "session_id": "session-1"}
     created = fake_service.created_run_inputs[0]
+    assert created.intent == "hello"
     assert created.yolo is True
     assert fake_service.started_run_ids == ["run-1"]
+
+
+def test_create_run_route_rejects_none_like_session_id() -> None:
+    fake_service = _FakeRunService()
+    client = _create_client(fake_service)
+
+    response = client.post(
+        "/api/runs",
+        json={
+            "session_id": "None",
+            "input": [{"kind": "text", "text": "hello"}],
+            "execution_mode": "ai",
+        },
+    )
+
+    assert response.status_code == 422
+    assert fake_service.created_run_inputs == []
 
 
 def test_create_run_route_accepts_thinking_config() -> None:
@@ -92,7 +149,7 @@ def test_create_run_route_accepts_thinking_config() -> None:
         "/api/runs",
         json={
             "session_id": "session-1",
-            "intent": "hello",
+            "input": [{"kind": "text", "text": "hello"}],
             "execution_mode": "ai",
             "yolo": False,
             "thinking": {"enabled": True, "effort": "high"},
@@ -114,7 +171,7 @@ def test_create_run_route_accepts_target_role_id() -> None:
         "/api/runs",
         json={
             "session_id": "session-1",
-            "intent": "hello",
+            "input": [{"kind": "text", "text": "hello"}],
             "execution_mode": "ai",
             "target_role_id": "writer",
         },
@@ -127,8 +184,26 @@ def test_create_run_route_accepts_target_role_id() -> None:
         "target_role_id": "writer",
     }
     created = fake_service.created_run_inputs[0]
+    assert created.intent == "hello"
     assert created.target_role_id == "writer"
     assert fake_service.started_run_ids == ["run-1"]
+
+
+def test_create_run_route_rejects_legacy_intent_field() -> None:
+    fake_service = _FakeRunService()
+    client = _create_client(fake_service)
+
+    response = client.post(
+        "/api/runs",
+        json={
+            "session_id": "session-1",
+            "intent": "hello",
+            "execution_mode": "ai",
+        },
+    )
+
+    assert response.status_code == 422
+    assert fake_service.created_run_inputs == []
 
 
 def test_resolve_tool_approval_route_returns_conflict_for_stopped_run() -> None:
@@ -145,3 +220,68 @@ def test_resolve_tool_approval_route_returns_conflict_for_stopped_run() -> None:
     assert response.json()["detail"] == (
         "Run run-1 is stopped. Resume the run before resolving tool approval."
     )
+
+
+def test_resolve_tool_approval_route_accepts_approve_exact() -> None:
+    fake_service = _FakeRunService()
+    client = _create_client(fake_service)
+
+    response = client.post(
+        "/api/runs/run-1/tool-approvals/call-1/resolve",
+        json={"action": "approve_exact", "feedback": "persist this"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok", "action": "approve_exact"}
+    assert fake_service.resolved_tool_approvals == [
+        ("run-1", "call-1", "approve_exact", "persist this")
+    ]
+
+
+def test_resume_route_rejects_none_like_run_id() -> None:
+    fake_service = _FakeRunService()
+    client = _create_client(fake_service)
+
+    response = client.post("/api/runs/None:resume")
+
+    assert response.status_code == 422
+    assert fake_service.resumed_run_ids == []
+
+
+def test_list_background_tasks_route_returns_items() -> None:
+    fake_service = _FakeRunService()
+    client = _create_client(fake_service)
+
+    response = client.get("/api/runs/run-1/background-tasks")
+
+    assert response.status_code == 200
+    assert response.json() == {"items": [fake_service.background_tasks["exec-1"]]}
+
+
+def test_get_background_task_route_returns_single_terminal() -> None:
+    fake_service = _FakeRunService()
+    client = _create_client(fake_service)
+
+    response = client.get("/api/runs/run-1/background-tasks/exec-1")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "background_task": fake_service.background_tasks["exec-1"]
+    }
+
+
+def test_stop_background_task_route_returns_updated_terminal() -> None:
+    fake_service = _FakeRunService()
+    client = _create_client(fake_service)
+
+    response = client.post("/api/runs/run-1/background-tasks/exec-1:stop")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "background_task": {
+            "background_task_id": "exec-1",
+            "run_id": "run-1",
+            "status": "stopped",
+            "command": "sleep 30",
+        }
+    }

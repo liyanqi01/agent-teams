@@ -2,29 +2,39 @@
  * app/recovery.js
  * Session recovery snapshot loading, banner rendering, and explicit resume actions.
  */
-import { focusSubagent, refreshSubagentRail } from '../components/subagentRail.js';
+import { refreshSubagentRail } from '../components/subagentRail.js';
 import { refreshVisibleContextIndicators } from '../components/contextIndicators.js';
+import { clearRunStreamState } from '../components/messageRenderer.js';
 import {
     loadSessionRounds,
     overlayRoundRecoveryState,
-    selectRound,
 } from '../components/rounds.js';
 import { scheduleSessionsRefresh } from '../components/sidebar.js';
-import { fetchSessionRecovery, resolveToolApproval, resumeRun } from '../core/api.js';
 import {
+    fetchSessionRecovery,
+    resolveToolApproval,
+    resumeRun,
+    stopBackgroundTask,
+} from '../core/api.js';
+import {
+    clearRunPrimaryRole,
     humanizeRoleId,
     isPrimaryRoleId,
     isReservedSystemRoleId,
     setRunPrimaryRole,
     state,
 } from '../core/state.js';
-import { resumeRunStream } from '../core/stream.js';
+import { endStream, resumeRunStream } from '../core/stream.js';
 import { els } from '../utils/dom.js';
+import { formatMessage, t } from '../utils/i18n.js';
 import { sysLog } from '../utils/logger.js';
 
 let recoveryActionBusy = false;
 const approvalActionBusyIds = new Set();
 const approvalActionErrors = new Map();
+const backgroundTaskActionBusyIds = new Set();
+const backgroundTaskActionErrors = new Map();
+const backgroundTaskPanelExpandedRunIds = new Set();
 let recoveryBannerRenderSignature = '';
 const CONTINUITY_POLL_ACTIVE_MS = 1500;
 const CONTINUITY_POLL_IDLE_MS = 4000;
@@ -39,6 +49,32 @@ const continuity = {
 
 function isPrimaryOrReservedRoleId(roleId) {
     return isPrimaryRoleId(roleId) || isReservedSystemRoleId(roleId);
+}
+
+function isBackgroundTaskPanelCollapsed(runId) {
+    const safeRunId = String(runId || '').trim();
+    if (!safeRunId) return false;
+    return !backgroundTaskPanelExpandedRunIds.has(safeRunId);
+}
+
+function setBackgroundTaskPanelCollapsed(runId, collapsed) {
+    const safeRunId = String(runId || '').trim();
+    if (!safeRunId) return;
+    if (collapsed) {
+        backgroundTaskPanelExpandedRunIds.delete(safeRunId);
+    } else {
+        backgroundTaskPanelExpandedRunIds.add(safeRunId);
+    }
+}
+
+function handleBackgroundTaskPanelToggle(runId) {
+    const safeRunId = String(runId || '').trim();
+    if (!safeRunId) return;
+    setBackgroundTaskPanelCollapsed(
+        safeRunId,
+        !isBackgroundTaskPanelCollapsed(safeRunId),
+    );
+    renderRecoveryBanner();
 }
 
 export async function hydrateSessionView(
@@ -132,6 +168,8 @@ export function clearSessionRecovery() {
     state.pausedSubagent = null;
     approvalActionBusyIds.clear();
     approvalActionErrors.clear();
+    backgroundTaskActionBusyIds.clear();
+    backgroundTaskActionErrors.clear();
     recoveryBannerRenderSignature = '';
     if (!state.isGenerating) {
         state.activeRunId = null;
@@ -168,6 +206,7 @@ export function applyRecoverySnapshot(snapshot) {
     }
 
     reconcileApprovalActionState(normalized.pendingToolApprovals);
+    reconcileBackgroundTaskActionState(normalized.backgroundTasks);
     state.currentRecoverySnapshot = normalized;
     state.pausedSubagent = normalized.pausedSubagent;
     if (normalized.activeRun?.run_id) {
@@ -191,9 +230,16 @@ export async function refreshSessionRecovery(sessionId = state.currentSessionId,
     }
 
     try {
+        const previousActiveRunId = String(
+            state.currentRecoverySnapshot?.activeRun?.run_id || state.activeRunId || '',
+        ).trim();
         const snapshot = await fetchSessionRecovery(safeSessionId);
         if (state.currentSessionId !== safeSessionId) return null;
         const normalized = applyRecoverySnapshot(snapshot);
+        await reconcileMissingActiveRun(normalized, {
+            sessionId: safeSessionId,
+            previousActiveRunId,
+        });
         syncSessionContinuity();
         refreshVisibleContextIndicators({ immediate: true });
         return normalized;
@@ -232,7 +278,7 @@ export async function resumeRecoverableRun(
         && (activeRun.status === 'stopping' || activeRun.phase === 'stopping')
     ) {
         if (!quiet) {
-            sysLog('Run is still stopping. Wait for it to stop before resuming.', 'log-error');
+            sysLog(t('recovery.run_still_stopping'), 'log-error');
         }
         return false;
     }
@@ -255,7 +301,7 @@ export async function resumeRecoverableRun(
         return true;
     } catch (e) {
         if (!quiet) {
-            sysLog(e.message || 'Failed to resume run', 'log-error');
+            sysLog(e.message || t('recovery.resume_failed'), 'log-error');
         }
         if (safeSessionId) {
             await refreshSessionRecovery(safeSessionId, { quiet: true });
@@ -367,6 +413,7 @@ export function markPausedSubagent(payload = {}) {
             }
             : null,
         pendingToolApprovals: [],
+        backgroundTasks: [],
         pausedSubagent: null,
         roundSnapshot: null,
     };
@@ -422,6 +469,7 @@ export function markToolApprovalRequested(payload = {}) {
             }
             : null,
         pendingToolApprovals: [],
+        backgroundTasks: [],
         pausedSubagent: null,
         roundSnapshot: null,
     };
@@ -496,14 +544,50 @@ function normalizeRecoverySnapshot(snapshot) {
         ? snapshot.pending_tool_approvals.map(item => ({ ...item }))
         : [];
     const pausedSubagent = normalizePausedSubagent(snapshot?.paused_subagent, activeRun?.run_id || null);
+    const backgroundTasks = Array.isArray(snapshot?.background_tasks)
+        ? snapshot.background_tasks
+            .map(item => normalizeBackgroundTask(item, activeRun?.run_id || null))
+            .filter(Boolean)
+        : [];
     const roundSnapshot = snapshot?.round_snapshot && typeof snapshot.round_snapshot === 'object'
         ? { ...snapshot.round_snapshot }
         : null;
     return {
         activeRun,
         pendingToolApprovals,
+        backgroundTasks,
         pausedSubagent,
         roundSnapshot,
+    };
+}
+
+function normalizeBackgroundTask(raw, runId = null) {
+    if (!raw || typeof raw !== 'object') return null;
+    const backgroundTaskId = typeof raw.background_task_id === 'string'
+        ? raw.background_task_id
+        : '';
+    if (!backgroundTaskId) return null;
+    const recentOutput = Array.isArray(raw.recent_output)
+        ? raw.recent_output.map(line => String(line || '')).filter(Boolean)
+        : [];
+    const rawExitCode = raw.exit_code;
+    const outputExcerpt = typeof raw.output_excerpt === 'string'
+        ? raw.output_excerpt
+        : '';
+    return {
+        backgroundTaskId,
+        runId: String(raw.run_id || runId || ''),
+        command: String(raw.command || '').trim(),
+        cwd: String(raw.cwd || '').trim(),
+        status: String(raw.status || '').trim(),
+        tty: raw.tty === true,
+        timeoutMs: Number(raw.timeout_ms || 0),
+        exitCode: rawExitCode === null || rawExitCode === undefined ? null : Number(rawExitCode),
+        recentOutput,
+        outputExcerpt,
+        logPath: String(raw.log_path || raw.logPath || '').trim(),
+        completedAt: raw.completed_at ? String(raw.completed_at) : raw.completedAt ? String(raw.completedAt) : '',
+        updatedAt: raw.updated_at ? String(raw.updated_at) : raw.updatedAt ? String(raw.updatedAt) : '',
     };
 }
 
@@ -621,11 +705,14 @@ function shouldPollContinuity() {
 
     const activeRun = getActiveRecoveryRun();
     const hasApprovals = (state.currentRecoverySnapshot?.pendingToolApprovals || []).length > 0;
+    const hasActiveBackgroundTasks = (state.currentRecoverySnapshot?.backgroundTasks || [])
+        .filter(task => isBackgroundTaskActive(task)).length > 0;
     const hasPausedSubagent = !!(state.pausedSubagent || state.currentRecoverySnapshot?.pausedSubagent);
     return !!(
         state.isGenerating
         || state.activeEventSource
         || hasApprovals
+        || hasActiveBackgroundTasks
         || hasPausedSubagent
         || activeRun?.is_recoverable
     );
@@ -718,6 +805,37 @@ function shouldAutoAttachRecoveryStream(activeRun) {
     );
 }
 
+async function reconcileMissingActiveRun(
+    snapshot,
+    {
+        sessionId,
+        previousActiveRunId = '',
+    } = {},
+) {
+    const safeSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
+    const safePreviousActiveRunId = String(previousActiveRunId || '').trim();
+    if (!safeSessionId || !safePreviousActiveRunId) return false;
+    if (state.currentSessionId !== safeSessionId) return false;
+
+    const nextActiveRunId = String(snapshot?.activeRun?.run_id || '').trim();
+    if (nextActiveRunId === safePreviousActiveRunId) return false;
+    if (!state.activeEventSource || !state.isGenerating) return false;
+    if (String(state.activeRunId || '').trim() !== safePreviousActiveRunId) return false;
+
+    endStream({ preserveRunStreamState: true, focusPrompt: false });
+    await loadSessionRounds(safeSessionId);
+    if (state.currentSessionId !== safeSessionId) return false;
+
+    clearRunStreamState(safePreviousActiveRunId);
+    clearRunPrimaryRole(safePreviousActiveRunId);
+    if (!nextActiveRunId) {
+        state.activeRunId = null;
+    }
+    scheduleSessionsRefresh();
+    renderRecoveryBanner();
+    return true;
+}
+
 function resolveRecoveryAfterEventId(activeRun) {
     if (!activeRun || typeof activeRun !== 'object') return 0;
     const lastEventId = Number(activeRun.last_event_id || 0);
@@ -747,6 +865,26 @@ function reconcileApprovalActionState(approvals) {
     });
 }
 
+function reconcileBackgroundTaskActionState(tasks) {
+    const pendingIds = new Set(
+        Array.isArray(tasks)
+            ? tasks
+                .map(item => String(item?.backgroundTaskId || '').trim())
+                .filter(Boolean)
+            : [],
+    );
+    Array.from(backgroundTaskActionBusyIds).forEach(backgroundTaskId => {
+        if (!pendingIds.has(backgroundTaskId)) {
+            backgroundTaskActionBusyIds.delete(backgroundTaskId);
+        }
+    });
+    Array.from(backgroundTaskActionErrors.keys()).forEach(backgroundTaskId => {
+        if (!pendingIds.has(backgroundTaskId)) {
+            backgroundTaskActionErrors.delete(backgroundTaskId);
+        }
+    });
+}
+
 function areRecoverySnapshotsEquivalent(left, right) {
     return recoverySnapshotSignature(left) === recoverySnapshotSignature(right);
 }
@@ -757,6 +895,9 @@ function recoverySnapshotSignature(snapshot) {
         activeRun: signatureActiveRun(snapshot.activeRun),
         pendingToolApprovals: Array.isArray(snapshot.pendingToolApprovals)
             ? snapshot.pendingToolApprovals.map(signatureApproval)
+            : [],
+        backgroundTasks: Array.isArray(snapshot.backgroundTasks)
+            ? snapshot.backgroundTasks.map(signatureBackgroundTask)
             : [],
         pausedSubagent: signaturePausedSubagent(snapshot.pausedSubagent),
         roundSnapshotRunId: String(snapshot.roundSnapshot?.run_id || ''),
@@ -773,6 +914,7 @@ function signatureActiveRun(activeRun) {
         checkpoint_event_id: Number(activeRun.checkpoint_event_id || 0),
         last_event_id: Number(activeRun.last_event_id || 0),
         pending_tool_approval_count: Number(activeRun.pending_tool_approval_count || 0),
+        background_task_count: Number(activeRun.background_task_count || 0),
         stream_connected: !!activeRun.stream_connected,
         should_show_recover: !!activeRun.should_show_recover,
     };
@@ -799,6 +941,22 @@ function signaturePausedSubagent(pausedSubagent) {
     };
 }
 
+function signatureBackgroundTask(task) {
+    if (!task || typeof task !== 'object') return null;
+    return {
+        backgroundTaskId: String(task.backgroundTaskId || ''),
+        runId: String(task.runId || ''),
+        status: String(task.status || ''),
+        exitCode: task.exitCode === null || task.exitCode === undefined
+            ? null
+            : Number(task.exitCode),
+        updatedAt: String(task.updatedAt || ''),
+        recentOutput: Array.isArray(task.recentOutput)
+            ? task.recentOutput.map(line => String(line || ''))
+            : [],
+    };
+}
+
 function isLocallyStreaming(runId) {
     return !!(
         runId &&
@@ -809,21 +967,20 @@ function isLocallyStreaming(runId) {
 }
 
 function renderRecoveryBanner() {
-    const host = ensureRecoveryBannerHost();
-    if (!host) return;
-
+    renderBackgroundTaskPanel();
     const snapshot = state.currentRecoverySnapshot;
     const activeRun = getActiveRecoveryRun();
     const pausedSubagent = state.pausedSubagent || snapshot?.pausedSubagent || null;
     const approvals = snapshot?.pendingToolApprovals || [];
-    const hideBanner = (
-        !activeRun
-        || (isLocallyStreaming(activeRun.run_id) && approvals.length === 0 && !pausedSubagent)
-    );
+    const approvalsHost = ensureRecoveryApprovalHost();
+    const resumeBtn = ensureResumeRunButton();
+    const showResumeAction = shouldShowResumeAction(activeRun, approvals, pausedSubagent);
+    const showApprovals = approvals.length > 0;
     const nextSignature = recoveryBannerSignature({
-        hideBanner,
+        showResumeAction,
         activeRun,
         approvals,
+        backgroundTasks: [],
         pausedSubagent,
     });
     if (nextSignature === recoveryBannerRenderSignature) {
@@ -831,146 +988,120 @@ function renderRecoveryBanner() {
     }
     recoveryBannerRenderSignature = nextSignature;
 
-    if (hideBanner) {
-        host.style.display = 'none';
-        host.innerHTML = '';
-        syncRecoveryRailMode({ approvals: [], pausedSubagent: null });
-        return;
+    if (approvalsHost) {
+        if (showApprovals && activeRun?.run_id) {
+            approvalsHost.style.display = 'flex';
+            approvalsHost.innerHTML = renderApprovalList(activeRun, approvals);
+            approvalsHost.querySelectorAll('[data-approval-action]').forEach(button => {
+                const toolCallId = String(button.dataset.toolCallId || '');
+                const action = String(button.dataset.approvalAction || '');
+                if (!toolCallId || !action) return;
+                const approval = approvals.find(item => item.tool_call_id === toolCallId);
+                if (!approval) return;
+                button.onclick = () => {
+                    void handleApprovalAction(activeRun.run_id, approval, action);
+                };
+            });
+        } else {
+            approvalsHost.style.display = 'none';
+            approvalsHost.innerHTML = '';
+        }
     }
 
-    const footerActions = getFooterActions(activeRun, approvals, pausedSubagent);
-    const hasBody = approvals.length > 0 || !!pausedSubagent;
-    const pillTone = stateTone(activeRun);
-    host.style.display = 'block';
-    host.innerHTML = `
-        <div class="recovery-banner recovery-tone-${pillTone}">
-            <div class="recovery-banner-copy">
-                <div class="recovery-banner-label">Session Recovery</div>
-                <div class="recovery-banner-title">
-                    <span>Run ${shortRunId(activeRun.run_id)}</span>
-                    <span class="recovery-status-pill recovery-status-${pillTone}">
-                        ${stateLabel(activeRun)}
-                    </span>
-                </div>
-                <div class="recovery-banner-text">${describeRecoveryState(activeRun, approvals, pausedSubagent)}</div>
-            </div>
-            ${hasBody
-        ? `<div class="recovery-banner-body">
-                    ${approvals.length > 0 ? renderApprovalList(activeRun, approvals) : ''}
-                    ${pausedSubagent ? renderPausedSubagentCallout(pausedSubagent) : ''}
-                </div>`
-        : ''
+    if (resumeBtn) {
+        if (showResumeAction && activeRun?.run_id) {
+            resumeBtn.style.display = 'inline-flex';
+            resumeBtn.disabled = recoveryActionBusy;
+            resumeBtn.onclick = () => {
+                void handleRecoveryAction(
+                    { action: 'resume-run' },
+                    activeRun,
+                    null,
+                );
+            };
+        } else {
+            resumeBtn.style.display = 'none';
+            resumeBtn.disabled = false;
+            resumeBtn.onclick = null;
+        }
     }
-            ${footerActions.length > 0
-        ? `<div class="recovery-banner-actions">
-                    ${footerActions
-            .map(action => `
-                            <button
-                                type="button"
-                                class="${action.kind === 'primary' ? 'primary-btn' : 'secondary-btn'} recovery-action-btn"
-                                data-recovery-action="${action.action}"
-                                ${recoveryActionBusy ? 'disabled' : ''}
-                            >
-                                ${action.label}
-                            </button>
-                        `)
-            .join('')}
-                </div>`
-        : ''
-    }
-        </div>
-    `;
-
-    host.querySelectorAll('[data-recovery-action]').forEach(button => {
-        const action = footerActions.find(item => item.action === button.dataset.recoveryAction);
-        if (!action) return;
-        button.onclick = () => {
-            void handleRecoveryAction(action, activeRun, pausedSubagent);
-        };
-    });
-
-    host.querySelectorAll('[data-approval-action]').forEach(button => {
-        const toolCallId = String(button.dataset.toolCallId || '');
-        const action = String(button.dataset.approvalAction || '');
-        if (!toolCallId || !action) return;
-        const approval = approvals.find(item => item.tool_call_id === toolCallId);
-        if (!approval) return;
-        button.onclick = () => {
-            void handleApprovalAction(activeRun.run_id, approval, action);
-        };
-    });
-
-    syncRecoveryRailMode({ approvals, pausedSubagent });
 }
 
-function recoveryBannerSignature({ hideBanner, activeRun, approvals, pausedSubagent }) {
+function recoveryBannerSignature({ showResumeAction, activeRun, approvals, backgroundTasks, pausedSubagent }) {
     const busyIds = Array.from(approvalActionBusyIds).sort();
     const errorEntries = Array.from(approvalActionErrors.entries())
         .map(([toolCallId, message]) => [String(toolCallId), String(message || '')])
         .sort((left, right) => left[0].localeCompare(right[0]));
+    const backgroundTaskBusyIds = Array.from(backgroundTaskActionBusyIds).sort();
+    const backgroundTaskErrorEntries = Array.from(backgroundTaskActionErrors.entries())
+        .map(([backgroundTaskId, message]) => [String(backgroundTaskId), String(message || '')])
+        .sort((left, right) => left[0].localeCompare(right[0]));
     return JSON.stringify({
-        hidden: !!hideBanner,
+        showResumeAction: !!showResumeAction,
         activeRun: signatureActiveRun(activeRun),
         approvals: Array.isArray(approvals) ? approvals.map(signatureApproval) : [],
+        backgroundTasks: Array.isArray(backgroundTasks)
+            ? backgroundTasks.map(signatureBackgroundTask)
+            : [],
         pausedSubagent: signaturePausedSubagent(pausedSubagent),
         recoveryActionBusy: !!recoveryActionBusy,
         approvalBusyIds: busyIds,
         approvalErrors: errorEntries,
+        backgroundTaskBusyIds,
+        backgroundTaskErrors: backgroundTaskErrorEntries,
         localStreamingRunId: activeRun && isLocallyStreaming(activeRun.run_id)
             ? String(activeRun.run_id || '')
             : '',
     });
 }
 
-function ensureRecoveryBannerHost() {
-    if (els.recoveryBannerHost) return els.recoveryBannerHost;
+function ensureRecoveryApprovalHost() {
+    if (els.recoveryApprovalHost) return els.recoveryApprovalHost;
     const inputContainer = document.querySelector('.input-container');
     if (!inputContainer) return null;
     const host = document.createElement('div');
-    host.id = 'recovery-banner-host';
-    host.className = 'recovery-banner-host';
+    host.id = 'recovery-approval-host';
+    host.className = 'recovery-approval-host';
     host.style.display = 'none';
     inputContainer.insertBefore(host, inputContainer.firstChild);
-    els.recoveryBannerHost = host;
+    els.recoveryApprovalHost = host;
     return host;
 }
 
-function syncRecoveryRailMode({ approvals = [], pausedSubagent = null } = {}) {
-    const rightRail = els.rightRail || document.getElementById('right-rail');
-    if (!rightRail) return;
-    const hasPendingApprovals = Array.isArray(approvals) && approvals.length > 0;
-    const hasPausedSubagent = !!pausedSubagent;
-
-    rightRail.classList.toggle('right-rail-recovery-priority', hasPendingApprovals);
-    rightRail.classList.toggle('right-rail-followup-priority', !hasPendingApprovals && hasPausedSubagent);
+function ensureResumeRunButton() {
+    if (els.resumeRunBtn) return els.resumeRunBtn;
+    const button = document.getElementById('resume-run-btn');
+    if (!button) return null;
+    els.resumeRunBtn = button;
+    return button;
 }
 
-function getFooterActions(activeRun, approvals, pausedSubagent) {
-    const actions = [];
-    if (!activeRun?.is_recoverable) return actions;
-    if (isLocallyStreaming(activeRun.run_id)) return actions;
-    if (activeRun.status === 'stopped' || activeRun.phase === 'stopped') {
-        actions.push({
-            action: 'resume-run',
-            label: 'Resume Run',
-            kind: 'primary',
-        });
-    }
-    if (pausedSubagent?.instanceId) {
-        actions.push({
-            action: 'open-subagent',
-            label: 'Open Subagent',
-            kind: 'secondary',
-        });
-    }
-    if (approvals.length > 0) {
-        actions.push({
-            action: 'review-round',
-            label: 'View Round',
-            kind: 'secondary',
-        });
-    }
-    return actions;
+function ensureBackgroundTaskHost() {
+    if (els.backgroundTaskHost) return els.backgroundTaskHost;
+    const chatContainer = els.chatContainer || els.chatMessages?.parentElement;
+    const inputContainer = document.querySelector('.input-container');
+    if (!chatContainer || !inputContainer || inputContainer.parentNode !== chatContainer) return null;
+    const host = document.createElement('div');
+    host.id = 'background-task-host';
+    host.className = 'background-task-strip-host';
+    host.style.display = 'none';
+    chatContainer.insertBefore(host, inputContainer);
+    els.backgroundTaskHost = host;
+    return host;
+}
+
+function shouldShowResumeAction(activeRun, approvals, pausedSubagent) {
+    if (!activeRun?.is_recoverable) return false;
+    if (!activeRun?.run_id || isLocallyStreaming(activeRun.run_id)) return false;
+    if (Array.isArray(approvals) && approvals.length > 0) return false;
+    if (pausedSubagent) return false;
+    if (activeRun.status === 'stopping' || activeRun.phase === 'stopping') return false;
+    return (
+        activeRun.status === 'stopped'
+        || activeRun.phase === 'stopped'
+        || activeRun.status === 'paused'
+        || activeRun.phase === 'awaiting_recovery'
+    );
 }
 
 async function handleRecoveryAction(actionDef, activeRun, pausedSubagent) {
@@ -981,22 +1112,6 @@ async function handleRecoveryAction(actionDef, activeRun, pausedSubagent) {
             reason: `recovery ${activeRun.status || activeRun.phase || 'resume'}`,
         });
         return;
-    }
-    if (actionDef.action === 'review-round') {
-        if (snapshotRoundFor(activeRun.run_id)) {
-            selectRound(snapshotRoundFor(activeRun.run_id));
-        } else {
-            document
-                .querySelector(`.session-round-section[data-run-id="${activeRun.run_id}"]`)
-                ?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-        }
-        return;
-    }
-    if (actionDef.action === 'open-subagent' && pausedSubagent?.instanceId) {
-        focusSubagent(
-            pausedSubagent.instanceId,
-            pausedSubagent.roleId || pausedSubagent.instanceId,
-        );
     }
 }
 
@@ -1025,7 +1140,7 @@ async function handleApprovalAction(runId, approval, action) {
                 quiet: true,
             });
             if (!resumed) {
-                throw new Error('Failed to resume run before approval');
+                throw new Error(t('recovery.resume_before_approval_failed'));
             }
             approvalWillResolveViaLiveRun = true;
             await waitForFreshApprovalRequest(safeRunId, safeToolCallId);
@@ -1047,11 +1162,68 @@ async function handleApprovalAction(runId, approval, action) {
         approvalActionBusyIds.delete(safeToolCallId);
         approvalActionErrors.set(
             safeToolCallId,
-            e?.message || 'Failed to resolve tool approval',
+            e?.message || t('recovery.resolve_tool_approval_failed'),
         );
-        sysLog(e?.message || 'Failed to resolve tool approval', 'log-error');
+        sysLog(e?.message || t('recovery.resolve_tool_approval_failed'), 'log-error');
         renderRecoveryBanner();
     }
+}
+
+async function handleBackgroundTaskAction(runId, backgroundTask, action) {
+    const safeRunId = String(runId || '').trim();
+    const safeBackgroundTaskId = String(backgroundTask?.backgroundTaskId || '').trim();
+    const safeAction = String(action || '').trim().toLowerCase();
+    if (!safeRunId || !safeBackgroundTaskId || !safeAction) return;
+    if (backgroundTaskActionBusyIds.has(safeBackgroundTaskId)) return;
+
+    backgroundTaskActionBusyIds.add(safeBackgroundTaskId);
+    backgroundTaskActionErrors.delete(safeBackgroundTaskId);
+    renderRecoveryBanner();
+
+    try {
+        if (safeAction !== 'stop') return;
+        const response = await stopBackgroundTask(safeRunId, safeBackgroundTaskId);
+        const updated = normalizeBackgroundTask(response?.background_task, safeRunId);
+        if (updated) {
+            applyBackgroundTaskUpdate(updated);
+        }
+        scheduleRecoveryContinuityRefresh({
+            sessionId: state.currentSessionId,
+            delayMs: 0,
+            includeRounds: false,
+            quiet: true,
+            reason: 'background-task-stop',
+        });
+    } catch (e) {
+        backgroundTaskActionErrors.set(
+            safeBackgroundTaskId,
+            e?.message || t('recovery.background_task.stop_failed'),
+        );
+        sysLog(e?.message || t('recovery.background_task.stop_failed'), 'log-error');
+    } finally {
+        backgroundTaskActionBusyIds.delete(safeBackgroundTaskId);
+        renderRecoveryBanner();
+    }
+}
+
+function applyBackgroundTaskUpdate(backgroundTask) {
+    const snapshot = state.currentRecoverySnapshot;
+    if (!snapshot) return;
+    const existing = snapshot.backgroundTasks || [];
+    const found = existing.some(item => item.backgroundTaskId === backgroundTask.backgroundTaskId);
+    const nextBackgroundTasks = found
+        ? existing.map(item => (item.backgroundTaskId === backgroundTask.backgroundTaskId ? backgroundTask : item))
+        : [backgroundTask, ...existing];
+    state.currentRecoverySnapshot = {
+        ...snapshot,
+        activeRun: snapshot.activeRun
+            ? {
+                ...snapshot.activeRun,
+                background_task_count: nextBackgroundTasks.length,
+            }
+            : snapshot.activeRun,
+        backgroundTasks: nextBackgroundTasks,
+    };
 }
 
 async function waitForFreshApprovalRequest(runId, toolCallId, timeoutMs = 3000) {
@@ -1086,89 +1258,143 @@ function snapshotRoundFor(runId) {
     return null;
 }
 
-function describeRecoveryState(activeRun, approvals, pausedSubagent) {
-    if (pausedSubagent) {
-        return `Paused at ${pausedSubagent.roleId || pausedSubagent.instanceId}. Open that subagent and send a follow-up to continue this run.`;
+function renderBackgroundTaskPanel() {
+    const host = ensureBackgroundTaskHost();
+    if (!host) return;
+
+    const snapshot = state.currentRecoverySnapshot;
+    const backgroundTasks = snapshot?.backgroundTasks || [];
+    const activeBackgroundTasks = backgroundTasks.filter(task => isBackgroundTaskActive(task));
+    const runId = String(
+        snapshot?.activeRun?.run_id
+        || activeBackgroundTasks[0]?.runId
+        || backgroundTasks[0]?.runId
+        || '',
+    ).trim();
+    const hidePanel = !runId || activeBackgroundTasks.length === 0;
+
+    if (hidePanel) {
+        host.style.display = 'none';
+        host.innerHTML = '';
+        return;
     }
-    if (activeRun.status === 'stopping' || activeRun.phase === 'stopping') {
-        return 'Stop requested. Wait for the active worker to exit before attempting recovery.';
-    }
-    if (approvals.length > 0) {
-        const noun = approvals.length === 1 ? 'approval' : 'approvals';
-        return `Waiting for ${approvals.length} tool ${noun}. Resolve them here, then the run will continue from the latest checkpoint.`;
-    }
-    if (activeRun.status === 'running' || activeRun.status === 'queued') {
-        return isLocallyStreaming(activeRun.run_id)
-            ? 'This tab is following the live stream.'
-            : 'A recoverable run is active for this session. The live stream reconnects automatically.';
-    }
-    if (activeRun.status === 'stopped') {
-        return 'Execution stopped at a durable checkpoint. Resume from the latest persisted state.';
-    }
-    return 'A recoverable run is available for this session.';
+
+    host.style.display = 'block';
+    host.innerHTML = `
+        <div class="background-task-strip" role="status" aria-live="polite">
+            <div class="background-task-strip-summary">
+                <span class="background-task-strip-label">${escapeHtml(t('recovery.background_task.panel_label'))}</span>
+                <span class="background-task-strip-meta">${escapeHtml(describeBackgroundTaskPanel(activeBackgroundTasks))}</span>
+            </div>
+            <div class="background-task-strip-items">
+                ${renderBackgroundTaskList(runId, activeBackgroundTasks)}
+            </div>
+        </div>
+    `;
+
+    host.querySelectorAll('[data-background-task-action]').forEach(button => {
+        const backgroundTaskId = String(button.dataset.backgroundTaskId || '');
+        const action = String(button.dataset.backgroundTaskAction || '');
+        if (!backgroundTaskId || !action) return;
+        const backgroundTask = activeBackgroundTasks.find(
+            item => item.backgroundTaskId === backgroundTaskId,
+        );
+        if (!backgroundTask) return;
+        button.onclick = () => {
+            void handleBackgroundTaskAction(runId, backgroundTask, action);
+        };
+    });
 }
 
-function stateLabel(activeRun) {
-    if (!activeRun) return 'Unknown';
-    switch (activeRun.phase) {
-        case 'awaiting_tool_approval':
-            return 'Awaiting Approval';
-        case 'awaiting_subagent_followup':
-            return 'Awaiting Follow-up';
-        case 'running':
-            return 'Running';
-        case 'stopping':
-            return 'Stopping';
-        case 'stopped':
-            return 'Stopped';
-        case 'queued':
-            return 'Queued';
-        default:
-            break;
-    }
-    switch (activeRun.status) {
-        case 'running':
-            return 'Running';
-        case 'stopping':
-            return 'Stopping';
-        case 'paused':
-            return 'Paused';
-        case 'stopped':
-            return 'Stopped';
-        case 'queued':
-            return 'Queued';
-        case 'completed':
-            return 'Completed';
-        case 'failed':
-            return 'Failed';
-        default:
-            return 'Recoverable';
-    }
-}
-
-function stateTone(activeRun) {
-    if (!activeRun) return 'idle';
-    if (activeRun.phase === 'awaiting_tool_approval') return 'warning';
-    if (activeRun.phase === 'awaiting_subagent_followup') return 'warning';
-    switch (activeRun.status) {
-        case 'running':
-            return 'running';
-        case 'stopping':
-            return 'warning';
-        case 'stopped':
-            return 'stopped';
-        case 'failed':
-            return 'danger';
-        case 'completed':
-            return 'success';
-        default:
-            return 'idle';
-    }
+function describeBackgroundTaskPanel(backgroundTasks) {
+    return `${backgroundTasks.length} active`;
 }
 
 function shortRunId(runId) {
     const safe = String(runId || '');
     return safe.length > 16 ? `${safe.slice(0, 8)}...${safe.slice(-4)}` : safe;
+}
+
+function renderBackgroundTaskList(runId, backgroundTasks) {
+    return `
+        <div class="background-task-chip-list">
+            ${backgroundTasks.map(item => renderBackgroundTaskItem(runId, item)).join('')}
+        </div>
+    `;
+}
+
+function renderBackgroundTaskItem(runId, backgroundTask) {
+    const backgroundTaskId = String(backgroundTask?.backgroundTaskId || '');
+    const busy = backgroundTaskActionBusyIds.has(backgroundTaskId);
+    const error = backgroundTaskActionErrors.get(backgroundTaskId) || '';
+    const statusText = error
+        || (busy ? t('recovery.applying') : backgroundTaskStatusLabel(backgroundTask));
+    const chipTone = backgroundTaskTone(backgroundTask, { busy, error });
+    const details = [
+        statusText,
+        backgroundTask.command || shortRunId(backgroundTaskId),
+        backgroundTask.cwd ? `cwd: ${backgroundTask.cwd}` : '',
+        backgroundTask.logPath ? `log: ${backgroundTask.logPath}` : '',
+        backgroundTask.exitCode === null ? '' : `exit: ${backgroundTask.exitCode}`,
+    ].filter(Boolean).join('\n');
+
+    return `
+        <section class="background-task-chip background-task-chip-${chipTone}" title="${escapeAttribute(details)}">
+            <span class="background-task-chip-status">${escapeHtml(statusText)}</span>
+            <span class="background-task-chip-command">${escapeHtml(backgroundTask.command || shortRunId(backgroundTaskId))}</span>
+            ${isBackgroundTaskActive(backgroundTask)
+        ? `<button
+                    type="button"
+                    class="background-task-chip-stop"
+                    data-background-task-action="stop"
+                    data-background-task-id="${escapeAttribute(backgroundTaskId)}"
+                    data-run-id="${escapeAttribute(runId)}"
+                    ${busy || recoveryActionBusy ? 'disabled' : ''}
+                >
+                    ${escapeHtml(t('recovery.background_task.stop'))}
+                </button>`
+        : ''
+    }
+        </section>
+    `;
+}
+
+function isBackgroundTaskActive(backgroundTask) {
+    return backgroundTask?.status === 'running' || backgroundTask?.status === 'blocked';
+}
+
+function backgroundTaskTone(backgroundTask, { busy = false, error = '' } = {}) {
+    if (error) return 'danger';
+    if (busy) return 'warning';
+    switch (backgroundTask?.status) {
+        case 'running':
+            return 'running';
+        case 'blocked':
+            return 'warning';
+        case 'completed':
+            return 'success';
+        case 'failed':
+            return 'danger';
+        default:
+            return 'idle';
+    }
+}
+
+function backgroundTaskStatusLabel(backgroundTask) {
+    switch (backgroundTask?.status) {
+        case 'running':
+            return t('recovery.state.running');
+        case 'blocked':
+            return t('recovery.state.paused');
+        case 'stopped':
+            return t('recovery.state.stopped');
+        case 'completed':
+            return t('recovery.state.completed');
+        case 'failed':
+            return t('recovery.state.failed');
+        default:
+            return t('recovery.state.unknown');
+    }
 }
 
 function renderApprovalList(activeRun, approvals) {
@@ -1183,57 +1409,48 @@ function renderApprovalItem(activeRun, approval) {
     const toolCallId = String(approval?.tool_call_id || '');
     const busy = approvalActionBusyIds.has(toolCallId);
     const error = approvalActionErrors.get(toolCallId) || '';
-    const statusClass = error ? 'is-error' : busy ? 'is-busy' : '';
-    const statusText = error || (busy ? 'Applying...' : '');
+    const statusText = error || (busy ? t('recovery.applying') : '');
     const actor = humanizeRoleLabel(approval?.role_id || approval?.instance_id || 'Agent');
     const title = approvalTitle(approval);
-    const subtitle = `Requested by ${actor}`;
+    const subtitle = [
+        formatMessage('recovery.requested_by', { actor }),
+        approval?.source ? `source ${approval.source}` : '',
+        approval?.risk_level ? `risk ${approval.risk_level}` : '',
+        approval?.target_summary ? `target ${approval.target_summary}` : '',
+    ].filter(Boolean).join(' · ');
 
     return `
-        <section class="recovery-approval-item">
+        <section class="recovery-approval-card">
             <div class="recovery-approval-copy">
+                <div class="recovery-approval-eyebrow">${escapeHtml(t('stream.approval_required'))}</div>
                 <div class="recovery-approval-title">${escapeHtml(title)}</div>
-                <div class="recovery-approval-text">${escapeHtml(subtitle)}</div>
+                ${subtitle ? `<div class="recovery-approval-meta">${escapeHtml(subtitle)}</div>` : ''}
             </div>
             <div class="recovery-approval-actions">
+                <button
+                    type="button"
+                    class="recovery-approval-action recovery-approval-action-approve"
+                    data-approval-action="approve"
+                    data-tool-call-id="${escapeAttribute(toolCallId)}"
+                    ${busy || recoveryActionBusy ? 'disabled' : ''}
+                >
+                    ${escapeHtml(t('recovery.approve'))}
+                </button>
+                <button
+                    type="button"
+                    class="recovery-approval-action recovery-approval-action-deny"
+                    data-approval-action="deny"
+                    data-tool-call-id="${escapeAttribute(toolCallId)}"
+                    ${busy || recoveryActionBusy ? 'disabled' : ''}
+                >
+                    ${escapeHtml(t('recovery.deny'))}
+                </button>
                 ${statusText
-        ? `<span class="recovery-approval-status ${statusClass}">${escapeHtml(statusText)}</span>`
-        : '<span class="recovery-approval-status"></span>'
+        ? `<span class="recovery-approval-status ${error ? 'is-error' : ''}">${escapeHtml(statusText)}</span>`
+        : ''
     }
-                <div class="recovery-approval-buttons">
-                    <button
-                        type="button"
-                        class="recovery-choice-btn recovery-choice-approve"
-                        data-approval-action="approve"
-                        data-tool-call-id="${escapeAttribute(toolCallId)}"
-                        ${busy || recoveryActionBusy ? 'disabled' : ''}
-                    >
-                        Approve
-                    </button>
-                    <button
-                        type="button"
-                        class="recovery-choice-btn recovery-choice-deny"
-                        data-approval-action="deny"
-                        data-tool-call-id="${escapeAttribute(toolCallId)}"
-                        ${busy || recoveryActionBusy ? 'disabled' : ''}
-                    >
-                        Deny
-                    </button>
-                </div>
             </div>
         </section>
-    `;
-}
-
-function renderPausedSubagentCallout(pausedSubagent) {
-    const actor = pausedSubagent.roleId || pausedSubagent.instanceId;
-    return `
-        <div class="recovery-subagent-callout">
-            <div class="recovery-subagent-copy">
-                <div class="recovery-subagent-title">${escapeHtml(actor || 'Paused subagent')}</div>
-                <div class="recovery-subagent-text">This run is waiting for a follow-up inside the paused subagent panel.</div>
-            </div>
-        </div>
     `;
 }
 
@@ -1241,18 +1458,18 @@ function approvalTitle(approval) {
     const toolName = String(approval?.tool_name || '');
     const args = parseApprovalArgs(approval?.args_preview);
     if (toolName === 'list_available_roles') {
-        return 'List available roles';
+        return t('recovery.tool.list_available_roles');
     }
     if (toolName === 'create_tasks') {
         const taskCount = normalizeCount(args.task_count);
         return taskCount > 0
-            ? `Create ${taskCount} delegated task${taskCount === 1 ? '' : 's'}`
-            : 'Create delegated tasks';
+            ? formatMessage('recovery.tool.create_tasks_count', { count: taskCount })
+            : t('recovery.tool.create_tasks');
     }
     if (toolName === 'dispatch_task') {
-        return 'Dispatch task';
+        return t('recovery.tool.dispatch_task');
     }
-    return `Run ${humanizeToolName(toolName || 'tool')}`;
+    return formatMessage('recovery.tool.run', { tool: humanizeToolName(toolName || 'tool') });
 }
 
 function parseApprovalArgs(argsPreview) {
@@ -1271,7 +1488,7 @@ function normalizeCount(value) {
 }
 
 function humanizeRoleLabel(value) {
-    return humanizeRoleId(value, { coordinatorLabel: 'Coordinator Agent' });
+    return humanizeRoleId(value);
 }
 
 function humanizeToolName(value) {

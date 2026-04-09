@@ -22,16 +22,20 @@ export {
 
 export {
     dispatchHumanTask,
+    fetchRunBackgroundTask,
+    fetchRunBackgroundTasks,
     injectMessage,
     injectSubagentMessage,
     resolveGate,
     resolveToolApproval,
     resumeRun,
     sendUserPrompt,
+    stopBackgroundTask,
     stopRun,
 } from './runs.js';
 
 export {
+    deleteRoleConfig,
     fetchRoleConfigOptions,
     fetchRoleConfig,
     fetchRoleConfigs,

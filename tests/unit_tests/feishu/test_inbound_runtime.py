@@ -4,8 +4,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
-from agent_teams.gateway.feishu.inbound_runtime import FeishuInboundRuntime
-from agent_teams.gateway.feishu.models import (
+from relay_teams.gateway.feishu.inbound_runtime import FeishuInboundRuntime
+from relay_teams.gateway.feishu.models import (
+    FEISHU_METADATA_MESSAGE_ID_KEY,
     FeishuEnvironment,
     FeishuNormalizedMessage,
     FeishuTriggerRuntimeConfig,
@@ -16,10 +17,10 @@ from agent_teams.gateway.feishu.models import (
     SESSION_METADATA_TITLE_SOURCE_KEY,
     SESSION_TITLE_SOURCE_MANUAL,
 )
-from agent_teams.providers.token_usage_repo import SessionTokenUsage
-from agent_teams.sessions import ExternalSessionBindingRepository
-from agent_teams.sessions.runs.run_models import IntentInput, RunThinkingConfig
-from agent_teams.sessions.session_models import SessionMode, SessionRecord
+from relay_teams.providers.token_usage_repo import SessionTokenUsage
+from relay_teams.sessions import ExternalSessionBindingRepository
+from relay_teams.sessions.runs.run_models import IntentInput, RunThinkingConfig
+from relay_teams.sessions.session_models import SessionMode, SessionRecord
 
 
 class _FakeSessionService:
@@ -89,6 +90,9 @@ class _FakeRunService:
         self.started: list[str] = []
 
     def create_run(self, intent: IntentInput) -> tuple[str, str]:
+        return self.create_detached_run(intent)
+
+    def create_detached_run(self, intent: IntentInput) -> tuple[str, str]:
         self.created.append(intent)
         return f"run-{len(self.created)}", intent.session_id
 
@@ -120,6 +124,16 @@ class _FakeFeishuClient:
         environment: FeishuEnvironment | None = None,
     ) -> str | None:
         _ = environment
+        return self.user_names.get(open_id)
+
+    def resolve_user_name(
+        self,
+        *,
+        open_id: str,
+        chat_id: str | None = None,
+        environment: FeishuEnvironment | None = None,
+    ) -> str | None:
+        _ = (chat_id, environment)
         return self.user_names.get(open_id)
 
 
@@ -165,6 +179,7 @@ def _build_message(
     chat_type: str,
     tenant_key: str = "tenant-1",
     sender_open_id: str | None = "ou_user",
+    sender_name: str | None = None,
     trigger_text: str = "hello",
 ) -> FeishuNormalizedMessage:
     return FeishuNormalizedMessage(
@@ -175,6 +190,7 @@ def _build_message(
         message_id=message_id,
         message_type="text",
         sender_open_id=sender_open_id,
+        sender_name=sender_name,
         trigger_text=trigger_text,
         payload={"message_text": trigger_text},
         metadata={"provider": "feishu", "event_id": event_id},
@@ -210,6 +226,7 @@ def test_start_run_creates_group_session_and_run(tmp_path: Path) -> None:
             message_id="om_1",
             chat_id="oc_group_1",
             chat_type="group",
+            sender_name="Alice",
             trigger_text="please summarize this repo",
         ),
     )
@@ -227,8 +244,19 @@ def test_start_run_creates_group_session_and_run(tmp_path: Path) -> None:
         ]
         == "feishu"
     )
-    assert run_service.created[0].intent == "please summarize this repo"
+    assert (
+        session_service.sessions["session-1"].metadata[FEISHU_METADATA_MESSAGE_ID_KEY]
+        == "om_1"
+    )
+    assert (
+        run_service.created[0].intent
+        == "收到来自 Alice 的飞书消息：please summarize this repo"
+    )
     assert run_service.created[0].yolo is False
+    assert run_service.created[0].conversation_context is not None
+    assert run_service.created[0].conversation_context.source_provider == "feishu"
+    assert run_service.created[0].conversation_context.source_kind == "im"
+    assert run_service.created[0].conversation_context.feishu_chat_type == "group"
 
 
 def test_resolve_session_id_uses_user_name_for_p2p(tmp_path: Path) -> None:

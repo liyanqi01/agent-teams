@@ -31,6 +31,7 @@ import { sysLog } from '../../utils/logger.js';
 import {
     appendThinkingChunk,
     appendStreamChunk,
+    appendStreamOutputParts,
     finalizeThinking,
     finalizeStream,
     getOrCreateStreamBlock,
@@ -101,6 +102,56 @@ export function handleTextDelta(payload, eventMeta, instanceId, roleId) {
         }
         getOrCreateStreamBlock(container, streamKey, roleId, label, runId);
         appendStreamChunk(streamKey, payload.text || '', runId, roleId, label);
+    }
+}
+
+export function handleOutputDelta(payload, eventMeta, instanceId, roleId) {
+    const runId = eventMeta?.run_id || eventMeta?.trace_id || state.activeRunId || '';
+    const primaryRoleId = getRunPrimaryRoleId(runId);
+    const primaryLabel = getRunPrimaryRoleLabel(runId);
+    const isPrimary = !roleId || isRunPrimaryRoleId(roleId, runId);
+    const label = isPrimary ? primaryLabel : (roleId || 'Agent');
+    const streamKey = isPrimary ? 'primary' : (instanceId || roleId);
+    const output = Array.isArray(payload?.output) ? payload.output : [];
+
+    if (isPrimary) {
+        const container = coordinatorContainerFor(eventMeta);
+        getOrCreateStreamBlock(container, streamKey, primaryRoleId, label, runId);
+        appendStreamOutputParts(streamKey, output, {
+            container,
+            runId,
+            roleId: primaryRoleId,
+            label,
+        });
+        return;
+    }
+
+    const container = getPanelScrollContainer(instanceId, roleId);
+    if (!getActiveInstanceId()) {
+        openAgentPanel(instanceId, roleId);
+    }
+    getOrCreateStreamBlock(container, streamKey, roleId, label, runId);
+    appendStreamOutputParts(streamKey, output, {
+        container,
+        runId,
+        roleId,
+        label,
+    });
+}
+
+export function handleGenerationProgress(payload) {
+    const runKind = String(payload?.run_kind || 'generation');
+    const phase = String(payload?.phase || 'running');
+    if (phase === 'started') {
+        sysLog(`${runKind} started.`, 'log-info');
+        return;
+    }
+    if (phase === 'completed') {
+        sysLog(`${runKind} completed.`, 'log-info');
+        return;
+    }
+    if (phase === 'failed') {
+        sysLog(`${runKind} failed.`, 'log-error');
     }
 }
 
@@ -204,8 +255,8 @@ export function handleRunCompleted(eventMeta) {
     sysLog('Run completed.');
     markLlmRetrySucceeded();
     const runId = eventMeta?.run_id || eventMeta?.trace_id || state.activeRunId || '';
-    if (state.activeRunId) {
-        markRunTerminalState(state.activeRunId, {
+    if (runId) {
+        markRunTerminalState(runId, {
             status: 'completed',
             phase: 'terminal',
             recoverable: false,
@@ -234,8 +285,8 @@ export function handleRunStopped(eventMeta, payload) {
     if (state.activeAgentInstanceId) {
         markSubagentStatus(state.activeAgentInstanceId, 'stopped');
     }
-    if (state.activeRunId) {
-        markRunTerminalState(state.activeRunId, {
+    if (runId) {
+        markRunTerminalState(runId, {
             status: 'stopped',
             phase: 'stopped',
             recoverable: true,
@@ -265,8 +316,8 @@ export function handleRunFailed(eventMeta, payload) {
     if (state.activeAgentInstanceId) {
         markSubagentStatus(state.activeAgentInstanceId, 'failed');
     }
-    if (state.activeRunId) {
-        markRunTerminalState(state.activeRunId, {
+    if (runId) {
+        markRunTerminalState(runId, {
             status: 'failed',
             phase: 'terminal',
             recoverable: false,

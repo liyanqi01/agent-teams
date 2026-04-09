@@ -3,24 +3,37 @@ from __future__ import annotations
 
 import asyncio
 import ssl
+import sys
+from types import ModuleType, SimpleNamespace
 from typing import cast
+import warnings
 
 import httpx
+import pytest
+from websockets.datastructures import Headers
+from websockets.exceptions import ConnectionClosedOK, InvalidStatus
+from websockets.frames import Close
+from websockets.http11 import Response
 
-from agent_teams.env.proxy_env import ProxyEnvConfig
-from agent_teams.gateway.feishu.models import (
+from relay_teams.env.proxy_env import ProxyEnvConfig
+from relay_teams.gateway.feishu.lark_ws_compat import (
+    import_lark_module,
+    import_lark_ws_client_module,
+)
+from relay_teams.gateway.feishu.models import (
     FeishuEnvironment,
     FeishuTriggerRuntimeConfig,
     FeishuTriggerSourceConfig,
     FeishuTriggerTargetConfig,
     TriggerProcessingResult,
 )
-from agent_teams.gateway.feishu.subscription_service import (
+from relay_teams.gateway.feishu.subscription_service import (
     FeishuSubscriptionService,
     WsClientLike,
     _FeishuWsController,
     _FeishuWsHub,
     _build_websocket_ssl_context,
+    _parse_ws_conn_exception,
     _resolve_websocket_proxy_url,
 )
 
@@ -230,7 +243,9 @@ def test_subscription_service_stop_shuts_down_shared_runner_factory() -> None:
     assert runner_factory.shutdown_calls == 1
 
 
-def test_feishu_ws_hub_reuses_single_thread_for_multiple_bots() -> None:
+def test_feishu_ws_hub_reuses_single_thread_for_multiple_bots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     runtime_a = _build_runtime(
         trigger_id="trg_a",
         name="bot_a",
@@ -257,6 +272,10 @@ def test_feishu_ws_hub_reuses_single_thread_for_multiple_bots() -> None:
         created_controllers[runtime_config.trigger_id] = controller
         return controller
 
+    monkeypatch.setattr(
+        "relay_teams.gateway.feishu.subscription_service.import_lark_ws_client_module",
+        lambda: SimpleNamespace(),
+    )
     hub = _FeishuWsHub(controller_factory=_controller_factory)
 
     hub.start_client(runtime_config=runtime_a, event_handler=_FakeHandler())
@@ -375,6 +394,43 @@ def test_feishu_ws_controller_get_conn_url_uses_net_http_client(monkeypatch) -> 
         "_create_feishu_http_client",
         lambda: fake_http_client,
     )
+    const_module = ModuleType("lark_oapi.ws.const")
+    setattr(const_module, "GEN_ENDPOINT_URI", "/callback/ws/endpoint")
+    exception_module = ModuleType("lark_oapi.ws.exception")
+
+    class _FakeClientException(Exception):
+        def __init__(self, code: int, message: str) -> None:
+            super().__init__(message)
+            self.code = code
+            self.message = message
+
+    class _FakeServerException(Exception):
+        def __init__(self, code: int, message: str) -> None:
+            super().__init__(message)
+            self.code = code
+            self.message = message
+
+    setattr(exception_module, "ClientException", _FakeClientException)
+    setattr(exception_module, "ServerException", _FakeServerException)
+    model_module = ModuleType("lark_oapi.ws.model")
+
+    class _FakeEndpointResp:
+        def __init__(self, payload: dict[str, object]) -> None:
+            data = cast(dict[str, object], payload["data"])
+            client_config = cast(dict[str, object], data["ClientConfig"])
+            self.code = payload["code"]
+            self.msg = payload["msg"]
+            self.data = SimpleNamespace(
+                URL=data["URL"],
+                ClientConfig=SimpleNamespace(
+                    PingInterval=client_config["PingInterval"]
+                ),
+            )
+
+    setattr(model_module, "EndpointResp", _FakeEndpointResp)
+    monkeypatch.setitem(sys.modules, "lark_oapi.ws.const", const_module)
+    monkeypatch.setitem(sys.modules, "lark_oapi.ws.exception", exception_module)
+    monkeypatch.setitem(sys.modules, "lark_oapi.ws.model", model_module)
     ws_client = _FakeWsClient()
 
     conn_url = controller._get_conn_url(cast(WsClientLike, ws_client))
@@ -392,7 +448,7 @@ def test_feishu_ws_controller_get_conn_url_uses_net_http_client(monkeypatch) -> 
 
 def test_build_websocket_ssl_context_respects_proxy_ssl_setting(monkeypatch) -> None:
     monkeypatch.setattr(
-        "agent_teams.gateway.feishu.subscription_service.load_proxy_env_config",
+        "relay_teams.gateway.feishu.subscription_service.load_proxy_env_config",
         lambda: ProxyEnvConfig(ssl_verify=False),
     )
 
@@ -405,7 +461,7 @@ def test_build_websocket_ssl_context_respects_proxy_ssl_setting(monkeypatch) -> 
 
 def test_resolve_websocket_proxy_url_uses_https_proxy_for_wss(monkeypatch) -> None:
     monkeypatch.setattr(
-        "agent_teams.gateway.feishu.subscription_service.load_proxy_env_config",
+        "relay_teams.gateway.feishu.subscription_service.load_proxy_env_config",
         lambda: ProxyEnvConfig(
             https_proxy="http://proxy.internal:8443",
             http_proxy="http://proxy.internal:8080",
@@ -422,7 +478,7 @@ def test_resolve_websocket_proxy_url_uses_https_proxy_for_wss(monkeypatch) -> No
 
 def test_resolve_websocket_proxy_url_respects_no_proxy(monkeypatch) -> None:
     monkeypatch.setattr(
-        "agent_teams.gateway.feishu.subscription_service.load_proxy_env_config",
+        "relay_teams.gateway.feishu.subscription_service.load_proxy_env_config",
         lambda: ProxyEnvConfig(
             https_proxy="http://proxy.internal:8443",
             no_proxy="open.feishu.cn",
@@ -434,3 +490,138 @@ def test_resolve_websocket_proxy_url_respects_no_proxy(monkeypatch) -> None:
     )
 
     assert proxy_url is None
+
+
+def test_import_lark_ws_client_module_suppresses_known_deprecations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    try:
+        previous_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        previous_loop = None
+
+    loop = asyncio.new_event_loop()
+
+    try:
+        asyncio.set_event_loop(loop)
+
+        def _fake_import(module_name: str) -> ModuleType:
+            warnings.warn_explicit(
+                "datetime.datetime.utcfromtimestamp() is deprecated",
+                DeprecationWarning,
+                filename="well_known_types.py",
+                lineno=1,
+                module="lark_oapi.ws.pb.google.protobuf.internal.well_known_types",
+            )
+            warnings.warn_explicit(
+                "There is no current event loop",
+                DeprecationWarning,
+                filename="client.py",
+                lineno=1,
+                module="lark_oapi.ws.client",
+            )
+            warnings.warn_explicit(
+                "websockets.InvalidStatusCode is deprecated",
+                DeprecationWarning,
+                filename="client.py",
+                lineno=1,
+                module="lark_oapi.ws.client",
+            )
+            warnings.warn_explicit(
+                "websockets.legacy is deprecated",
+                DeprecationWarning,
+                filename="legacy.py",
+                lineno=1,
+                module="websockets.legacy.client",
+            )
+            return ModuleType(module_name)
+
+        monkeypatch.setattr(
+            "relay_teams.gateway.feishu.lark_ws_compat.importlib.import_module",
+            _fake_import,
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("default")
+            module = import_lark_ws_client_module()
+        assert module.__name__ == "lark_oapi.ws.client"
+        assert caught == []
+    finally:
+        loop.close()
+        asyncio.set_event_loop(previous_loop)
+
+
+def test_import_lark_module_suppresses_dispatcher_handler_deprecations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _fake_import(module_name: str) -> ModuleType:
+        warnings.warn_explicit(
+            "datetime.datetime.utcfromtimestamp() is deprecated",
+            DeprecationWarning,
+            filename="well_known_types.py",
+            lineno=1,
+            module="lark_oapi.ws.pb.google.protobuf.internal.well_known_types",
+        )
+        warnings.warn_explicit(
+            "websockets.legacy is deprecated",
+            DeprecationWarning,
+            filename="legacy.py",
+            lineno=1,
+            module="websockets.legacy.client",
+        )
+        return ModuleType(module_name)
+
+    monkeypatch.setattr(
+        "relay_teams.gateway.feishu.lark_ws_compat.importlib.import_module",
+        _fake_import,
+    )
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("default")
+            module = import_lark_module("lark_oapi.event.dispatcher_handler")
+        assert module.__name__ == "lark_oapi.event.dispatcher_handler"
+        assert caught == []
+    finally:
+        pass
+
+
+def test_parse_ws_conn_exception_reads_invalid_status_response_headers() -> None:
+    headers = Headers()
+    headers["handshake-status"] = "403"
+    headers["handshake-msg"] = "forbidden"
+
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        import_lark_ws_client_module()
+        with pytest.raises(Exception, match="forbidden") as caught:
+            _parse_ws_conn_exception(InvalidStatus(Response(403, "Forbidden", headers)))
+        assert caught.type.__name__ == "ClientException"
+    finally:
+        loop.close()
+        asyncio.set_event_loop(None)
+
+
+def test_feishu_ws_controller_receive_loop_ignores_normal_close_after_stop() -> None:
+    controller = _FeishuWsController(
+        runtime_config=_build_runtime(
+            trigger_id="trg_a",
+            name="bot_a",
+            app_id="cli_demo",
+            app_name="bot-a",
+            app_secret="secret-demo",
+        ),
+        event_handler=_FakeHandler(),
+    )
+
+    class _ClosingWsConnection:
+        async def close(self) -> None:
+            return None
+
+        async def recv(self) -> bytes | str:
+            controller._stop_requested = True
+            raise ConnectionClosedOK(Close(1000, "bye"), Close(1000, ""), False)
+
+    ws_client = _FakeWsClient()
+    ws_client._conn = cast(_FakeWsConnection, _ClosingWsConnection())
+
+    asyncio.run(controller._receive_loop(cast(WsClientLike, ws_client)))

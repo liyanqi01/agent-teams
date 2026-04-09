@@ -1,4 +1,4 @@
-﻿# Metrics Platform Design
+# Metrics Platform Design
 
 ## Summary
 
@@ -15,6 +15,7 @@
    - session metrics
    - llm metrics
    - tool metrics
+   - retrieval metrics
 3. `sinks`
    - aggregate store sink
    - prettylog sink
@@ -27,15 +28,24 @@
 ## Naming And Tags
 
 Built-in metrics:
-- `agent_teams.session.steps`
-- `agent_teams.llm.input_tokens`
-- `agent_teams.llm.cached_input_tokens`
-- `agent_teams.llm.output_tokens`
-- `agent_teams.tool.calls`
-- `agent_teams.tool.duration_ms`
-- `agent_teams.tool.failures`
-- `agent_teams.skill.calls`
-- `agent_teams.mcp.calls`
+- `relay_teams.session.steps`
+- `relay_teams.llm.input_tokens`
+- `relay_teams.llm.cached_input_tokens`
+- `relay_teams.llm.output_tokens`
+- `relay_teams.tool.calls`
+- `relay_teams.tool.duration_ms`
+- `relay_teams.tool.failures`
+- `relay_teams.skill.calls`
+- `relay_teams.mcp.calls`
+- `relay_teams.retrieval.searches`
+- `relay_teams.retrieval.search_duration_ms`
+- `relay_teams.retrieval.search_failures`
+- `relay_teams.retrieval.rebuilds`
+- `relay_teams.retrieval.rebuild_duration_ms`
+- `relay_teams.retrieval.document_count`
+- `relay_teams.gateway.operations`
+- `relay_teams.gateway.operation_duration_ms`
+- `relay_teams.gateway.operation_failures`
 
 Standard tags:
 - `workspace_id`
@@ -46,6 +56,14 @@ Standard tags:
 - `tool_name`
 - `tool_source`
 - `mcp_server`
+- `retrieval_backend`
+- `retrieval_scope_kind`
+- `retrieval_operation`
+- `gateway_channel`
+- `gateway_operation`
+- `gateway_phase`
+- `gateway_transport`
+- `gateway_cold_start`
 - `status`
 
 ## Storage And Queries
@@ -54,6 +72,9 @@ The current aggregate store writes normalized metric points into SQLite and expa
 - cached token ratio
 - tool success rate
 - average tool duration
+- gateway request failure rate
+- gateway request average latency
+- ACP prompt run-start and first-update average latency
 
 ## Extension Rules
 
@@ -76,3 +97,8 @@ HTTP API:
 
 Frontend:
 - topbar `Observability` view
+  - cached vs uncached input token split
+  - retrieval search volume/failure/latency/index-size KPIs
+  - tool breakdown and role breakdown panels
+  - gateway ACP request volume/failure/latency KPIs
+  - gateway operation breakdown panel

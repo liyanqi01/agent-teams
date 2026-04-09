@@ -4,14 +4,14 @@ from __future__ import annotations
 import pytest
 from pydantic_ai.mcp import MCPServerStdio
 
-from agent_teams.mcp.mcp_models import (
+from relay_teams.mcp.mcp_models import (
     McpConfigScope,
     McpServerSpec,
     McpToolInfo,
 )
-from agent_teams.mcp.mcp_registry import McpRegistry, build_mcp_server
-from agent_teams.mcp.mcp_service import McpService
-from agent_teams.trace import get_trace_context
+from relay_teams.mcp.mcp_registry import McpRegistry, build_mcp_server
+from relay_teams.mcp.mcp_service import McpService
+from relay_teams.trace import get_trace_context
 
 
 def test_list_servers_reports_effective_transport() -> None:
@@ -195,3 +195,26 @@ def test_build_mcp_server_allows_stdio_timeout_override() -> None:
     assert server.tool_prefix == "context7"
     assert server.timeout == 42.0
     assert server.read_timeout == 123.0
+
+
+def test_registry_resolve_server_names_ignores_unknown_servers_when_not_strict() -> (
+    None
+):
+    registry = McpRegistry(
+        (
+            McpServerSpec(
+                name="filesystem",
+                config={"mcpServers": {"filesystem": {"command": "npx"}}},
+                server_config={"command": "npx"},
+                source=McpConfigScope.APP,
+            ),
+        )
+    )
+
+    resolved = registry.resolve_server_names(
+        ("filesystem", "missing"),
+        strict=False,
+        consumer="tests.unit_tests.mcp.test_mcp_service",
+    )
+
+    assert resolved == ("filesystem",)

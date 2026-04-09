@@ -9,7 +9,7 @@ import {
     reloadSkillsConfig,
 } from '../../core/api.js';
 import { showToast } from '../../utils/feedback.js';
-import { t } from '../../utils/i18n.js';
+import { formatMessage, t } from '../../utils/i18n.js';
 import { errorToPayload, logError } from '../../utils/logger.js';
 
 const collapsedMcpServers = new Set();
@@ -81,11 +81,14 @@ export async function loadSkillsStatusPanel() {
     try {
         const status = await fetchConfigStatus();
         const skillsStatus = document.getElementById('skills-status');
+        if (!skillsStatus) {
+            return;
+        }
         const skills = status.skills?.skills || [];
         if (skills.length === 0) {
             skillsStatus.innerHTML = renderEmptyState(t('settings.system.no_skills'), t('settings.system.no_skills_copy'));
         } else {
-            skillsStatus.innerHTML = renderStatusList(skills, 'Ready');
+            skillsStatus.innerHTML = renderStatusList(skills, t('settings.system.ready_state'));
         }
     } catch (e) {
         logError(
@@ -102,7 +105,11 @@ async function handleReloadMcp() {
         showToast({ title: t('settings.system.mcp_reloaded'), message: t('settings.system.mcp_reloaded_message'), tone: 'success' });
         await loadMcpStatusPanel();
     } catch (e) {
-        showToast({ title: t('settings.system.reload_failed'), message: `Failed to reload: ${e.message}`, tone: 'danger' });
+        showToast({
+            title: t('settings.system.reload_failed'),
+            message: formatMessage('settings.system.reload_failed_detail', { error: e.message }),
+            tone: 'danger',
+        });
     }
 }
 
@@ -112,7 +119,11 @@ async function handleReloadSkills() {
         showToast({ title: t('settings.system.skills_reloaded'), message: t('settings.system.skills_reloaded_message'), tone: 'success' });
         await loadSkillsStatusPanel();
     } catch (e) {
-        showToast({ title: t('settings.system.reload_failed'), message: `Failed to reload: ${e.message}`, tone: 'danger' });
+        showToast({
+            title: t('settings.system.reload_failed'),
+            message: formatMessage('settings.system.reload_failed_detail', { error: e.message }),
+            tone: 'danger',
+        });
     }
 }
 
@@ -151,7 +162,7 @@ async function loadMcpServerView(serverName) {
             source: '',
             transport: '',
             tools: [],
-            errorMessage: e?.message || 'Failed to load tools for this MCP server.',
+            errorMessage: e?.message || t('settings.system.load_tools_failed_detail'),
             loading: false,
         };
     }
@@ -220,8 +231,8 @@ function renderMcpServerList(serverViews) {
 
 function renderMcpStatusToolbar(serverCount, collapsibleCount, allCollapsed, loadingCount) {
     const summaryLabel = loadingCount > 0
-        ? `${serverCount} server${serverCount === 1 ? '' : 's'} configured, ${loadingCount} loading..`
-        : `${serverCount} server${serverCount === 1 ? '' : 's'} loaded`;
+        ? formatMessage('settings.system.server_count_loading', { count: serverCount, loading: loadingCount })
+        : formatMessage('settings.system.server_count_loaded', { count: serverCount });
     return `
         <div class="mcp-status-toolbar">
             <div class="mcp-status-toolbar-copy">${escapeHtml(summaryLabel)}</div>
@@ -270,7 +281,7 @@ function renderMcpServerCard(serverView) {
 function renderMcpServerTools(serverView, collapsed) {
     if (serverView.loading) {
         return `
-            <div class="mcp-tools-empty panel-loading">Loading tools...</div>
+            <div class="mcp-tools-empty panel-loading">${t('settings.system.loading_tools')}</div>
         `;
     }
 
@@ -282,7 +293,7 @@ function renderMcpServerTools(serverView, collapsed) {
 
     if (serverView.tools.length === 0) {
         return `
-            <div class="mcp-tools-empty">No tools exposed by this MCP server.</div>
+            <div class="mcp-tools-empty">${t('settings.system.no_tools_exposed')}</div>
         `;
     }
 
@@ -306,22 +317,84 @@ function renderMcpToolRow(tool) {
     return `
         <div class="mcp-tool-row">
             <div class="mcp-tool-name">${escapeHtml(tool?.name || 'Unnamed tool')}</div>
-            <div class="mcp-tool-description${description ? '' : ' mcp-tool-description-empty'}">${escapeHtml(description || 'No description provided.')}</div>
+            <div class="mcp-tool-description${description ? '' : ' mcp-tool-description-empty'}">${escapeHtml(description || t('settings.system.no_description'))}</div>
         </div>
     `;
 }
 
 function renderStatusList(items, stateLabel) {
+    const normalizedItems = Array.isArray(items)
+        ? items.map(normalizeStatusItem).filter(item => item !== null)
+        : [];
+    const nameCounts = buildStatusNameCounts(normalizedItems);
     return `
         <div class="status-list">
-            ${items.map(item => `
+            ${normalizedItems.map(item => `
                 <div class="status-list-row">
-                    <div class="status-list-name">${escapeHtml(item)}</div>
+                    <div class="status-list-copy">
+                        <div class="status-list-name">${escapeHtml(formatStatusItemLabel(item, nameCounts))}</div>
+                        <div class="status-list-description${item.description ? '' : ' status-list-description-empty'}">${escapeHtml(item.description || t('settings.system.no_description'))}</div>
+                    </div>
                     <div class="status-list-state">${escapeHtml(stateLabel)}</div>
                 </div>
             `).join('')}
         </div>
     `;
+}
+
+function normalizeStatusItem(item) {
+    if (typeof item === 'string') {
+        const name = item.trim();
+        if (!name) {
+            return null;
+        }
+        return {
+            name,
+            description: '',
+            scope: '',
+        };
+    }
+
+    const name = typeof item?.name === 'string' ? item.name.trim() : '';
+    if (!name) {
+        return null;
+    }
+
+    return {
+        name,
+        description: typeof item?.description === 'string' ? item.description.trim() : '',
+        scope: typeof item?.scope === 'string' ? item.scope.trim() : '',
+    };
+}
+
+function buildStatusNameCounts(items) {
+    const counts = new Map();
+    items.forEach(item => {
+        const name = String(item?.name || '').trim();
+        if (!name) {
+            return;
+        }
+        counts.set(name, (counts.get(name) || 0) + 1);
+    });
+    return counts;
+}
+
+function formatStatusItemLabel(item, nameCounts) {
+    const safeName = String(item?.name || '').trim();
+    const duplicateCount = nameCounts.get(safeName) || 0;
+    if (duplicateCount <= 1) {
+        return safeName;
+    }
+    return formatSkillStatusLabel(safeName, item?.scope);
+}
+
+function formatSkillStatusLabel(name, scope) {
+    const safeName = String(name || '').trim();
+    const safeScope = String(scope || '').trim().toUpperCase();
+    if (!safeScope) {
+        return safeName;
+    }
+    return `${safeName} · ${safeScope}`;
 }
 
 function renderEmptyState(title, description) {
@@ -349,12 +422,12 @@ function getCollapsibleServerNames(serverViews) {
 
 function getMcpServerStateLabel(serverView) {
     if (serverView.loading) {
-        return 'Loading..';
+        return t('settings.system.loading_state');
     }
     if (serverView.errorMessage) {
-        return 'Unavailable';
+        return t('settings.system.unavailable_state');
     }
-    return 'Loaded';
+    return t('settings.system.loaded_state');
 }
 
 function pruneCollapsedServers(validServerNames) {

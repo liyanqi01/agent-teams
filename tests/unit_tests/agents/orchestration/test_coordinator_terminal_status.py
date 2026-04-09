@@ -1,38 +1,44 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
 
-from agent_teams.agents.instances.enums import InstanceStatus
-from agent_teams.agents.instances.models import create_subagent_instance
-from agent_teams.agents.orchestration.coordinator import CoordinatorGraph
-from agent_teams.agents.execution.system_prompts import RuntimePromptBuilder
-from agent_teams.mcp.mcp_registry import McpRegistry
-from agent_teams.roles.role_models import RoleDefinition
-from agent_teams.roles.role_registry import RoleRegistry
-from agent_teams.sessions.runs.run_control_manager import RunControlManager
-from agent_teams.sessions.runs.event_stream import RunEventHub
-from agent_teams.sessions.runs.injection_queue import RunInjectionManager
-from agent_teams.sessions.runs.run_models import IntentInput
-from agent_teams.agents.instances.instance_repository import AgentInstanceRepository
-from agent_teams.sessions.runs.event_log import EventLog
-from agent_teams.agents.execution.message_repository import MessageRepository
-from agent_teams.sessions.runs.run_runtime_repo import (
+from relay_teams.media import content_parts_from_text
+from relay_teams.agents.instances.enums import InstanceStatus
+from relay_teams.agents.instances.models import create_subagent_instance
+from relay_teams.agents.orchestration.coordinator import CoordinatorGraph
+from relay_teams.agents.orchestration.task_execution_service import TaskExecutionResult
+from relay_teams.agents.execution.system_prompts import RuntimePromptBuilder
+from relay_teams.mcp.mcp_registry import McpRegistry
+from relay_teams.roles.role_models import RoleDefinition
+from relay_teams.roles.role_registry import RoleRegistry
+from relay_teams.sessions.runs.run_control_manager import RunControlManager
+from relay_teams.sessions.runs.assistant_errors import RunCompletionReason
+from relay_teams.sessions.runs.event_stream import RunEventHub
+from relay_teams.sessions.runs.injection_queue import RunInjectionManager
+from relay_teams.sessions.runs.run_models import IntentInput
+from relay_teams.agents.instances.instance_repository import AgentInstanceRepository
+from relay_teams.sessions.runs.event_log import EventLog
+from relay_teams.agents.execution.message_repository import MessageRepository
+from relay_teams.sessions.runs.run_runtime_repo import (
     RunRuntimePhase,
     RunRuntimeRecord,
     RunRuntimeRepository,
     RunRuntimeStatus,
 )
-from agent_teams.persistence.shared_state_repo import SharedStateRepository
-from agent_teams.sessions.session_repository import SessionRepository
-from agent_teams.agents.tasks.task_repository import TaskRepository
-from agent_teams.agents.tasks.enums import TaskStatus
-from agent_teams.agents.tasks.models import (
+from relay_teams.persistence.shared_state_repo import SharedStateRepository
+from relay_teams.sessions.session_repository import SessionRepository
+from relay_teams.agents.tasks.task_repository import TaskRepository
+from relay_teams.agents.tasks.enums import TaskStatus
+from relay_teams.agents.tasks.models import (
     TaskEnvelope,
     VerificationPlan,
     VerificationResult,
+)
+from relay_teams.workspace import (
+    build_conversation_id,
+    build_instance_conversation_id,
 )
 
 
@@ -43,7 +49,7 @@ class _RecordingTaskExecutionService:
 
     async def execute(
         self, *, instance_id: str, role_id: str, task: TaskEnvelope
-    ) -> str:
+    ) -> TaskExecutionResult:
         _ = role_id
         self.calls.append(task.task_id)
         result = f"{task.task_id} done"
@@ -53,13 +59,13 @@ class _RecordingTaskExecutionService:
             assigned_instance_id=instance_id,
             result=result,
         )
-        return result
+        return TaskExecutionResult(output=result)
 
 
 def _build_coordinator(
     tmp_path: Path,
     *,
-    coordinator_role_id: str = "coordinator_agent",
+    coordinator_role_id: str = "Coordinator",
 ) -> tuple[
     CoordinatorGraph,
     TaskRepository,
@@ -135,7 +141,7 @@ def _build_coordinator(
     )
 
 
-def test_terminal_status_from_verification_marks_root_task_failed(
+def test_terminal_status_from_verification_completes_with_assistant_error(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "coordinator_terminal_status.db"
@@ -160,7 +166,7 @@ def test_terminal_status_from_verification_marks_root_task_failed(
         event_bus=event_log,
     )
 
-    status = coordinator._terminal_status_from_verification(
+    result = coordinator._terminal_status_from_verification(
         trace_id="run-1",
         root_task=root_task,
         verification=VerificationResult(
@@ -169,19 +175,21 @@ def test_terminal_status_from_verification_marks_root_task_failed(
             details=("Task not completed yet",),
         ),
         output="",
+        root_instance_id=None,
+        root_role_id="Coordinator",
     )
 
-    assert status == "failed"
+    assert result.completion_reason == RunCompletionReason.ASSISTANT_ERROR
+    assert result.error_code == "verification_failed"
+    assert result.error_message == "Task not completed yet"
     record = task_repo.get(root_task.task_id)
-    assert record.status == TaskStatus.FAILED
+    assert record.status == TaskStatus.COMPLETED
     assert record.assigned_instance_id == "inst-1"
     assert record.error_message == "Task not completed yet"
+    assert "Task not completed yet" in (record.result or "")
 
     events = event_log.list_by_session("session-1")
-    assert events[-1]["event_type"] == "task_failed"
-    payload = json.loads(str(events[-1]["payload_json"]))
-    assert payload["reason"] == "verification_failed"
-    assert payload["details"] == ["Task not completed yet"]
+    assert events == ()
 
 
 @pytest.mark.asyncio
@@ -215,7 +223,7 @@ async def test_resume_reactivates_stopped_delegated_task_before_verification(
     _ = task_repo.create(child_task)
 
     coordinator_instance = create_subagent_instance(
-        "coordinator_agent",
+        "Coordinator",
         workspace_id="workspace-1",
         conversation_id="conversation-coordinator",
     )
@@ -230,7 +238,7 @@ async def test_resume_reactivates_stopped_delegated_task_before_verification(
         trace_id="run-1",
         session_id="session-1",
         instance_id=coordinator_instance.instance_id,
-        role_id="coordinator_agent",
+        role_id="Coordinator",
         workspace_id=coordinator_instance.workspace_id,
         conversation_id=coordinator_instance.conversation_id,
         status=InstanceStatus.IDLE,
@@ -266,14 +274,12 @@ async def test_resume_reactivates_stopped_delegated_task_before_verification(
         )
     )
 
-    trace_id, root_task_id, status, result = await coordinator.resume(trace_id="run-1")
+    result = await coordinator.resume(trace_id="run-1")
 
-    assert (trace_id, root_task_id, status, result) == (
-        "run-1",
-        root_task.task_id,
-        "completed",
-        "task-root-1 done",
-    )
+    assert result.trace_id == "run-1"
+    assert result.root_task_id == root_task.task_id
+    assert result.completion_reason == RunCompletionReason.ASSISTANT_RESPONSE
+    assert result.output == "task-root-1 done"
     assert task_execution_service.calls == [child_task.task_id, root_task.task_id]
     assert task_repo.get(child_task.task_id).status == TaskStatus.COMPLETED
     assert task_repo.get(root_task.task_id).status == TaskStatus.COMPLETED
@@ -309,7 +315,7 @@ def test_prepare_recovery_preserves_paused_subagent_followup_state(
     _ = task_repo.create(child_task)
 
     coordinator_instance = create_subagent_instance(
-        "coordinator_agent",
+        "Coordinator",
         workspace_id="workspace-1",
         conversation_id="conversation-coordinator",
     )
@@ -324,7 +330,7 @@ def test_prepare_recovery_preserves_paused_subagent_followup_state(
         trace_id="run-1",
         session_id="session-1",
         instance_id=coordinator_instance.instance_id,
-        role_id="coordinator_agent",
+        role_id="Coordinator",
         workspace_id=coordinator_instance.workspace_id,
         conversation_id=coordinator_instance.conversation_id,
         status=InstanceStatus.IDLE,
@@ -392,19 +398,70 @@ async def test_run_resolves_dynamic_coordinator_role_id(tmp_path: Path) -> None:
         coordinator_role_id="Coordinator",
     )
 
-    trace_id, root_task_id, status, result = await coordinator.run(
-        IntentInput(session_id="session-1", intent="hello"),
+    result = await coordinator.run(
+        IntentInput(
+            session_id="session-1",
+            input=content_parts_from_text("hello"),
+        ),
         trace_id="run-dynamic",
     )
 
-    root_task = task_repo.get(root_task_id)
+    root_task = task_repo.get(result.root_task_id)
     coordinator_instance = agent_repo.get_session_role_instance(
         "session-1", "Coordinator"
     )
 
-    assert trace_id == "run-dynamic"
-    assert status == "completed"
-    assert result == f"{root_task_id} done"
+    assert result.trace_id == "run-dynamic"
+    assert result.completion_reason == RunCompletionReason.ASSISTANT_RESPONSE
+    assert result.output == f"{result.root_task_id} done"
     assert root_task.envelope.role_id == "Coordinator"
     assert coordinator_instance is not None
     assert coordinator_instance.role_id == "Coordinator"
+
+
+@pytest.mark.asyncio
+async def test_run_with_fresh_root_instance_skips_stale_session_role_instance(
+    tmp_path: Path,
+) -> None:
+    coordinator, task_repo, agent_repo, _run_runtime_repo, _ = _build_coordinator(
+        tmp_path,
+        coordinator_role_id="Coordinator",
+    )
+    stale_instance = create_subagent_instance(
+        "Coordinator",
+        workspace_id="default",
+        conversation_id=build_conversation_id("session-1", "Coordinator"),
+    )
+    agent_repo.upsert_instance(
+        run_id="run-stale",
+        trace_id="run-stale",
+        session_id="session-1",
+        instance_id=stale_instance.instance_id,
+        role_id="Coordinator",
+        workspace_id=stale_instance.workspace_id,
+        conversation_id=stale_instance.conversation_id,
+        status=InstanceStatus.IDLE,
+    )
+
+    result = await coordinator.run(
+        IntentInput(
+            session_id="session-1",
+            input=content_parts_from_text("hello"),
+            reuse_root_instance=False,
+        ),
+        trace_id="run-fresh",
+    )
+
+    root_task = task_repo.get(result.root_task_id)
+    assigned_instance_id = root_task.assigned_instance_id
+    assert result.trace_id == "run-fresh"
+    assert result.completion_reason == RunCompletionReason.ASSISTANT_RESPONSE
+    assert assigned_instance_id is not None
+    assert assigned_instance_id != stale_instance.instance_id
+    runtime_record = agent_repo.get_instance(assigned_instance_id)
+    assert runtime_record.conversation_id != stale_instance.conversation_id
+    assert runtime_record.conversation_id == build_instance_conversation_id(
+        "session-1",
+        "Coordinator",
+        assigned_instance_id,
+    )

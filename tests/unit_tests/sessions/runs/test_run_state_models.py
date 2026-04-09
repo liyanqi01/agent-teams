@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from agent_teams.sessions.runs.enums import RunEventType
-from agent_teams.sessions.runs.run_models import RunEvent
-from agent_teams.sessions.runs.run_state_models import (
+from relay_teams.sessions.runs.enums import RunEventType
+from relay_teams.sessions.runs.run_models import RunEvent
+from relay_teams.sessions.runs.run_state_models import (
     RunStatePhase,
     RunStateRecord,
     RunStateStatus,
@@ -57,6 +57,36 @@ def test_run_resumed_transitions_stopped_run_back_to_running() -> None:
     assert resumed.recoverable is True
     assert resumed.last_event_id == 4
     assert resumed.checkpoint_event_id == 4
+
+
+def test_run_paused_transitions_run_to_awaiting_recovery() -> None:
+    previous = RunStateRecord(
+        run_id="run-1",
+        session_id="session-1",
+        status=RunStateStatus.RUNNING,
+        phase=RunStatePhase.STREAMING,
+        recoverable=True,
+        last_event_id=4,
+        checkpoint_event_id=4,
+        pending_tool_approvals=(),
+        paused_subagent=None,
+        updated_at=datetime(2026, 3, 6, 0, 0, tzinfo=UTC),
+    )
+
+    paused = apply_run_event_to_state(
+        previous,
+        event=_build_event(
+            RunEventType.RUN_PAUSED,
+            occurred_at=datetime(2026, 3, 6, 0, 1, tzinfo=UTC),
+        ),
+        event_id=5,
+    )
+
+    assert paused.status == RunStateStatus.PAUSED
+    assert paused.phase == RunStatePhase.AWAITING_RECOVERY
+    assert paused.recoverable is True
+    assert paused.last_event_id == 5
+    assert paused.checkpoint_event_id == 5
 
 
 def test_text_delta_does_not_advance_checkpoint_event_id() -> None:

@@ -6,8 +6,13 @@ import subprocess
 
 from typer.testing import CliRunner
 
-from agent_teams.interfaces.cli import app as cli_app
-from agent_teams.interfaces.server import cli as server_cli
+from relay_teams.interfaces.cli import app as cli_app
+from relay_teams.interfaces.server import cli as server_cli
+from relay_teams.interfaces.server.runtime_identity import (
+    ServerHealthPayload,
+    ServerRuntimeIdentity,
+    SkillRegistrySanity,
+)
 
 runner = CliRunner()
 
@@ -16,6 +21,52 @@ class _FakeStartupInfo:
     def __init__(self) -> None:
         self.dwFlags = 0
         self.wShowWindow = 0
+
+
+def _runtime_identity(
+    *,
+    python_executable: str = "D:/workspace/agent_teams/.venv/Scripts/python.exe",
+    package_root: str = "D:/workspace/agent_teams/src/relay_teams",
+    config_dir: str = "C:/Users/test/.relay-teams",
+    builtin_roles_dir: str = "D:/workspace/agent_teams/src/relay_teams/builtin/roles",
+    builtin_skills_dir: str = "D:/workspace/agent_teams/src/relay_teams/builtin/skills",
+) -> ServerRuntimeIdentity:
+    return ServerRuntimeIdentity(
+        python_executable=python_executable,
+        package_root=package_root,
+        config_dir=config_dir,
+        builtin_roles_dir=builtin_roles_dir,
+        builtin_skills_dir=builtin_skills_dir,
+    )
+
+
+def _health_payload(
+    *,
+    python_executable: str = "D:/workspace/agent_teams/.venv/Scripts/python.exe",
+    package_root: str = "D:/workspace/agent_teams/src/relay_teams",
+    config_dir: str = "C:/Users/test/.relay-teams",
+    builtin_roles_dir: str = "D:/workspace/agent_teams/src/relay_teams/builtin/roles",
+    builtin_skills_dir: str = "D:/workspace/agent_teams/src/relay_teams/builtin/skills",
+) -> ServerHealthPayload:
+    return ServerHealthPayload(
+        status="ok",
+        version="0.1.0",
+        python_executable=python_executable,
+        package_root=package_root,
+        config_dir=config_dir,
+        builtin_roles_dir=builtin_roles_dir,
+        builtin_skills_dir=builtin_skills_dir,
+        skill_registry_sanity=SkillRegistrySanity(
+            builtin_skill_count=4,
+            builtin_skill_refs=(
+                "builtin:deepresearch",
+                "builtin:pptx-craft",
+                "builtin:skill-installer",
+                "builtin:time",
+            ),
+            has_builtin_deepresearch=True,
+        ),
+    )
 
 
 def test_server_help_lists_stop_and_restart_commands() -> None:
@@ -200,6 +251,7 @@ def test_restart_reuses_existing_server_binding(monkeypatch, tmp_path: Path) -> 
         "_wait_for_managed_server",
         fake_wait_for_managed_server,
     )
+    monkeypatch.setattr(server_cli, "get_server_health", lambda base_url: None)
 
     server_cli.restart(host=None, port=None, force=True)
 
@@ -248,6 +300,7 @@ def test_start_spawns_daemon_and_waits_for_health(monkeypatch) -> None:
     monkeypatch.setattr(
         server_cli, "_wait_for_managed_server", fake_wait_for_managed_server
     )
+    monkeypatch.setattr(server_cli, "get_server_health", lambda base_url: None)
 
     server_cli.start(host="127.0.0.1", port=8000, daemon=True)
 
@@ -268,10 +321,38 @@ def test_start_skips_if_already_running(monkeypatch) -> None:
         lambda *, raise_on_invalid=False: process,
     )
     monkeypatch.setattr(server_cli, "_is_process_running", lambda pid: True)
-    monkeypatch.setattr(server_cli, "is_server_healthy", lambda url: True)
+    monkeypatch.setattr(
+        server_cli, "_get_current_runtime_identity", lambda: _runtime_identity()
+    )
+    monkeypatch.setattr(
+        server_cli, "get_server_health", lambda base_url: _health_payload()
+    )
 
     # Should return without error (server already running)
     server_cli.start(host="127.0.0.1", port=8000, daemon=True)
+
+
+def test_start_skips_if_matching_unmanaged_server_is_already_running(
+    monkeypatch,
+) -> None:
+    started: list[tuple[str, int]] = []
+
+    monkeypatch.setattr(server_cli, "_load_managed_server", lambda **kwargs: None)
+    monkeypatch.setattr(
+        server_cli, "_get_current_runtime_identity", lambda: _runtime_identity()
+    )
+    monkeypatch.setattr(
+        server_cli, "get_server_health", lambda base_url: _health_payload()
+    )
+    monkeypatch.setattr(
+        server_cli,
+        "start_server_daemon",
+        lambda host, port: started.append((host, port)),
+    )
+
+    server_cli.start(host="127.0.0.1", port=8000, daemon=True)
+
+    assert started == []
 
 
 def test_health_check_host_resolves_wildcard_addresses() -> None:
@@ -289,12 +370,15 @@ def test_restart_fails_for_unmanaged_healthy_server(monkeypatch) -> None:
         _ = (force, timeout_seconds)
         return None
 
-    def fake_is_server_healthy(base_url: str) -> bool:
-        assert base_url == "http://127.0.0.1:8000"
-        return True
-
     monkeypatch.setattr(server_cli, "_stop_managed_server", fake_stop)
-    monkeypatch.setattr(server_cli, "is_server_healthy", fake_is_server_healthy)
+    monkeypatch.setattr(
+        server_cli, "_get_current_runtime_identity", lambda: _runtime_identity()
+    )
+    monkeypatch.setattr(
+        server_cli,
+        "get_server_health",
+        lambda base_url: _health_payload(),
+    )
 
     try:
         server_cli.restart(host=None, port=None, force=False)
@@ -302,3 +386,115 @@ def test_restart_fails_for_unmanaged_healthy_server(monkeypatch) -> None:
         assert "not managed by this CLI" in str(exc)
     else:
         raise AssertionError("restart should reject unmanaged healthy servers")
+
+
+def test_start_fails_for_mismatched_live_server_runtime(monkeypatch) -> None:
+    monkeypatch.setattr(server_cli, "_load_managed_server", lambda **kwargs: None)
+    monkeypatch.setattr(
+        server_cli, "_get_current_runtime_identity", lambda: _runtime_identity()
+    )
+    monkeypatch.setattr(
+        server_cli,
+        "get_server_health",
+        lambda base_url: _health_payload(
+            python_executable="C:/Python312/python.exe",
+            package_root="C:/Users/test/AppData/Local/Programs/Python/Python312/Lib/site-packages/relay_teams",
+        ),
+    )
+
+    try:
+        server_cli.start(host="127.0.0.1", port=8000, daemon=True)
+    except RuntimeError as exc:
+        assert "runtime mismatch" in str(exc)
+        assert "Stop the conflicting server first" in str(exc)
+    else:
+        raise AssertionError("start should reject mismatched live runtimes")
+
+
+def test_start_fails_for_mismatched_live_builtin_roles_dir(monkeypatch) -> None:
+    monkeypatch.setattr(server_cli, "_load_managed_server", lambda **kwargs: None)
+    monkeypatch.setattr(
+        server_cli, "_get_current_runtime_identity", lambda: _runtime_identity()
+    )
+    monkeypatch.setattr(
+        server_cli,
+        "get_server_health",
+        lambda base_url: _health_payload(
+            builtin_roles_dir="D:/workspace/other/src/relay_teams/builtin/roles"
+        ),
+    )
+
+    try:
+        server_cli.start(host="127.0.0.1", port=8000, daemon=True)
+    except RuntimeError as exc:
+        assert "runtime mismatch" in str(exc)
+        assert "builtin roles" in str(exc)
+        assert "Stop the conflicting server first" in str(exc)
+    else:
+        raise AssertionError("start should reject builtin role path mismatches")
+
+
+def test_root_cli_autostart_rejects_mismatched_local_runtime(monkeypatch) -> None:
+    started: list[tuple[str, int]] = []
+
+    monkeypatch.setattr(
+        cli_app,
+        "_get_server_health",
+        lambda base_url: _health_payload(
+            python_executable="C:/Python312/python.exe",
+            package_root="C:/Users/test/AppData/Local/Programs/Python/Python312/Lib/site-packages/relay_teams",
+        ),
+    )
+    monkeypatch.setattr(
+        cli_app,
+        "build_server_runtime_identity",
+        lambda *, config_dir=None: _runtime_identity(),
+    )
+    monkeypatch.setattr(
+        cli_app,
+        "_start_server_daemon",
+        lambda host, port: started.append((host, port)),
+    )
+
+    try:
+        cli_app._auto_start_if_needed("http://127.0.0.1:8000", autostart=True)
+    except RuntimeError as exc:
+        assert "runtime mismatch" in str(exc)
+        assert "Stop the conflicting server first" in str(exc)
+    else:
+        raise AssertionError("root CLI should reject mismatched local runtimes")
+
+    assert started == []
+
+
+def test_root_cli_autostart_rejects_mismatched_builtin_roles_dir(monkeypatch) -> None:
+    started: list[tuple[str, int]] = []
+
+    monkeypatch.setattr(
+        cli_app,
+        "_get_server_health",
+        lambda base_url: _health_payload(
+            builtin_roles_dir="D:/workspace/other/src/relay_teams/builtin/roles"
+        ),
+    )
+    monkeypatch.setattr(
+        cli_app,
+        "build_server_runtime_identity",
+        lambda *, config_dir=None: _runtime_identity(),
+    )
+    monkeypatch.setattr(
+        cli_app,
+        "_start_server_daemon",
+        lambda host, port: started.append((host, port)),
+    )
+
+    try:
+        cli_app._auto_start_if_needed("http://127.0.0.1:8000", autostart=True)
+    except RuntimeError as exc:
+        assert "runtime mismatch" in str(exc)
+        assert "builtin roles" in str(exc)
+        assert "Stop the conflicting server first" in str(exc)
+    else:
+        raise AssertionError("root CLI should reject builtin role path mismatches")
+
+    assert started == []

@@ -39,6 +39,13 @@ const loadingTreePaths = new Set();
 const treeLoadErrors = new Map();
 const workspaceViewCache = new Map();
 
+function formatMessage(key, values = {}) {
+    return Object.entries(values).reduce(
+        (result, [name, value]) => result.replaceAll(`{${name}}`, String(value)),
+        t(key),
+    );
+}
+
 
 function findWorkspaceById(workspaces, workspaceId) {
     const safeWorkspaceId = String(workspaceId || '').trim();
@@ -71,10 +78,11 @@ function buildFeishuBindingKey(binding) {
     const triggerId = String(binding?.trigger_id || '').trim();
     const tenantKey = String(binding?.tenant_key || '').trim();
     const chatId = String(binding?.chat_id || '').trim();
-    if (!triggerId || !tenantKey || !chatId) {
+    const sessionId = String(binding?.session_id || '').trim();
+    if (!triggerId || !tenantKey || !chatId || !sessionId) {
         return '';
     }
-    return `${triggerId}::${tenantKey}::${chatId}`;
+    return `${triggerId}::${tenantKey}::${chatId}::${sessionId}`;
 }
 
 function buildFeishuBindingOptions(bindings) {
@@ -82,8 +90,8 @@ function buildFeishuBindingOptions(bindings) {
     const options = [
         {
             value: '',
-            label: 'No Feishu delivery',
-            description: 'Do not send automation updates to Feishu.',
+            label: t('sidebar.feishu_delivery_none'),
+            description: t('sidebar.feishu_delivery_none_copy'),
         },
     ];
     safeBindings.forEach(binding => {
@@ -120,6 +128,15 @@ function resolveFeishuBindingDisplayName(binding, bindings) {
     return String(binding?.chat_id || '').trim();
 }
 
+function formatAutomationRunLogMessage(result) {
+    const sessionId = String(result?.session_id || '').trim();
+    const suffix = sessionId ? `: ${sessionId}` : '';
+    if (result?.queued === true) {
+        return formatMessage('sidebar.log.queued_bound_session', { session_id: sessionId });
+    }
+    return formatMessage('sidebar.log.started_bound_session', { session_id: sessionId });
+}
+
 async function requestAutomationProjectEditInput(project) {
     const [workspaces, feishuBindings] = await Promise.all([
         fetchWorkspaces(),
@@ -151,7 +168,7 @@ async function requestAutomationProjectEditInput(project) {
             },
             {
                 id: 'workspace_id',
-                label: 'Workspace Directory',
+                label: t('sidebar.workspace_directory'),
                 type: 'select',
                 value: String(project?.workspace_id || '').trim(),
                 options: workspaceOptions,
@@ -159,7 +176,7 @@ async function requestAutomationProjectEditInput(project) {
             {
                 id: 'prompt',
                 label: t('automation.detail.prompt'),
-                placeholder: 'Summarize the latest project changes.',
+                placeholder: t('sidebar.prompt_placeholder'),
                 value: String(project?.prompt || '').trim(),
                 multiline: true,
             },
@@ -185,31 +202,31 @@ async function requestAutomationProjectEditInput(project) {
             },
             {
                 id: 'delivery_binding_key',
-                label: 'Feishu Chat',
+                label: t('sidebar.feishu_chat'),
                 type: 'select',
                 value: currentBindingKey,
                 options: bindingOptions,
             },
             {
                 id: 'delivery_event_started',
-                label: 'Notify on start',
+                label: t('sidebar.notify_on_start'),
                 type: 'checkbox',
                 value: deliveryEvents.includes('started'),
-                description: 'Send a start message to the selected Feishu chat.',
+                description: t('sidebar.notify_on_start_copy'),
             },
             {
                 id: 'delivery_event_completed',
-                label: 'Notify on completion',
+                label: t('sidebar.notify_on_completion'),
                 type: 'checkbox',
                 value: deliveryEvents.includes('completed'),
-                description: 'Send the final success result to Feishu.',
+                description: t('sidebar.notify_on_completion_copy'),
             },
             {
                 id: 'delivery_event_failed',
-                label: 'Notify on failure',
+                label: t('sidebar.notify_on_failure'),
                 type: 'checkbox',
                 value: deliveryEvents.includes('failed'),
-                description: 'Send the failure reason to Feishu.',
+                description: t('sidebar.notify_on_failure_copy'),
             },
         ],
     });
@@ -247,6 +264,7 @@ async function requestAutomationProjectEditInput(project) {
             trigger_id: String(selectedBinding.trigger_id || '').trim(),
             tenant_key: String(selectedBinding.tenant_key || '').trim(),
             chat_id: String(selectedBinding.chat_id || '').trim(),
+            session_id: String(selectedBinding.session_id || '').trim(),
             chat_type: String(selectedBinding.chat_type || '').trim(),
             source_label: String(selectedBinding.source_label || '').trim(),
         } : null,
@@ -570,7 +588,7 @@ function setProjectViewVisible(visible) {
 
 function renderAutomationLoadingState(project) {
     renderToolbar(project, {
-        summary: 'Loading automation project...',
+        summary: t('workspace_view.loading_automation_project'),
         mode: 'automation',
         actions: '',
     });
@@ -582,14 +600,14 @@ function renderAutomationLoadingState(project) {
                         <h3>Schedule</h3>
                         <span class="workspace-view-panel-meta">Automation</span>
                     </div>
-                    ${renderInlineState('Loading automation details...')}
+                    ${renderInlineState(t('workspace_view.loading_automation_details'))}
                 </section>
                 <section class="workspace-view-panel workspace-diff-panel">
                     <div class="workspace-view-panel-header">
-                        <h3>Recent Runs</h3>
+                        <h3>${escapeHtml(t('workspace_view.recent_runs'))}</h3>
                         <span class="workspace-view-panel-meta"></span>
                     </div>
-                    ${renderInlineState('Loading automation sessions...')}
+                    ${renderInlineState(t('workspace_view.loading_automation_sessions'))}
                 </section>
             </div>
         `;
@@ -598,14 +616,14 @@ function renderAutomationLoadingState(project) {
 
 function renderAutomationErrorState(project, error) {
     renderToolbar(project, {
-        summary: 'Failed to load automation project',
+        summary: t('workspace_view.failed_automation_project'),
         mode: 'automation',
         actions: '',
     });
     if (els.projectViewContent) {
         els.projectViewContent.innerHTML = `
             <div class="workspace-view-empty-state is-error">
-                <p>Failed to load automation project.</p>
+                <p>${escapeHtml(t('workspace_view.failed_automation_project'))}</p>
                 <p>${escapeHtml(String(error?.message || error || ''))}</p>
             </div>
         `;
@@ -707,8 +725,8 @@ function renderAutomationProjectView(project, sessions, workspaceRecord = null, 
                 </section>
                 <section class="workspace-view-panel automation-binding-panel">
                     <div class="workspace-view-panel-header">
-                        <h3>Bindings</h3>
-                        <span class="workspace-view-panel-meta">${escapeHtml(deliveryBinding ? 'Feishu' : 'Disabled')}</span>
+                        <h3>${escapeHtml(t('workspace_view.bindings'))}</h3>
+                        <span class="workspace-view-panel-meta">${escapeHtml(deliveryBinding ? 'Feishu' : t('workspace_view.delivery_disabled'))}</span>
                     </div>
                     <div class="automation-binding-list">
                         <div class="automation-binding-item">
@@ -720,24 +738,24 @@ function renderAutomationProjectView(project, sessions, workspaceRecord = null, 
                             <code>${escapeHtml(workspaceRootPath)}</code>
                         </div>
                         <div class="automation-binding-item">
-                            <span>Delivery events</span>
+                            <span>${escapeHtml(t('workspace_view.delivery_events'))}</span>
                             <strong>${escapeHtml(deliveryEventsLabel)}</strong>
                         </div>
                         ${deliveryBinding ? `
                             <div class="automation-binding-item">
-                                <span>Feishu trigger</span>
+                                <span>${escapeHtml(t('workspace_view.feishu_trigger'))}</span>
                                 <strong>${escapeHtml(String(deliveryBinding.trigger_id || ''))}</strong>
                             </div>
                             <div class="automation-binding-item">
-                                <span>Feishu chat</span>
+                                <span>${escapeHtml(t('workspace_view.feishu_chat'))}</span>
                                 <strong>${escapeHtml(deliveryBindingName)}</strong>
                             </div>
                             <div class="automation-binding-item">
-                                <span>Chat type</span>
+                                <span>${escapeHtml(t('workspace_view.chat_type'))}</span>
                                 <strong>${escapeHtml(String(deliveryBinding.chat_type || ''))}</strong>
                             </div>
                         ` : ''}
-                        <p class="automation-binding-help">${escapeHtml(deliveryBinding ? 'Automation updates will be pushed to the selected Feishu chat.' : t('automation.workspace.help'))}</p>
+                        <p class="automation-binding-help">${escapeHtml(deliveryBinding ? t('workspace_view.delivery_help_feishu') : t('automation.workspace.help'))}</p>
                     </div>
                 </section>
             </div>
@@ -783,10 +801,14 @@ function renderAutomationProjectView(project, sessions, workspaceRecord = null, 
     document.querySelector('[data-automation-edit]')?.addEventListener('click', editAction);
     const runAction = async () => {
         const result = await runAutomationProject(String(project?.automation_project_id || ''));
+        if (result?.reused_bound_session === true) {
+            sysLog(formatAutomationRunLogMessage(result));
+            await openAutomationProjectView(project);
+            return;
+        }
         if (result?.session_id) {
             document.dispatchEvent(new CustomEvent('agent-teams-select-session', { detail: { sessionId: result.session_id } }));
         }
-        await openAutomationProjectView(project);
     };
     document.querySelector('[data-automation-run]')?.addEventListener('click', runAction);
     const toggleAction = async () => {
@@ -1686,7 +1708,9 @@ function renderFileIcon() {
 
 function formatAutomationTitle(project) {
     const label = String(project?.display_name || project?.name || project?.automation_project_id || '').trim();
-    return label ? `${label} Automation` : 'Automation Project';
+    return label
+        ? formatMessage('workspace_view.automation_suffix', { label })
+        : t('workspace_view.automation_project');
 }
 
 function formatWorkspaceTitle(workspace) {

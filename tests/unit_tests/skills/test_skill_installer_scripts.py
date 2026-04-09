@@ -15,8 +15,8 @@ import zipfile
 
 import pytest
 
-from agent_teams.builtin import get_builtin_skills_dir
-from agent_teams.skills import installer_support
+from relay_teams.builtin import get_builtin_skills_dir
+from relay_teams.skills import installer_support
 
 
 def test_resolve_source_from_marketplace_page(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -116,7 +116,7 @@ def test_install_from_repo_paths_reports_download_and_git_failures(
 
 
 def test_list_skills_script_reports_installed_annotations(tmp_path: Path) -> None:
-    skill_dir = tmp_path / ".agent-teams" / "skills" / "alpha"
+    skill_dir = tmp_path / ".relay-teams" / "skills" / "alpha"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text(
         "---\nname: alpha\ndescription: installed alpha\n---\nUse alpha.\n",
@@ -194,16 +194,16 @@ def test_install_skill_script_downloads_and_installs_skill(tmp_path: Path) -> No
         )
 
     assert result.returncode == 0, result.stderr
-    installed_skill_dir = tmp_path / ".agent-teams" / "skills" / "demo-skill"
+    installed_skill_dir = tmp_path / ".relay-teams" / "skills" / "demo-skill"
     assert (installed_skill_dir / "SKILL.md").exists()
     assert (installed_skill_dir / "scripts" / "demo.py").exists()
-    assert not (tmp_path / ".agent-teams" / "roles" / "MainAgent.md").exists()
+    assert not (tmp_path / ".relay-teams" / "roles" / "MainAgent.md").exists()
     assert "Restart Agent Teams to pick up new skills." in result.stdout
     assert result.stderr == ""
 
 
 def test_bind_skill_script_updates_main_agent_role(tmp_path: Path) -> None:
-    skill_dir = tmp_path / ".agent-teams" / "skills" / "demo-skill"
+    skill_dir = tmp_path / ".relay-teams" / "skills" / "demo-skill"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text(
         "---\nname: demo-skill\ndescription: demo installer\n---\nUse demo.\n",
@@ -224,16 +224,16 @@ def test_bind_skill_script_updates_main_agent_role(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    role_path = tmp_path / ".agent-teams" / "roles" / "MainAgent.md"
+    role_path = tmp_path / ".relay-teams" / "roles" / "MainAgent.md"
     assert role_path.exists()
     role_text = role_path.read_text(encoding="utf-8")
-    assert "- demo-skill" in role_text
+    assert "- app:demo-skill" in role_text
     assert "Updated roles: MainAgent" in result.stdout
     assert result.stderr == ""
 
 
 def test_bind_skill_script_defaults_to_current_role_env(tmp_path: Path) -> None:
-    skill_dir = tmp_path / ".agent-teams" / "skills" / "demo-skill"
+    skill_dir = tmp_path / ".relay-teams" / "skills" / "demo-skill"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text(
         "---\nname: demo-skill\ndescription: demo installer\n---\nUse demo.\n",
@@ -254,15 +254,15 @@ def test_bind_skill_script_defaults_to_current_role_env(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    role_path = tmp_path / ".agent-teams" / "roles" / "Crafter.md"
+    role_path = tmp_path / ".relay-teams" / "roles" / "Crafter.md"
     assert role_path.exists()
     role_text = role_path.read_text(encoding="utf-8")
-    assert "- demo-skill" in role_text
+    assert "- app:demo-skill" in role_text
     assert "Updated roles: Crafter" in result.stdout
 
 
 def test_mount_skills_to_roles_creates_main_agent_override(tmp_path: Path) -> None:
-    skill_dir = tmp_path / ".agent-teams" / "skills" / "demo-skill"
+    skill_dir = tmp_path / ".relay-teams" / "skills" / "demo-skill"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text(
         "---\nname: demo-skill\ndescription: demo installer\n---\nUse demo.\n",
@@ -289,12 +289,12 @@ def test_mount_skills_to_roles_creates_main_agent_override(tmp_path: Path) -> No
             os.environ["USERPROFILE"] = old_userprofile
 
     assert mounted_roles == ("MainAgent",)
-    role_path = tmp_path / ".agent-teams" / "roles" / "MainAgent.md"
+    role_path = tmp_path / ".relay-teams" / "roles" / "MainAgent.md"
     assert role_path.exists()
     role_text = role_path.read_text(encoding="utf-8")
     assert "role_id: MainAgent" in role_text
-    assert "- skill-installer" in role_text
-    assert "- demo-skill" in role_text
+    assert "- builtin:skill-installer" in role_text
+    assert "- app:demo-skill" in role_text
 
 
 def test_resolve_role_mount_targets_defaults_to_current_role_env(
@@ -374,7 +374,7 @@ def test_run_git_reports_timeout(
 
 
 def test_install_skill_script_reports_errors_on_stderr(tmp_path: Path) -> None:
-    existing_skill_dir = tmp_path / ".agent-teams" / "skills" / "demo-skill"
+    existing_skill_dir = tmp_path / ".relay-teams" / "skills" / "demo-skill"
     existing_skill_dir.mkdir(parents=True)
     (existing_skill_dir / "SKILL.md").write_text(
         "---\nname: demo-skill\ndescription: existing\n---\nUse demo.\n",

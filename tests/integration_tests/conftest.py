@@ -72,7 +72,7 @@ def integration_env(
 ) -> Iterator[IntegrationEnvironment]:
     repo_root = Path(__file__).resolve().parent.parent.parent
     runtime_root = tmp_path_factory.mktemp("agent-teams-integration")
-    config_dir = runtime_root / ".agent-teams"
+    config_dir = runtime_root / ".relay-teams"
 
     fake_llm_port = find_free_port()
     backend_port = find_free_port()
@@ -86,6 +86,13 @@ def integration_env(
         fake_llm_v1_base_url=fake_llm_v1_base_url,
     )
     assert_integration_model_config_uses_fake_llm(config_dir=config_dir)
+    demo_screenshot_source = repo_root / "docs" / "relay_teams.png"
+    if demo_screenshot_source.exists():
+        demo_docs_dir = runtime_root / "docs"
+        demo_docs_dir.mkdir(parents=True, exist_ok=True)
+        (demo_docs_dir / "relay_teams.png").write_bytes(
+            demo_screenshot_source.read_bytes()
+        )
 
     original_home_env = _capture_home_env()
     _apply_home_env(runtime_root)
@@ -97,6 +104,7 @@ def integration_env(
     if existing_pythonpath:
         python_paths.append(existing_pythonpath)
     shared_env["PYTHONPATH"] = os.pathsep.join(python_paths)
+    shared_env["AGENT_TEAMS_COMPUTER_RUNTIME"] = "fake"
 
     fake_llm_log_file = runtime_root / "fake-llm.log"
     backend_log_file = runtime_root / "backend.log"
@@ -133,7 +141,7 @@ def integration_env(
                 sys.executable,
                 "-m",
                 "uvicorn",
-                "agent_teams.interfaces.server.app:app",
+                "relay_teams.interfaces.server.app:app",
                 "--host",
                 "127.0.0.1",
                 "--port",
@@ -141,7 +149,7 @@ def integration_env(
                 "--log-level",
                 "warning",
             ),
-            cwd=runtime_root,
+            cwd=repo_root,
             env=shared_env,
             log_file=backend_log_file,
         )
@@ -174,3 +182,13 @@ def api_client(integration_env: IntegrationEnvironment) -> Iterator[httpx.Client
         trust_env=False,
     ) as client:
         yield client
+
+
+@pytest.fixture(autouse=True)
+def reset_fake_llm_state(integration_env: IntegrationEnvironment) -> None:
+    response = httpx.post(
+        f"{integration_env.fake_llm_admin_url}/admin/reset",
+        timeout=5.0,
+        trust_env=False,
+    )
+    response.raise_for_status()

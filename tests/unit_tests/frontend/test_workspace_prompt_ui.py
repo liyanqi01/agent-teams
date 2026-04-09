@@ -81,6 +81,9 @@ def test_workspace_shell_hides_execution_mode_selector() -> None:
     backend_status_script = (
         repo_root / "frontend" / "dist" / "js" / "utils" / "backendStatus.js"
     ).read_text(encoding="utf-8")
+    i18n_script = (
+        repo_root / "frontend" / "dist" / "js" / "utils" / "i18n.js"
+    ).read_text(encoding="utf-8")
     markdown_script = (
         repo_root / "frontend" / "dist" / "js" / "utils" / "markdown.js"
     ).read_text(encoding="utf-8")
@@ -112,7 +115,10 @@ def test_workspace_shell_hides_execution_mode_selector() -> None:
     assert 'id="orchestration-preset-select"' in index_html
     assert 'id="prompt-input-hint"' in index_html
     assert 'id="session-token-usage"' in index_html
-    assert "Latest provider context usage" in index_html
+    assert 'class="composer-usage-strip"' in index_html
+    assert "Prompt / context window" in index_html
+    assert "Tokens --" not in index_html
+    assert "↑ -- ↓ --" in index_html
     assert "-- / --" in index_html
     assert "Checking backend..." in index_html
     assert "Enter to send · Shift+Enter for new line" in index_html
@@ -131,7 +137,9 @@ def test_workspace_shell_hides_execution_mode_selector() -> None:
     assert "emphasizeRoundSection" in timeline_script
     assert "round-nav-toggle" in navigator_script
     assert "ROUND_NAV_COLLAPSED_KEY" in navigator_script
-    assert "item.title = String(round.intent || 'No intent');" in navigator_script
+    assert "let scheduledOffsetFrame = 0;" in navigator_script
+    assert "function scheduleOffsetApply(nav) {" in navigator_script
+    assert "round.intent || t('rounds.no_intent')" in navigator_script
     assert "alert(" not in model_profiles_script
     assert "confirm(" not in model_profiles_script
     assert "alert(" not in system_status_script
@@ -139,6 +147,11 @@ def test_workspace_shell_hides_execution_mode_selector() -> None:
     assert "showToast" in feedback_script
     assert "showConfirmDialog" in feedback_script
     assert "requestAnimationFrame" in navbar_script
+    assert "persistSidebarWidth(currentWidth);" in navbar_script
+    assert "persistRightRailWidth(currentWidth);" in navbar_script
+    assert "function persistSidebarWidth(width) {" in navbar_script
+    assert "function persistRightRailWidth(width) {" in navbar_script
+    assert navbar_script.count("flushWidth();") >= 2
     assert "initBackendStatusMonitor" in bootstrap_script
     assert "initializeSessionTokenUsage" in bootstrap_script
     assert "initializeSessionTopologyControls" in bootstrap_script
@@ -149,6 +162,11 @@ def test_workspace_shell_hides_execution_mode_selector() -> None:
     assert "fetchSessionContextPreview" not in context_indicator_script
     assert "main-context-indicator" in context_indicator_script
     assert "panel-context-indicator" in context_indicator_script
+    assert "isMainComposerRecoveryActionVisible" not in context_indicator_script
+    assert "Prompt / context window" in i18n_script
+    assert "Prompt tokens: {input_tokens}" in i18n_script
+    assert "本轮输入 / 上下文窗口" in i18n_script
+    assert "本轮输入：{input_tokens}" in i18n_script
     assert 'data-tab="orchestration"' in settings_index_script
     assert 'id="orchestration-panel"' in settings_index_script
     assert "loadOrchestrationSettingsPanel" in settings_index_script
@@ -158,20 +176,28 @@ def test_workspace_shell_hides_execution_mode_selector() -> None:
     assert 'id="cancel-orchestration-btn"' in settings_index_script
     assert "main_agent_prompt" not in orchestration_settings_script
     assert "default_orchestration_preset_id" in orchestration_settings_script
-    assert "Set as default orchestration" in orchestration_settings_script
+    assert "t('settings.orchestration.field.default')" in orchestration_settings_script
     assert "showOrchestrationList" in orchestration_settings_script
     assert "showOrchestrationEditor" in orchestration_settings_script
     assert "showConfirmDialog" in orchestration_settings_script
     assert "fetchSessionTokenUsage" in session_token_usage_script
-    assert "Token usage: total=" in session_token_usage_script
+    assert "token_usage.detail" in session_token_usage_script
     assert "session-token-usage" in session_token_usage_script
+    assert "session-token-usage-pair" in session_token_usage_script
+    assert "session-token-usage-arrow-up" in session_token_usage_script
+    assert "session-token-usage-arrow-down" in session_token_usage_script
     assert "markBackendOnline" in request_script
     assert "markBackendOffline" in request_script
     assert ".status-indicator > span:last-child" in components_css
     assert "flex: 1 1 auto;" in components_css
     assert "white-space: nowrap;" in components_css
     assert ".input-footer-hint {" in components_css
+    assert ".composer-usage-strip {" in components_css
+    assert ".composer-usage-pill {" in components_css
     assert ".session-token-usage {" in components_css
+    assert ".session-token-usage-pair {" in components_css
+    assert ".composer-context-indicator {" in components_css
+    assert "position: static;" in components_css
     assert ".status-indicator.online span {" not in components_css
     assert ".status-indicator.offline > span:first-child" in components_css
     assert ".status-indicator.checking > span:first-child" in components_css
@@ -188,7 +214,7 @@ def test_workspace_shell_hides_execution_mode_selector() -> None:
     assert "formatCodeLanguage" in markdown_script
     assert "markdown-code-copy" in markdown_script
     assert "navigator.clipboard.writeText" in markdown_script
-    assert "Code Copied" in markdown_script
+    assert "markdown.copy_success_title" in markdown_script
     assert ".msg-content blockquote," in components_css
     assert ".markdown-table-wrap {" in components_css
     assert ".markdown-code-block {" in components_css
@@ -259,8 +285,8 @@ def test_light_theme_workspace_uses_shared_surface_hierarchy() -> None:
     )
     assert "body.light-theme .round-state-pill," in components_css
     assert "background: transparent;" in components_css
-    assert "body.light-theme .tool-block," in components_css
-    assert "background: var(--bg-tool-block);" in components_css
+    assert "body.light-theme .tool-detail-card" in components_css
+    assert "background: var(--bg-surface-muted);" in components_css
     assert "background: var(--bg-surface-glass);" in layout_css
     assert "--bg-surface-glass: #f3f4f4;" in (
         repo_root / "frontend" / "dist" / "css" / "base.css"

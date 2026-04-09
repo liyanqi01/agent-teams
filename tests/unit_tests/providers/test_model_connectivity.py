@@ -7,18 +7,19 @@ from typing import cast
 import httpx
 import pytest
 
-from agent_teams.providers.model_config import (
+from relay_teams.providers.model_config import (
     ModelEndpointConfig,
+    ModelRequestHeader,
     ProviderType,
     SamplingConfig,
 )
-from agent_teams.providers.model_connectivity import (
+from relay_teams.providers.model_connectivity import (
     ModelDiscoveryRequest,
     ModelConnectivityProbeOverride,
     ModelConnectivityProbeRequest,
     ModelConnectivityProbeService,
 )
-from agent_teams.sessions.runs.runtime_config import RuntimeConfig, RuntimePaths
+from relay_teams.sessions.runs.runtime_config import RuntimeConfig, RuntimePaths
 
 
 class _FakeHttpClient:
@@ -73,7 +74,7 @@ def test_probe_uses_saved_profile_and_returns_usage(monkeypatch) -> None:
     service = ModelConnectivityProbeService(get_runtime=lambda: _runtime_config())
 
     monkeypatch.setattr(
-        "agent_teams.providers.model_connectivity.create_sync_http_client",
+        "relay_teams.providers.model_connectivity.create_sync_http_client",
         lambda **kwargs: (
             captured.update(kwargs)
             or _FakeHttpClient(
@@ -118,7 +119,7 @@ def test_probe_uses_profile_connect_timeout_when_request_timeout_omitted(
     service = ModelConnectivityProbeService(get_runtime=lambda: _runtime_config())
 
     monkeypatch.setattr(
-        "agent_teams.providers.model_connectivity.create_sync_http_client",
+        "relay_teams.providers.model_connectivity.create_sync_http_client",
         lambda **kwargs: (
             captured.update(kwargs)
             or _FakeHttpClient(
@@ -138,7 +139,7 @@ def test_probe_merges_override_with_saved_profile(monkeypatch) -> None:
     service = ModelConnectivityProbeService(get_runtime=lambda: _runtime_config())
 
     monkeypatch.setattr(
-        "agent_teams.providers.model_connectivity.create_sync_http_client",
+        "relay_teams.providers.model_connectivity.create_sync_http_client",
         lambda **kwargs: (
             captured.update(kwargs)
             or _FakeHttpClient(
@@ -171,7 +172,7 @@ def test_probe_uses_model_ssl_override_before_global_default(monkeypatch) -> Non
     service = ModelConnectivityProbeService(get_runtime=lambda: _runtime_config())
 
     monkeypatch.setattr(
-        "agent_teams.providers.model_connectivity.create_sync_http_client",
+        "relay_teams.providers.model_connectivity.create_sync_http_client",
         lambda **kwargs: (
             captured.update(kwargs)
             or _FakeHttpClient(
@@ -195,7 +196,7 @@ def test_probe_returns_timeout_error(monkeypatch) -> None:
     service = ModelConnectivityProbeService(get_runtime=lambda: _runtime_config())
 
     monkeypatch.setattr(
-        "agent_teams.providers.model_connectivity.create_sync_http_client",
+        "relay_teams.providers.model_connectivity.create_sync_http_client",
         lambda **_kwargs: _FakeHttpClient(error=httpx.ReadTimeout("timed out")),
     )
 
@@ -213,7 +214,7 @@ def test_probe_returns_auth_error_for_unauthorized_response(monkeypatch) -> None
     service = ModelConnectivityProbeService(get_runtime=lambda: _runtime_config())
 
     monkeypatch.setattr(
-        "agent_teams.providers.model_connectivity.create_sync_http_client",
+        "relay_teams.providers.model_connectivity.create_sync_http_client",
         lambda **_kwargs: _FakeHttpClient(
             response=httpx.Response(
                 401,
@@ -236,7 +237,7 @@ def test_probe_accepts_editor_default_timeout(monkeypatch) -> None:
     service = ModelConnectivityProbeService(get_runtime=lambda: _runtime_config())
 
     monkeypatch.setattr(
-        "agent_teams.providers.model_connectivity.create_sync_http_client",
+        "relay_teams.providers.model_connectivity.create_sync_http_client",
         lambda **kwargs: (
             captured.update(kwargs)
             or _FakeHttpClient(
@@ -266,7 +267,7 @@ def test_probe_supports_bigmodel_provider(monkeypatch) -> None:
     service = ModelConnectivityProbeService(get_runtime=lambda: _runtime_config())
 
     monkeypatch.setattr(
-        "agent_teams.providers.model_connectivity.create_sync_http_client",
+        "relay_teams.providers.model_connectivity.create_sync_http_client",
         lambda **kwargs: (
             captured.update(kwargs)
             or _FakeHttpClient(
@@ -280,7 +281,7 @@ def test_probe_supports_bigmodel_provider(monkeypatch) -> None:
             override=ModelConnectivityProbeOverride(
                 provider=ProviderType.BIGMODEL,
                 model="glm-4.5",
-                base_url="https://open.bigmodel.cn/api/paas/v4",
+                base_url="https://open.bigmodel.cn/api/coding/paas/v4",
                 api_key="draft-api-key",
             )
         )
@@ -288,7 +289,44 @@ def test_probe_supports_bigmodel_provider(monkeypatch) -> None:
 
     assert result.ok is True
     assert result.provider == ProviderType.BIGMODEL
-    assert captured["url"] == "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+    assert (
+        captured["url"]
+        == "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions"
+    )
+
+
+def test_probe_allows_header_only_override(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    service = ModelConnectivityProbeService(get_runtime=lambda: _runtime_config())
+
+    monkeypatch.setattr(
+        "relay_teams.providers.model_connectivity.create_sync_http_client",
+        lambda **kwargs: (
+            captured.update(kwargs)
+            or _FakeHttpClient(
+                captured=captured, response=httpx.Response(200, json={"usage": {}})
+            )
+        ),
+    )
+
+    result = service.probe(
+        ModelConnectivityProbeRequest(
+            override=ModelConnectivityProbeOverride(
+                model="draft-model",
+                base_url="https://draft.test/v1",
+                headers=(
+                    ModelRequestHeader(
+                        name="Authorization",
+                        value="Bearer header-only",
+                    ),
+                ),
+            )
+        )
+    )
+
+    assert result.ok is True
+    headers = cast(dict[str, str], captured["headers"])
+    assert headers["Authorization"] == "Bearer header-only"
 
 
 def test_discover_models_uses_saved_profile_and_parses_catalog(monkeypatch) -> None:
@@ -296,7 +334,7 @@ def test_discover_models_uses_saved_profile_and_parses_catalog(monkeypatch) -> N
     service = ModelConnectivityProbeService(get_runtime=lambda: _runtime_config())
 
     monkeypatch.setattr(
-        "agent_teams.providers.model_connectivity.create_sync_http_client",
+        "relay_teams.providers.model_connectivity.create_sync_http_client",
         lambda **kwargs: (
             captured.update(kwargs)
             or _FakeHttpClient(
@@ -328,6 +366,76 @@ def test_discover_models_uses_saved_profile_and_parses_catalog(monkeypatch) -> N
     assert headers["Authorization"] == "Bearer saved-api-key"
     assert captured["timeout_seconds"] == pytest.approx(2.8)
     assert captured["connect_timeout_seconds"] == pytest.approx(2.8)
+    assert tuple(entry.model for entry in result.model_entries) == (
+        "fake-chat-model",
+        "reasoning-model",
+    )
+
+
+def test_discover_models_extracts_context_window_when_provider_returns_it(
+    monkeypatch,
+) -> None:
+    service = ModelConnectivityProbeService(get_runtime=lambda: _runtime_config())
+
+    monkeypatch.setattr(
+        "relay_teams.providers.model_connectivity.create_sync_http_client",
+        lambda **_kwargs: _FakeHttpClient(
+            response=httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "fake-chat-model",
+                            "context_window": 256000,
+                        },
+                        {
+                            "id": "reasoning-model",
+                            "limits": {
+                                "context": 128000,
+                            },
+                        },
+                    ],
+                },
+            )
+        ),
+    )
+
+    result = service.discover_models(ModelDiscoveryRequest(profile_name="default"))
+
+    assert result.ok is True
+    assert result.models == ("fake-chat-model", "reasoning-model")
+    assert result.model_entries[0].model == "fake-chat-model"
+    assert result.model_entries[0].context_window == 256000
+    assert result.model_entries[1].model == "reasoning-model"
+    assert result.model_entries[1].context_window == 128000
+
+
+def test_discover_models_falls_back_to_known_context_window_rules(monkeypatch) -> None:
+    service = ModelConnectivityProbeService(get_runtime=lambda: _runtime_config())
+
+    monkeypatch.setattr(
+        "relay_teams.providers.model_connectivity.create_sync_http_client",
+        lambda **_kwargs: _FakeHttpClient(
+            response=httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {"id": "gpt-4o-mini"},
+                        {"id": "kimi-k2.5"},
+                    ],
+                },
+            )
+        ),
+    )
+
+    result = service.discover_models(ModelDiscoveryRequest(profile_name="default"))
+
+    assert result.ok is True
+    assert result.models == ("gpt-4o-mini", "kimi-k2.5")
+    assert result.model_entries[0].context_window == 128000
+    assert result.model_entries[1].context_window == 256000
 
 
 def test_discover_models_allows_saved_api_key_with_override_base_url(
@@ -337,7 +445,7 @@ def test_discover_models_allows_saved_api_key_with_override_base_url(
     service = ModelConnectivityProbeService(get_runtime=lambda: _runtime_config())
 
     monkeypatch.setattr(
-        "agent_teams.providers.model_connectivity.create_sync_http_client",
+        "relay_teams.providers.model_connectivity.create_sync_http_client",
         lambda **kwargs: (
             captured.update(kwargs)
             or _FakeHttpClient(
@@ -367,7 +475,7 @@ def test_discover_models_supports_bigmodel_provider(monkeypatch) -> None:
     service = ModelConnectivityProbeService(get_runtime=lambda: _runtime_config())
 
     monkeypatch.setattr(
-        "agent_teams.providers.model_connectivity.create_sync_http_client",
+        "relay_teams.providers.model_connectivity.create_sync_http_client",
         lambda **kwargs: (
             captured.update(kwargs)
             or _FakeHttpClient(
@@ -381,7 +489,7 @@ def test_discover_models_supports_bigmodel_provider(monkeypatch) -> None:
         ModelDiscoveryRequest(
             override=ModelConnectivityProbeOverride(
                 provider=ProviderType.BIGMODEL,
-                base_url="https://open.bigmodel.cn/api/paas/v4",
+                base_url="https://open.bigmodel.cn/api/coding/paas/v4",
                 api_key="draft-api-key",
             )
         )
@@ -390,14 +498,48 @@ def test_discover_models_supports_bigmodel_provider(monkeypatch) -> None:
     assert result.ok is True
     assert result.provider == ProviderType.BIGMODEL
     assert result.models == ("glm-4.5",)
-    assert captured["url"] == "https://open.bigmodel.cn/api/paas/v4/models"
+    assert captured["url"] == "https://open.bigmodel.cn/api/coding/paas/v4/models"
+
+
+def test_discover_models_allows_header_only_override(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    service = ModelConnectivityProbeService(get_runtime=lambda: _runtime_config())
+
+    monkeypatch.setattr(
+        "relay_teams.providers.model_connectivity.create_sync_http_client",
+        lambda **kwargs: (
+            captured.update(kwargs)
+            or _FakeHttpClient(
+                captured=captured,
+                response=httpx.Response(200, json={"data": [{"id": "draft-model"}]}),
+            )
+        ),
+    )
+
+    result = service.discover_models(
+        ModelDiscoveryRequest(
+            override=ModelConnectivityProbeOverride(
+                base_url="https://draft.test/v1",
+                headers=(
+                    ModelRequestHeader(
+                        name="Authorization",
+                        value="Bearer discovery-header",
+                    ),
+                ),
+            )
+        )
+    )
+
+    assert result.ok is True
+    headers = cast(dict[str, str], captured["headers"])
+    assert headers["Authorization"] == "Bearer discovery-header"
 
 
 def test_discover_models_returns_invalid_response_error(monkeypatch) -> None:
     service = ModelConnectivityProbeService(get_runtime=lambda: _runtime_config())
 
     monkeypatch.setattr(
-        "agent_teams.providers.model_connectivity.create_sync_http_client",
+        "relay_teams.providers.model_connectivity.create_sync_http_client",
         lambda **_kwargs: _FakeHttpClient(
             response=httpx.Response(200, json={"items": [{"id": "missing-data"}]})
         ),
@@ -434,7 +576,7 @@ def test_probe_resolves_default_alias_to_runtime_default_profile(monkeypatch) ->
     )
 
     monkeypatch.setattr(
-        "agent_teams.providers.model_connectivity.create_sync_http_client",
+        "relay_teams.providers.model_connectivity.create_sync_http_client",
         lambda **kwargs: (
             captured.update(kwargs)
             or _FakeHttpClient(
@@ -471,7 +613,7 @@ def _runtime_config(
         paths=RuntimePaths(
             config_dir=Path("D:/tmp/.agent_teams"),
             env_file=Path("D:/tmp/.agent_teams/.env"),
-            db_path=Path("D:/tmp/.agent_teams/agent_teams.db"),
+            db_path=Path("D:/tmp/.agent_teams/relay_teams.db"),
             roles_dir=Path("D:/tmp/.agent_teams/roles"),
         ),
         llm_profiles={profile_name: config},

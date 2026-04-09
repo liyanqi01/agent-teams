@@ -5,7 +5,7 @@ import httpx
 from pathlib import Path
 from typer.testing import CliRunner
 
-from agent_teams.interfaces.cli import app as cli_app
+from relay_teams.interfaces.cli import app as cli_app
 from integration_tests.support.environment import IntegrationEnvironment
 
 runner = CliRunner()
@@ -64,7 +64,7 @@ def test_root_message_uses_yolo_by_default(monkeypatch) -> None:
         "/api/runs",
         {
             "session_id": "session-1",
-            "intent": "hello",
+            "input": [{"kind": "text", "text": "hello"}],
             "execution_mode": "ai",
             "yolo": True,
         },

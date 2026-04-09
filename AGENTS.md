@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Layout
-- Core package: `src/agent_teams/`
+- Core package: `src/relay_teams/`
 - Main modules:
   - `agents/`: agent models, execution flow, orchestration, and task domain
     - `agents/execution/`: prompt assembly, message persistence, subagent running, LLM session flow
@@ -30,7 +30,7 @@
   - `workspace/`: workspace ids, handles, memory, artifacts, and manager
 - Frontend assets: `frontend/dist/`
 - Tests:
-  - `tests/unit_tests/`: mirrors `src/agent_teams/` by module
+  - `tests/unit_tests/`: mirrors `src/relay_teams/` by module
   - `tests/integration_tests/api/`: HTTP/SSE integration flows
   - `tests/integration_tests/browser/`: browser scenarios
   - `tests/integration_tests/cli/`: CLI integration coverage
@@ -46,22 +46,29 @@
 - Expose public package APIs through package-level `__init__.py`.
 - Use the project logger in production paths; do not use `print()`.
 - Do not use emoji in code, comments, docs, or commit messages.
+- For packaged resource files such as tool description `.txt` files, avoid hand-maintained subpackage `package-data` whitelists; use parent-package globs and add a source-tree coverage test to catch drift.
+- Keep transport semantics consistent for the same provider/model path. If the primary execution flow uses streaming, auxiliary LLM flows such as reflection, compaction, or memory rewrite must also use streaming APIs against that endpoint rather than mixing in non-streaming shortcuts.
 - For outbound network changes, evaluate proxy requirements first and reuse the existing proxy module when needed.
 - CLI modules should provide their own subcommands. List/query output must support default table output and `--format json`.
 - Database schema and API changes do not need backward compatibility, but matching `docs/` updates must be included in the same task.
+- Persisted capability references may contain dirty data. Runtime paths that consume existing role state from the database or already-saved config must tolerate missing `tools`, `mcp_servers`, and `skills` by filtering unknown entries and logging a warning with enough context to diagnose the source.
+- Keep strict validation for explicit user mutations and validation endpoints. Creating or editing a role should still reject unknown `tools`, `mcp_servers`, and `skills` instead of silently accepting them.
+- Do not let startup, config reload, prompt building, provider construction, or task execution fail only because persisted capability references point at missing registry entries.
 
 ## Development
 - Initial setup:
   - Windows: `setup.bat`
   - Linux/macOS: `sh setup.sh`
-  - Then: `uv sync --extra dev`
+  - If you skip the setup script, run: `uv sync --extra dev && uv pip install -e .`
+  - Prefer `uv run --extra dev ...` for local tooling so commands use the project environment instead of the system Python.
 
 ## Coding Standards
 - Prefer enums and Pydantic models over loose dictionaries.
 - Do not use `typing.Any`, `hasattr`, or `# type: ignore`.
 - Changed behavior must come with tests.
-- `tests/unit_tests/` should mirror `src/agent_teams/`. Add matching `__init__.py` files for new test directories.
+- `tests/unit_tests/` should mirror `src/relay_teams/`. Add matching `__init__.py` files for new test directories.
 - Prefer focused unit tests first. Add integration coverage when run/SSE/interface flows change.
+- For built-in PPT skills, when a user reports遮挡、重叠、溢出等版式问题, fix the artifact, upstream the reusable rule into the built-in ppt skill docs/tests, and verify end-to-end conversion before opening a PR.
 
 ## Interface Boundaries
 - Public backend contract is `/api/*`.
@@ -69,11 +76,11 @@
 - Interface layers must not access backend repositories directly.
 
 ## Pre-Commit Self-Check
-1. `uv run ruff check --fix`
-2. `uv run ruff format --no-cache --force-exclude`
-3. `uv run basedpyright`
-4. `uv run pytest -q tests/unit_tests`
-5. `uv run pytest -q tests/integration_tests`
+1. `uv run --extra dev ruff check --fix`
+2. `uv run --extra dev ruff format --no-cache --force-exclude`
+3. `uv run --extra dev basedpyright`
+4. `uv run --extra dev pytest -q tests/unit_tests`
+5. `uv run --extra dev pytest -q tests/integration_tests`
 
 ## Security
 - Secrets only in keyring.

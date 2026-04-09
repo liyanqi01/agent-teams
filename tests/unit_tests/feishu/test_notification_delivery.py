@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from agent_teams.gateway.feishu.models import (
+from relay_teams.gateway.feishu.models import (
     FEISHU_METADATA_CHAT_ID_KEY,
     FEISHU_METADATA_CHAT_TYPE_KEY,
     FEISHU_METADATA_PLATFORM_KEY,
@@ -15,16 +15,16 @@ from agent_teams.gateway.feishu.models import (
     FeishuTriggerSourceConfig,
     FeishuTriggerTargetConfig,
 )
-from agent_teams.gateway.feishu.notification_delivery import (
+from relay_teams.gateway.feishu.notification_delivery import (
     FeishuNotificationDispatcher,
 )
-from agent_teams.notifications import (
+from relay_teams.notifications import (
     NotificationChannel,
     NotificationContext,
     NotificationRequest,
     NotificationType,
 )
-from agent_teams.sessions.session_models import SessionMode, SessionRecord
+from relay_teams.sessions.session_models import SessionMode, SessionRecord
 
 
 class _FakeSessionRepo:
@@ -74,8 +74,9 @@ class _FakeFeishuClient:
         chat_id: str,
         text: str,
         environment: FeishuEnvironment | None = None,
-    ) -> None:
+    ) -> str:
         self.sent.append(("text", chat_id, text, environment))
+        return "om_text"
 
     def send_card_message(
         self,
@@ -83,8 +84,9 @@ class _FakeFeishuClient:
         chat_id: str,
         card: dict[str, object],
         environment: FeishuEnvironment | None = None,
-    ) -> None:
+    ) -> str:
         self.sent.append(("card", chat_id, card, environment))
+        return "om_card"
 
 
 class _FakeTerminalNotificationSuppressor:

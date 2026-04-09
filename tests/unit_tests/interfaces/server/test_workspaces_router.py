@@ -8,11 +8,12 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import pytest
 
-from agent_teams.interfaces.server.deps import get_workspace_service
-from agent_teams.interfaces.server.routers import workspaces
-from agent_teams.workspace import (
+from relay_teams.interfaces.server.deps import get_workspace_service
+from relay_teams.interfaces.server.routers import workspaces
+from relay_teams.workspace import (
     FileScopeBackend,
     GitWorktreeClient,
+    WorkspaceRecord,
     WorkspaceFileScope,
     WorkspaceProfile,
     WorkspaceRepository,
@@ -54,6 +55,19 @@ class FakeGitWorktreeClient(GitWorktreeClient):
 
     def current_head(self, repository_root: Path) -> str:
         return "abc123"
+
+    def fetch_ref(
+        self,
+        repository_root: Path,
+        *,
+        remote: str = "origin",
+        ref: str = "main",
+    ) -> None:
+        _ = (repository_root, remote, ref)
+
+    def resolve_ref(self, repository_root: Path, ref_name: str) -> str:
+        _ = repository_root
+        return f"resolved:{ref_name}"
 
     def add_worktree(
         self,
@@ -107,6 +121,22 @@ def test_create_workspace(tmp_path: Path) -> None:
     assert payload["root_path"] == str(root_path.resolve())
 
 
+def test_create_workspace_rejects_none_like_workspace_id(tmp_path: Path) -> None:
+    client, _ = _create_test_client(tmp_path)
+    root_path = tmp_path / "workspace-root"
+    root_path.mkdir()
+
+    response = client.post(
+        "/api/workspaces",
+        json={
+            "workspace_id": "None",
+            "root_path": str(root_path),
+        },
+    )
+
+    assert response.status_code == 422
+
+
 def test_list_and_get_workspaces(tmp_path: Path) -> None:
     client, service = _create_test_client(tmp_path)
     root_path = tmp_path / "workspace-root"
@@ -123,6 +153,14 @@ def test_list_and_get_workspaces(tmp_path: Path) -> None:
     assert [item["workspace_id"] for item in list_response.json()] == ["project-alpha"]
     assert get_response.status_code == 200
     assert get_response.json()["root_path"] == str(root_path.resolve())
+
+
+def test_get_workspace_rejects_none_like_path_identifier(tmp_path: Path) -> None:
+    client, _ = _create_test_client(tmp_path)
+
+    response = client.get("/api/workspaces/None")
+
+    assert response.status_code == 422
 
 
 def test_create_workspace_rejects_missing_root(tmp_path: Path) -> None:
@@ -375,6 +413,39 @@ def test_fork_workspace(tmp_path: Path) -> None:
     )
     assert payload["profile"]["file_scope"]["backend"] == "git_worktree"
     assert payload["profile"]["file_scope"]["branch_name"] == "fork/alpha-project-fork"
+
+
+def test_fork_workspace_forwards_start_ref(tmp_path: Path) -> None:
+    class CaptureForkWorkspaceService(WorkspaceService):
+        def __init__(self) -> None:
+            super().__init__(
+                repository=WorkspaceRepository(tmp_path / "workspaces_router.db")
+            )
+            self.calls: list[tuple[str, str, str | None]] = []
+
+        def fork_workspace(
+            self,
+            *,
+            source_workspace_id: str,
+            name: str,
+            start_ref: str | None = None,
+        ):
+            self.calls.append((source_workspace_id, name, start_ref))
+            return WorkspaceRecord(
+                workspace_id="alpha-project-fork",
+                root_path=(tmp_path / "storage" / "alpha-project-fork").resolve(),
+            )
+
+    service = CaptureForkWorkspaceService()
+    client, _ = _create_test_client(tmp_path, service=service)
+
+    response = client.post(
+        "/api/workspaces/project-alpha:fork",
+        json={"name": "Alpha Project Fork", "start_ref": "origin/release"},
+    )
+
+    assert response.status_code == 200
+    assert service.calls == [("project-alpha", "Alpha Project Fork", "origin/release")]
 
 
 def test_delete_workspace_supports_remove_worktree_query(tmp_path: Path) -> None:

@@ -224,6 +224,72 @@ console.log(JSON.stringify({
     assert payload["discoveryStatusText"] == "Fetched 2 models in 37ms."
 
 
+def test_discover_models_prefills_context_window_when_metadata_is_available(
+    tmp_path: Path,
+) -> None:
+    payload = _run_model_profiles_script(
+        tmp_path=tmp_path,
+        runner_source="""
+import { bindModelProfileHandlers } from "./modelProfiles.mjs";
+
+const notifications = [];
+
+const elements = createElements();
+installGlobals(elements, notifications);
+bindModelProfileHandlers();
+
+document.getElementById("add-profile-btn").onclick();
+document.getElementById("profile-base-url").value = "https://draft.test/v1";
+document.getElementById("profile-api-key").value = "draft-api-key";
+
+await document.getElementById("fetch-profile-models-btn").onclick();
+
+console.log(JSON.stringify({
+    modelValue: document.getElementById("profile-model").value,
+    contextWindowValue: document.getElementById("profile-context-window").value,
+}));
+""".strip(),
+        mock_api_source="""
+export async function fetchModelProfiles() {
+    return {};
+}
+
+export async function probeModelConnection(payload) {
+    globalThis.__probePayload = payload;
+    return { ok: true, latency_ms: 42 };
+}
+
+export async function discoverModelCatalog(payload) {
+    globalThis.__discoverPayload = payload;
+    return {
+        ok: true,
+        latency_ms: 37,
+        models: ["fake-chat-model", "reasoning-model"],
+        model_entries: [
+            { model: "fake-chat-model", context_window: 256000 },
+            { model: "reasoning-model", context_window: null },
+        ],
+    };
+}
+
+export async function saveModelProfile(name, profile) {
+    globalThis.__savedProfile = { name, profile };
+}
+
+export async function reloadModelConfig() {
+    globalThis.__reloadCalled = true;
+}
+
+export async function deleteModelProfile(name) {
+    globalThis.__deletedProfileName = name;
+}
+""".strip(),
+    )
+
+    assert payload["modelValue"] == "fake-chat-model"
+    assert payload["contextWindowValue"] == "256000"
+
+
 def test_saving_model_profile_preserves_bigmodel_provider_value(tmp_path: Path) -> None:
     payload = _run_model_profiles_script(
         tmp_path=tmp_path,
@@ -240,7 +306,7 @@ document.getElementById("add-profile-btn").onclick();
 document.getElementById("profile-name").value = "glm-profile";
 document.getElementById("profile-provider").value = "bigmodel";
 document.getElementById("profile-model").value = "glm-4.5";
-document.getElementById("profile-base-url").value = "https://open.bigmodel.cn/api/paas/v4";
+document.getElementById("profile-base-url").value = "https://open.bigmodel.cn/api/coding/paas/v4";
 document.getElementById("profile-api-key").value = "test-api-key";
 
 await document.getElementById("save-profile-btn").onclick();
@@ -280,7 +346,7 @@ console.log(JSON.stringify({
     )
 
     assert payload["providerValue"] == "bigmodel"
-    assert payload["baseUrlValue"] == "https://open.bigmodel.cn/api/paas/v4"
+    assert payload["baseUrlValue"] == "https://open.bigmodel.cn/api/coding/paas/v4"
 
 
 def test_selecting_bigmodel_does_not_override_existing_base_url(tmp_path: Path) -> None:
@@ -853,6 +919,42 @@ export async function showConfirmDialog(payload) {
 const translations = {
     "settings.model.add_profile": "Add Profile",
     "settings.model.edit_profile": "Edit Profile",
+    "settings.model.empty_title": "No profiles configured",
+    "settings.model.empty_copy": "Create a profile to define the model endpoint, request limits, and sampling defaults.",
+    "settings.model.saved_title": "Profile Saved",
+    "settings.model.saved_message_detail": "Profile saved and reloaded.",
+    "settings.model.save_failed_title": "Save Failed",
+    "settings.model.save_failed_detail": "Failed to save: {error}",
+    "settings.model.testing": "Testing connection...",
+    "settings.model.probe_failed": "Probe failed: {error}",
+    "settings.model.delete_title": "Delete Profile",
+    "settings.model.delete_message": "Delete profile \\"{name}\\"?",
+    "settings.model.deleted_title": "Profile Deleted",
+    "settings.model.deleted_message_detail": "Profile deleted and reloaded.",
+    "settings.model.delete_failed_title": "Delete Failed",
+    "settings.model.delete_failed_detail": "Failed to delete: {error}",
+    "settings.model.fetching_models": "Fetching models...",
+    "settings.model.fetch_failed": "Fetch failed: {error}",
+    "settings.model.fetch_models": "Fetch Models",
+    "settings.model.validation_test_new": "Model, base URL, and API key are required before testing a new profile.",
+    "settings.model.validation_fetch_models": "Base URL and API key are required before fetching models for a new profile.",
+    "settings.model.probe_success": "Connected in {latency_ms}ms{usage_text}",
+    "settings.model.connection_failed": "Connection failed: {reason}",
+    "settings.model.probe_no_models": "Connected in {latency_ms}ms, but the endpoint returned no models.",
+    "settings.model.models_fetched": "Fetched {count} models in {latency_ms}ms.",
+    "settings.model.usage_tokens": " · {tokens} tokens",
+    "settings.model.show_models": "Show Models",
+    "settings.model.no_models_loaded": "No Models Loaded",
+    "settings.model.show_api_key": "Show API key",
+    "settings.model.hide_api_key": "Hide API key",
+    "settings.model.default_badge": "Default",
+    "settings.model.no_model": "No model",
+    "settings.model.no_endpoint": "No endpoint",
+    "settings.model.unknown": "Unknown",
+    "settings.action.test": "Test",
+    "settings.action.edit": "Edit",
+    "settings.action.delete": "Delete",
+    "settings.action.cancel": "Cancel",
 };
 
 export function t(key) {

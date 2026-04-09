@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from agent_teams.agents.execution.prompt_instructions import PromptInstructionResolver
-from agent_teams.agents.execution import system_prompts
-from agent_teams.agents.execution.system_prompts import (
+from relay_teams.agents.execution.prompt_instructions import PromptInstructionResolver
+from relay_teams.agents.execution import system_prompts
+from relay_teams.agents.execution.system_prompts import (
     PromptSkillInstruction,
     RuntimePromptBuildInput,
     SystemPromptSectionsInput,
@@ -16,17 +16,21 @@ from agent_teams.agents.execution.system_prompts import (
     build_runtime_system_prompt_result,
     compose_system_prompt,
 )
-from agent_teams.agents.execution.user_prompts import (
+from relay_teams.agents.execution.user_prompts import (
     UserPromptBuildInput,
+    UserPromptSkillCandidate,
     build_user_prompt,
 )
-from agent_teams.agents.tasks.models import TaskEnvelope, VerificationPlan
-from agent_teams.mcp.mcp_models import McpConfigScope, McpServerSpec, McpToolInfo
-from agent_teams.mcp.mcp_registry import McpRegistry
-from agent_teams.roles.role_models import RoleDefinition
-from agent_teams.roles.role_registry import RoleRegistry
-from agent_teams.sessions.runs.run_models import RunTopologySnapshot
-from agent_teams.sessions.session_models import SessionMode
+from relay_teams.agents.tasks.models import TaskEnvelope, VerificationPlan
+from relay_teams.mcp.mcp_models import McpConfigScope, McpServerSpec, McpToolInfo
+from relay_teams.mcp.mcp_registry import McpRegistry
+from relay_teams.roles.role_models import RoleDefinition
+from relay_teams.roles.role_registry import RoleRegistry
+from relay_teams.roles.runtime_role_resolver import RuntimeRoleResolver
+from relay_teams.roles.temporary_role_models import TemporaryRoleSpec
+from relay_teams.roles.temporary_role_repository import TemporaryRoleRepository
+from relay_teams.sessions.runs.run_models import RunTopologySnapshot
+from relay_teams.sessions.session_models import SessionMode
 
 
 @pytest.fixture(autouse=True)
@@ -40,12 +44,33 @@ def _suppress_host_github_prompt_line(
     )
 
 
+@pytest.fixture(autouse=True)
+def _freeze_runtime_date_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        system_prompts,
+        "_get_runtime_date_context",
+        lambda: ("2026-04-02", "HKT (UTC+08:00)"),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _suppress_host_package_tools(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        system_prompts,
+        "_resolve_package_tool_path",
+        lambda command_names: None,
+    )
+
+
 def _role(role_id: str) -> RoleDefinition:
     tools = ()
-    if role_id.casefold() in {"coordinator_agent", "coordinator"}:
+    if role_id.casefold() == "coordinator":
         tools = (
             "create_tasks",
+            "create_temporary_role",
             "update_task",
+            "list_available_roles",
+            "list_delegated_tasks",
             "dispatch_task",
         )
     return RoleDefinition(
@@ -94,11 +119,18 @@ def _coordinator_registry() -> RoleRegistry:
     registry = RoleRegistry()
     registry.register(
         RoleDefinition(
-            role_id="coordinator_agent",
+            role_id="Coordinator",
             name="Coordinator",
             description="Coordinates delegated work.",
             version="1",
-            tools=("create_tasks", "update_task", "dispatch_task"),
+            tools=(
+                "create_tasks",
+                "create_temporary_role",
+                "update_task",
+                "list_available_roles",
+                "list_delegated_tasks",
+                "dispatch_task",
+            ),
             mcp_servers=(),
             skills=(),
             model_profile="default",
@@ -125,13 +157,13 @@ def test_runtime_system_prompt_for_coordinator_has_contract_and_context() -> Non
     prompt = asyncio.run(
         build_runtime_system_prompt(
             RuntimePromptBuildInput(
-                role=_role("coordinator_agent"),
+                role=_role("Coordinator"),
                 task=_task(),
                 topology=RunTopologySnapshot(
                     session_mode=SessionMode.ORCHESTRATION,
                     main_agent_role_id="MainAgent",
                     normal_root_role_id="MainAgent",
-                    coordinator_role_id="coordinator_agent",
+                    coordinator_role_id="Coordinator",
                     orchestration_preset_id="default",
                     orchestration_prompt="Delegate by capability and finalize yourself.",
                     allowed_role_ids=("writer_agent",),
@@ -157,17 +189,132 @@ def test_runtime_system_prompt_for_coordinator_has_contract_and_context() -> Non
         "Create tasks as durable contracts with concrete outcomes and constraints."
         in prompt
     )
+    assert (
+        "Inspect the current worker pool with `list_available_roles` when selecting or reusing a dispatch target."
+        in prompt
+    )
+    assert (
+        "If no existing role is a good fit, create a run-scoped role with `create_temporary_role` before dispatch."
+        in prompt
+    )
+    assert (
+        "Prefer `template_role_id` when creating a temporary role so it inherits the closest existing capabilities."
+        in prompt
+    )
     assert "Choose the executing role in `dispatch_task`." in prompt
     assert (
         "Use the dispatch prompt to pass stage-specific instructions and upstream context."
         in prompt
     )
     assert "dispatch targets, not your own capabilities." in prompt
+    assert "- Source: static" in prompt
     assert "- Description: Drafts release notes." in prompt
     assert "- Tools: read, write" in prompt
     assert "- MCP Tools: docs_search" in prompt
     assert "- Skills: time" in prompt
     assert "Deliver weekly summary" not in prompt
+
+
+def test_runtime_system_prompt_ignores_unknown_mcp_servers_in_available_roles() -> None:
+    registry = RoleRegistry()
+    registry.register(
+        RoleDefinition(
+            role_id="Coordinator",
+            name="Coordinator",
+            description="Coordinates delegated work.",
+            version="1",
+            tools=("create_tasks", "update_task", "dispatch_task"),
+            mcp_servers=(),
+            skills=(),
+            model_profile="default",
+            system_prompt="You are a focused agent.",
+        )
+    )
+    registry.register(
+        RoleDefinition(
+            role_id="writer_agent",
+            name="Writer",
+            description="Drafts release notes.",
+            version="1",
+            tools=("read", "write"),
+            mcp_servers=("docs", "missing_server"),
+            skills=("time",),
+            model_profile="default",
+            system_prompt="You are a writer.",
+        )
+    )
+
+    prompt = asyncio.run(
+        build_runtime_system_prompt(
+            RuntimePromptBuildInput(
+                role=_role("Coordinator"),
+                task=_task(),
+                topology=RunTopologySnapshot(
+                    session_mode=SessionMode.ORCHESTRATION,
+                    main_agent_role_id="MainAgent",
+                    normal_root_role_id="MainAgent",
+                    coordinator_role_id="Coordinator",
+                    orchestration_preset_id="default",
+                    orchestration_prompt="Delegate by capability and finalize yourself.",
+                    allowed_role_ids=("writer_agent",),
+                ),
+                shared_state_snapshot=(),
+            ),
+            role_registry=registry,
+            mcp_registry=_FakeMcpRegistry(),
+        )
+    )
+
+    assert "- MCP Tools: docs_search" in prompt
+
+
+def test_runtime_system_prompt_includes_run_temporary_roles_in_available_roles(
+    tmp_path: Path,
+) -> None:
+    registry = _coordinator_registry()
+    resolver = RuntimeRoleResolver(
+        role_registry=registry,
+        temporary_role_repository=TemporaryRoleRepository(tmp_path / "roles.db"),
+    )
+    resolver.create_temporary_role(
+        run_id="trace-1",
+        session_id="session-1",
+        role=TemporaryRoleSpec(
+            role_id="tmp_writer",
+            name="Tmp Writer",
+            description="Handles a run-specific writing format.",
+            system_prompt="You are a temporary writer.",
+            tools=("read", "write"),
+        ),
+    )
+
+    prompt = asyncio.run(
+        build_runtime_system_prompt(
+            RuntimePromptBuildInput(
+                role=_role("Coordinator"),
+                task=_task(),
+                topology=RunTopologySnapshot(
+                    session_mode=SessionMode.ORCHESTRATION,
+                    main_agent_role_id="MainAgent",
+                    normal_root_role_id="MainAgent",
+                    coordinator_role_id="Coordinator",
+                    orchestration_preset_id="default",
+                    orchestration_prompt="Delegate by capability and finalize yourself.",
+                    allowed_role_ids=("writer_agent",),
+                ),
+                shared_state_snapshot=(),
+            ),
+            role_registry=registry,
+            runtime_role_resolver=resolver,
+            mcp_registry=_FakeMcpRegistry(),
+        )
+    )
+
+    assert "### writer_agent" in prompt
+    assert "### tmp_writer" in prompt
+    assert "- Source: temporary" in prompt
+    assert "- Description: Handles a run-specific writing format." in prompt
+    assert "- Tools: read, write" in prompt
 
 
 def test_runtime_system_prompt_for_worker_skips_runtime_contract() -> None:
@@ -187,6 +334,13 @@ def test_runtime_system_prompt_for_worker_skips_runtime_contract() -> None:
     assert "## Runtime Environment Information" in prompt
     assert "- Operating System:" in prompt
     assert f"- Working Directory: {working_directory.resolve()}" in prompt
+    assert "- Current Date: 2026-04-02" in prompt
+    assert "- Runtime Timezone: HKT (UTC+08:00)" in prompt
+    assert "- Python Package Tool (pip): not found on PATH" in prompt
+    assert "- Python Package Tool (uv): not found on PATH" in prompt
+    assert (
+        "Do not trust your internal knowledge for the current date or time." in prompt
+    )
 
 
 def test_runtime_environment_prompt_mentions_github_when_token_and_system_gh_exist(
@@ -206,6 +360,13 @@ def test_runtime_environment_prompt_mentions_github_when_token_and_system_gh_exi
     assert (
         f"- GitHub CLI: token configured; using system gh at {system_gh_path}" in prompt
     )
+    assert "- Current Date: 2026-04-02" in prompt
+    assert "- Runtime Timezone: HKT (UTC+08:00)" in prompt
+    assert "- Python Package Tool (pip): not found on PATH" in prompt
+    assert "- Python Package Tool (uv): not found on PATH" in prompt
+    assert (
+        "use the runtime date in this section as the default source of truth" in prompt
+    )
 
 
 def test_runtime_environment_prompt_mentions_on_demand_gh_when_only_token_exists(
@@ -222,6 +383,88 @@ def test_runtime_environment_prompt_mentions_on_demand_gh_when_only_token_exists
     )
 
     assert "- GitHub CLI: token configured; gh will be resolved on demand" in prompt
+    assert "- Current Date: 2026-04-02" in prompt
+    assert "- Runtime Timezone: HKT (UTC+08:00)" in prompt
+    assert "- Python Package Tool (pip): not found on PATH" in prompt
+    assert "- Python Package Tool (uv): not found on PATH" in prompt
+
+
+def test_runtime_environment_prompt_mentions_package_tools_and_uv_fallback_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        system_prompts,
+        "_resolve_package_tool_path",
+        lambda command_names: (
+            Path("/usr/local/bin/pip")
+            if command_names == ("pip", "pip3")
+            else Path("/usr/local/bin/uv")
+        ),
+    )
+
+    prompt = system_prompts.build_environment_info_prompt(
+        working_directory=Path("/tmp/project")
+    )
+
+    assert "- Python Package Tool (pip): /usr/local/bin/pip" in prompt
+    assert "- Python Package Tool (uv): /usr/local/bin/uv" in prompt
+    assert (
+        "If pip install fails with externally-managed-environment (PEP 668), try "
+        "uv pip install <packages>." in prompt
+    )
+
+
+def test_runtime_environment_prompt_omits_uv_fallback_hint_when_uv_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        system_prompts,
+        "_resolve_package_tool_path",
+        lambda command_names: (
+            Path("/usr/local/bin/pip") if command_names == ("pip", "pip3") else None
+        ),
+    )
+
+    prompt = system_prompts.build_environment_info_prompt(
+        working_directory=Path("/tmp/project")
+    )
+
+    assert "- Python Package Tool (pip): /usr/local/bin/pip" in prompt
+    assert "- Python Package Tool (uv): not found on PATH" in prompt
+    assert "uv pip install <packages>" not in prompt
+
+
+def test_runtime_environment_prompt_uses_runtime_shell_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from relay_teams.tools.workspace_tools.shell_executor import ShellRuntimeSummary
+
+    monkeypatch.setattr(
+        system_prompts,
+        "_get_github_cli_environment_status",
+        lambda: (False, None),
+    )
+    monkeypatch.setattr(
+        "relay_teams.tools.workspace_tools.shell_executor.describe_runtime_shell",
+        lambda: ShellRuntimeSummary(
+            shell_info="PowerShell",
+            shell_path=r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        ),
+    )
+
+    prompt = system_prompts.build_environment_info_prompt(
+        working_directory=Path("/tmp/project")
+    )
+
+    assert "Shell Type: PowerShell" in prompt
+    assert "powershell.exe" in prompt
+    assert "- Current Date: 2026-04-02" in prompt
+    assert "- Runtime Timezone: HKT (UTC+08:00)" in prompt
+    assert "- Python Package Tool (pip): not found on PATH" in prompt
+    assert "- Python Package Tool (uv): not found on PATH" in prompt
+    assert (
+        "Do not trust your internal knowledge for the current date or time." in prompt
+    )
 
 
 def test_runtime_system_prompt_layers_keep_base_instructions_before_workspace_context() -> (
@@ -230,13 +473,13 @@ def test_runtime_system_prompt_layers_keep_base_instructions_before_workspace_co
     result = asyncio.run(
         build_runtime_system_prompt_result(
             RuntimePromptBuildInput(
-                role=_role("coordinator_agent"),
+                role=_role("Coordinator"),
                 task=_task(),
                 topology=RunTopologySnapshot(
                     session_mode=SessionMode.ORCHESTRATION,
                     main_agent_role_id="MainAgent",
                     normal_root_role_id="MainAgent",
-                    coordinator_role_id="coordinator_agent",
+                    coordinator_role_id="Coordinator",
                     orchestration_preset_id="default",
                     orchestration_prompt="Delegate by capability and finalize yourself.",
                     allowed_role_ids=("writer_agent",),
@@ -254,6 +497,10 @@ def test_runtime_system_prompt_layers_keep_base_instructions_before_workspace_co
     assert "## Available Roles" in result.capability_summary
     assert "## Runtime Environment Information" in result.workspace_context
     assert "## Orchestration Prompt" in result.workspace_context
+    assert "- Current Date: 2026-04-02" in result.workspace_context
+    assert "- Runtime Timezone: HKT (UTC+08:00)" in result.workspace_context
+    assert "- Python Package Tool (pip): not found on PATH" in result.workspace_context
+    assert "- Python Package Tool (uv): not found on PATH" in result.workspace_context
     assert result.prompt.index("## Orchestration Rules") < result.prompt.index(
         "## Available Roles"
     )
@@ -262,7 +509,7 @@ def test_runtime_system_prompt_layers_keep_base_instructions_before_workspace_co
     )
 
 
-def test_compose_system_prompt_renders_tools_and_skills() -> None:
+def test_compose_system_prompt_renders_skill_catalog_when_provided() -> None:
     prompt = compose_system_prompt(
         SystemPromptSectionsInput(
             base_instructions="## Role\nYou are a planner.",
@@ -279,12 +526,9 @@ def test_compose_system_prompt_renders_tools_and_skills() -> None:
     assert "## Available Skills" in prompt
     assert "- time: Normalize all times to UTC." in prompt
     assert "Use `load_skill` when a listed skill is relevant" in prompt
-    assert "absolute file paths for the skill directory" in prompt
-    assert "Use `read_skill_resource`" not in prompt
-    assert "Use `run_skill_script`" not in prompt
 
 
-def test_compose_system_prompt_places_skill_catalog_before_workspace_context() -> None:
+def test_compose_system_prompt_places_skill_catalog_before_capability_summary() -> None:
     prompt = compose_system_prompt(
         SystemPromptSectionsInput(
             base_instructions="## Role\nYou are a planner.",
@@ -301,7 +545,8 @@ def test_compose_system_prompt_places_skill_catalog_before_workspace_context() -
         )
     )
 
-    assert prompt.index("## Available Skills") < prompt.index(
+    assert prompt.index("## Available Skills") < prompt.index("## Available Roles")
+    assert prompt.index("## Available Roles") < prompt.index(
         "## Runtime Environment Information"
     )
 
@@ -314,17 +559,35 @@ def test_user_prompt_builder_returns_raw_objective() -> None:
     assert prompt == "Draft the release notes."
 
 
+def test_user_prompt_builder_appends_skill_candidates() -> None:
+    prompt = build_user_prompt(
+        UserPromptBuildInput(
+            objective="Draft the release notes.",
+            skill_candidates=(
+                UserPromptSkillCandidate(
+                    name="planner",
+                    description="Break objectives into executable plans.",
+                ),
+            ),
+        )
+    )
+
+    assert prompt.startswith("Draft the release notes.")
+    assert "## Skill Candidates" in prompt
+    assert "- planner: Break objectives into executable plans." in prompt
+
+
 def test_runtime_system_prompt_for_coordinator_mentions_task_orchestration() -> None:
     prompt = asyncio.run(
         build_runtime_system_prompt(
             RuntimePromptBuildInput(
-                role=_role("coordinator_agent"),
+                role=_role("Coordinator"),
                 task=_task(),
                 topology=RunTopologySnapshot(
                     session_mode=SessionMode.ORCHESTRATION,
                     main_agent_role_id="MainAgent",
                     normal_root_role_id="MainAgent",
-                    coordinator_role_id="coordinator_agent",
+                    coordinator_role_id="Coordinator",
                     orchestration_preset_id="default",
                     orchestration_prompt="Delegate by capability and finalize yourself.",
                     allowed_role_ids=("writer_agent",),
@@ -340,6 +603,7 @@ def test_runtime_system_prompt_for_coordinator_mentions_task_orchestration() -> 
     assert "## Orchestration Rules" in prompt
     assert "Orchestration Prompt" in prompt
     assert "Choose roles by their Description, Tools, MCP Tools, and Skills." in prompt
+    assert "list_available_roles" in prompt
 
 
 def test_runtime_system_prompt_for_main_agent_uses_base_role_prompt_only() -> None:
@@ -371,7 +635,7 @@ def test_runtime_system_prompt_loads_all_project_agents_files_before_fallback(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    from agent_teams.agents.execution import prompt_instructions
+    from relay_teams.agents.execution import prompt_instructions
 
     project_root = tmp_path / "project"
     nested_dir = project_root / "src" / "feature"
@@ -423,7 +687,7 @@ def test_runtime_system_prompt_falls_back_to_global_claude_before_gemini(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    from agent_teams.agents.execution import prompt_instructions
+    from relay_teams.agents.execution import prompt_instructions
 
     config_dir = tmp_path / "config"
     home_dir = tmp_path / "home"

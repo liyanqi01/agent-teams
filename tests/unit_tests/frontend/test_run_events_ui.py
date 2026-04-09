@@ -202,6 +202,10 @@ export function appendStreamChunk() {
     return undefined;
 }
 
+export function appendStreamOutputParts() {
+    return undefined;
+}
+
 export function finalizeThinking() {
     return undefined;
 }
@@ -263,7 +267,7 @@ globalThis.__openAgentPanelCalls = [];
         cwd=str(repo_root),
         text=True,
         encoding="utf-8",
-        timeout=30,
+        timeout=3,
     )
 
     if completed.returncode != 0:

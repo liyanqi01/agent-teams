@@ -17,8 +17,9 @@ export async function sendUserPrompt(
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                intent: prompt,
                 session_id: sessionId,
+                input: [{ kind: 'text', text: prompt }],
+                run_kind: 'conversation',
                 execution_mode: 'ai',
                 yolo: yolo === true,
                 thinking: thinking || { enabled: false, effort: null },
@@ -99,6 +100,30 @@ export async function resumeRun(runId) {
             method: 'POST',
         },
         'Failed to resume run',
+    );
+}
+
+export async function fetchRunBackgroundTasks(runId) {
+    return requestJson(
+        `/api/runs/${runId}/background-tasks`,
+        undefined,
+        'Failed to fetch background tasks',
+    );
+}
+
+export async function fetchRunBackgroundTask(runId, backgroundTaskId) {
+    return requestJson(
+        `/api/runs/${runId}/background-tasks/${backgroundTaskId}`,
+        undefined,
+        'Failed to fetch background task',
+    );
+}
+
+export async function stopBackgroundTask(runId, backgroundTaskId) {
+    return requestJson(
+        `/api/runs/${runId}/background-tasks/${backgroundTaskId}:stop`,
+        { method: 'POST' },
+        'Failed to stop background task',
     );
 }
 

@@ -3,6 +3,7 @@
  * Floating round navigator rendering and active-state sync.
  */
 import { esc, roundStateLabel, roundStateTone } from './utils.js';
+import { t } from '../../utils/i18n.js';
 
 let navRounds = [];
 let navActiveRunId = null;
@@ -13,6 +14,7 @@ const ROUND_NAV_POSITION_KEY = 'agent_teams_round_nav_position';
 /** Persistent offset relative to chat container: { fromRight, fromTop }. */
 let currentOffset = null;
 let resizeObserver = null;
+let scheduledOffsetFrame = 0;
 
 export function renderRoundNavigator(rounds, onSelectRound) {
     navRounds = Array.isArray(rounds) ? rounds : [];
@@ -36,7 +38,7 @@ export function renderRoundNavigator(rounds, onSelectRound) {
     }
 
     renderNavigatorDom(nav);
-    applyOffset(nav);
+    scheduleOffsetApply(nav);
 }
 
 export function hideRoundNavigator() {
@@ -103,7 +105,7 @@ function renderNavigatorDom(nav) {
             const widthDelta = newWidth - oldWidth;
             currentOffset = { fromRight, fromTop: currentOffset ? currentOffset.fromTop : (navRect.top - chatRect.top) };
             // fromRight stays same, so left shifts by widthDelta automatically
-            applyOffset(nav);
+            scheduleOffsetApply(nav);
             persistOffset();
         };
     }
@@ -124,10 +126,10 @@ function renderNavigatorDom(nav) {
         item.innerHTML = `
             <span class="idx">${idx + 1}</span>
             <span class="round-nav-copy">
-                <span class="txt">${esc(round.intent || 'No intent')}</span>
+                <span class="txt">${esc(round.intent || t('rounds.no_intent'))}</span>
                 <span class="round-nav-meta">
                     ${stateLabel ? `<span class="round-nav-state round-nav-state-${roundStateTone(round)}">${esc(stateLabel)}</span>` : ''}
-                    ${approvalCount > 0 ? `<span class="round-nav-state round-nav-state-warning">${approvalCount} approval${approvalCount === 1 ? '' : 's'}</span>` : ''}
+                    ${approvalCount > 0 ? `<span class="round-nav-state round-nav-state-warning">${esc(t('rounds.pending_approvals').replace('{count}', String(approvalCount)))}</span>` : ''}
                 </span>
             </span>
         `;
@@ -166,6 +168,16 @@ function applyOffset(nav) {
     nav.style.left = left + 'px';
     nav.style.top = top + 'px';
     nav.style.right = 'auto';
+}
+
+function scheduleOffsetApply(nav) {
+    if (scheduledOffsetFrame) {
+        window.cancelAnimationFrame(scheduledOffsetFrame);
+    }
+    scheduledOffsetFrame = window.requestAnimationFrame(() => {
+        scheduledOffsetFrame = 0;
+        applyOffset(nav);
+    });
 }
 
 /** Derive offset from current viewport position. */
@@ -251,7 +263,7 @@ function installResizeWatch(nav) {
     if (!chat) return;
     resizeObserver = new ResizeObserver(() => {
         if (nav.style.display === 'none') return;
-        applyOffset(nav);
+        scheduleOffsetApply(nav);
     });
     resizeObserver.observe(chat);
 }

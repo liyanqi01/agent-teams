@@ -4,19 +4,21 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from tempfile import mkdtemp
+import threading
 from typing import cast
 
 from pydantic import JsonValue
+import pytest
 
-from agent_teams.builtin import get_builtin_skills_dir
-from agent_teams.persistence.shared_state_repo import SharedStateRepository
-from agent_teams.skills.discovery import SkillsDirectory
-from agent_teams.skills.skill_models import SkillScope
-from agent_teams.roles.role_models import RoleDefinition
-from agent_teams.roles.role_registry import RoleRegistry
-from agent_teams.skills.skill_registry import SkillRegistry
+from relay_teams.builtin import get_builtin_skills_dir
+from relay_teams.persistence.shared_state_repo import SharedStateRepository
+from relay_teams.skills.discovery import SkillsDirectory
+from relay_teams.skills.skill_models import SkillScope
+from relay_teams.roles.role_models import RoleDefinition
+from relay_teams.roles.role_registry import RoleRegistry
+from relay_teams.skills.skill_registry import SkillRegistry
 
-from agent_teams.tools.runtime import ToolContext
+from relay_teams.tools.runtime import ToolContext
 
 
 def test_get_toolset_tools_builds_skill_tools_without_annotation_errors() -> None:
@@ -50,7 +52,31 @@ def test_get_instruction_entries_returns_structured_data(tmp_path: Path) -> None
     assert entries[0].description == "timezone helper"
 
 
-def test_registry_from_skill_dirs_prefers_project_skill_over_user_skill(
+def test_resolve_known_ignores_unknown_skills_when_strict_is_false(
+    tmp_path: Path,
+) -> None:
+    skill_dir = tmp_path / "skills" / "time"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: time\n"
+        "description: timezone helper\n"
+        "---\n"
+        "Use UTC for all timestamps.\n",
+        encoding="utf-8",
+    )
+    registry = SkillRegistry(directory=SkillsDirectory(base_dir=tmp_path / "skills"))
+
+    resolved = registry.resolve_known(
+        ("time", "missing_skill"),
+        strict=False,
+        consumer="tests.unit_tests.skills.test_skill_registry",
+    )
+
+    assert resolved == ("app:time",)
+
+
+def test_registry_from_skill_dirs_keeps_builtin_and_app_variants_for_same_name(
     tmp_path: Path,
 ) -> None:
     builtin_skill_dir = tmp_path / "builtin" / "skills" / "time"
@@ -80,13 +106,19 @@ def test_registry_from_skill_dirs_prefers_project_skill_over_user_skill(
         builtin_skills_dir=tmp_path / "builtin" / "skills",
     )
 
-    skill = registry.get_skill_definition("time")
-    entries = registry.get_instruction_entries(("time",))
+    app_skill = registry.get_skill_definition("app:time")
+    builtin_skill = registry.get_skill_definition("builtin:time")
+    resolved = registry.resolve_known(("time",), strict=False)
+    entries = registry.get_instruction_entries(("app:time", "builtin:time"))
 
-    assert skill is not None
-    assert skill.scope == SkillScope.APP
-    assert skill.metadata.description == "app timezone helper"
-    assert entries[0].description == "app timezone helper"
+    assert app_skill is not None
+    assert app_skill.scope == SkillScope.APP
+    assert app_skill.metadata.description == "app timezone helper"
+    assert builtin_skill is not None
+    assert builtin_skill.scope == SkillScope.BUILTIN
+    assert resolved == ("app:time",)
+    assert entries[0].name == "time (app)"
+    assert entries[1].name == "time (builtin)"
 
 
 def test_registry_from_skill_dirs_loads_user_skill_when_project_skill_missing(
@@ -112,7 +144,7 @@ def test_registry_from_skill_dirs_loads_user_skill_when_project_skill_missing(
 
     assert skill is not None
     assert skill.scope == SkillScope.BUILTIN
-    assert registry.list_names() == ("time",)
+    assert registry.list_names() == ("builtin:time",)
 
 
 def test_registry_from_config_dirs_merges_builtin_and_app_skills(
@@ -122,7 +154,7 @@ def test_registry_from_config_dirs_merges_builtin_and_app_skills(
     app_config_dir = tmp_path / ".agent-teams"
     builtin_skills_dir = tmp_path / "builtin" / "skills"
     monkeypatch.setattr(
-        "agent_teams.skills.discovery.get_builtin_skills_dir_path",
+        "relay_teams.skills.discovery.get_builtin_skills_dir_path",
         lambda: builtin_skills_dir.resolve(),
     )
 
@@ -154,16 +186,20 @@ def test_registry_from_config_dirs_merges_builtin_and_app_skills(
     registry = SkillRegistry.from_config_dirs(app_config_dir=app_config_dir)
 
     skills = registry.list_skill_definitions()
-    shared_skill = registry.get_skill_definition("shared")
-    builtin_only_skill = registry.get_skill_definition("builtin_only")
+    shared_app_skill = registry.get_skill_definition("app:shared")
+    shared_builtin_skill = registry.get_skill_definition("builtin:shared")
+    builtin_only_skill = registry.get_skill_definition("builtin:builtin_only")
 
-    assert tuple(skill.metadata.name for skill in skills) == (
-        "app_only",
-        "builtin_only",
-        "shared",
+    assert tuple(skill.ref for skill in skills) == (
+        "app:app_only",
+        "builtin:builtin_only",
+        "app:shared",
+        "builtin:shared",
     )
-    assert shared_skill is not None
-    assert shared_skill.scope == SkillScope.APP
+    assert shared_app_skill is not None
+    assert shared_app_skill.scope == SkillScope.APP
+    assert shared_builtin_skill is not None
+    assert shared_builtin_skill.scope == SkillScope.BUILTIN
     assert builtin_only_skill is not None
     assert builtin_only_skill.scope == SkillScope.BUILTIN
 
@@ -174,7 +210,7 @@ def test_registry_from_config_dirs_creates_app_skills_directory(
 ) -> None:
     app_config_dir = tmp_path / ".agent-teams"
     monkeypatch.setattr(
-        "agent_teams.skills.discovery.get_builtin_skills_dir_path",
+        "relay_teams.skills.discovery.get_builtin_skills_dir_path",
         lambda: (tmp_path / "builtin" / "skills").resolve(),
     )
 
@@ -184,13 +220,53 @@ def test_registry_from_config_dirs_creates_app_skills_directory(
     assert registry.list_skill_definitions() == ()
 
 
+def test_skills_directory_discover_replaces_skill_cache_atomically(
+    tmp_path: Path,
+) -> None:
+    _write_skill(
+        tmp_path / "skills" / "alpha",
+        name="alpha",
+        description="alpha skill",
+        instructions="Use alpha.",
+    )
+    _write_skill(
+        tmp_path / "skills" / "beta",
+        name="beta",
+        description="beta skill",
+        instructions="Use beta.",
+    )
+    directory = SkillsDirectory(base_dir=tmp_path / "skills")
+    directory.discover()
+    original_load_skill = directory._load_skill
+    load_started = threading.Event()
+    allow_continue = threading.Event()
+
+    def blocking_load_skill(*, path: Path, scope: SkillScope):
+        if path.parent.name == "alpha":
+            load_started.set()
+            assert allow_continue.wait(timeout=5)
+        return original_load_skill(path=path, scope=scope)
+
+    directory._load_skill = blocking_load_skill
+    worker = threading.Thread(target=directory.discover)
+    worker.start()
+    assert load_started.wait(timeout=5)
+
+    refs_during_discover = {skill.ref for skill in directory.list_skills()}
+
+    allow_continue.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert refs_during_discover == {"app:alpha", "app:beta"}
+
+
 def test_registry_loads_builtin_skill_installer_definition(tmp_path: Path) -> None:
     registry = SkillRegistry.from_skill_dirs(
         app_skills_dir=tmp_path / ".agent-teams" / "skills",
         builtin_skills_dir=get_builtin_skills_dir(),
     )
 
-    skill = registry.get_skill_definition("skill-installer")
+    skill = registry.get_skill_definition("builtin:skill-installer")
 
     assert skill is not None
     assert skill.scope == SkillScope.BUILTIN
@@ -201,7 +277,9 @@ def test_registry_loads_builtin_skill_installer_definition(tmp_path: Path) -> No
     )
 
 
-def test_load_skill_returns_manifest_and_absolute_file_paths(tmp_path: Path) -> None:
+def test_load_skill_returns_manifest_and_selected_absolute_file_paths(
+    tmp_path: Path,
+) -> None:
     skill_dir = tmp_path / "skills" / "time"
     resources_dir = skill_dir / "resources"
     scripts_dir = skill_dir / "scripts"
@@ -235,6 +313,7 @@ def test_load_skill_returns_manifest_and_absolute_file_paths(tmp_path: Path) -> 
 
     assert result["ok"] is True
     data = cast(dict[str, JsonValue], result["data"])
+    assert data["ref"] == "app:time"
     assert data["manifest_path"] == manifest_path.resolve().as_posix()
     assert data["manifest_content"] == manifest_content
     assert data["instructions"] == "Use UTC for all timestamps."
@@ -250,6 +329,8 @@ def test_load_skill_returns_manifest_and_absolute_file_paths(tmp_path: Path) -> 
         "description": "Execute trace_context script.",
         "path": script_path.resolve().as_posix(),
     }
+    assert data["files_truncated"] is False
+    assert data["files_omitted_count"] == 0
     assert sorted(cast(list[str], data["files"])) == sorted(
         [
             manifest_path.resolve().as_posix(),
@@ -257,6 +338,185 @@ def test_load_skill_returns_manifest_and_absolute_file_paths(tmp_path: Path) -> 
             usage_path.resolve().as_posix(),
         ]
     )
+
+
+def test_load_skill_prefers_app_scope_for_ambiguous_plain_name(
+    tmp_path: Path,
+) -> None:
+    app_skill_dir = tmp_path / ".agent-teams" / "skills" / "deepresearch"
+    builtin_skill_dir = tmp_path / "builtin" / "skills" / "deepresearch"
+    app_skill_dir.mkdir(parents=True)
+    builtin_skill_dir.mkdir(parents=True)
+    (app_skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: deepresearch\n"
+        "description: app deepresearch\n"
+        "---\n"
+        "Use app deepresearch.\n",
+        encoding="utf-8",
+    )
+    (builtin_skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: deepresearch\n"
+        "description: builtin deepresearch\n"
+        "---\n"
+        "Use builtin deepresearch.\n",
+        encoding="utf-8",
+    )
+    registry = SkillRegistry.from_skill_dirs(
+        app_skills_dir=tmp_path / ".agent-teams" / "skills",
+        builtin_skills_dir=tmp_path / "builtin" / "skills",
+    )
+    ctx = _FakeCtx()
+    ctx.deps.role_registry = RoleRegistry()
+    ctx.deps.role_registry.register(
+        RoleDefinition(
+            role_id="spec_coder",
+            name="Spec Coder",
+            description="Implements requested changes.",
+            version="1",
+            tools=(),
+            skills=("deepresearch",),
+            system_prompt="Implement tasks.",
+        )
+    )
+
+    result = asyncio.run(
+        registry.load_skill(
+            cast(ToolContext, cast(object, ctx)),
+            name="deepresearch",
+        )
+    )
+
+    assert result["ok"] is True
+    data = cast(dict[str, JsonValue], result["data"])
+    assert data["ref"] == "app:deepresearch"
+    assert data["description"] == "app deepresearch"
+    assert data["instructions"] == "Use app deepresearch."
+
+
+def test_load_skill_uses_authorized_builtin_scope_for_ambiguous_plain_name(
+    tmp_path: Path,
+) -> None:
+    app_skill_dir = tmp_path / ".agent-teams" / "skills" / "deepresearch"
+    builtin_skill_dir = tmp_path / "builtin" / "skills" / "deepresearch"
+    app_skill_dir.mkdir(parents=True)
+    builtin_skill_dir.mkdir(parents=True)
+    (app_skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: deepresearch\n"
+        "description: app deepresearch\n"
+        "---\n"
+        "Use app deepresearch.\n",
+        encoding="utf-8",
+    )
+    (builtin_skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: deepresearch\n"
+        "description: builtin deepresearch\n"
+        "---\n"
+        "Use builtin deepresearch.\n",
+        encoding="utf-8",
+    )
+    registry = SkillRegistry.from_skill_dirs(
+        app_skills_dir=tmp_path / ".agent-teams" / "skills",
+        builtin_skills_dir=tmp_path / "builtin" / "skills",
+    )
+    ctx = _FakeCtx()
+    ctx.deps.role_registry = RoleRegistry()
+    ctx.deps.role_registry.register(
+        RoleDefinition(
+            role_id="spec_coder",
+            name="Spec Coder",
+            description="Implements requested changes.",
+            version="1",
+            tools=(),
+            skills=("builtin:deepresearch",),
+            system_prompt="Implement tasks.",
+        )
+    )
+
+    result = asyncio.run(
+        registry.load_skill(
+            cast(ToolContext, cast(object, ctx)),
+            name="deepresearch",
+        )
+    )
+
+    assert result["ok"] is True
+    data = cast(dict[str, JsonValue], result["data"])
+    assert data["ref"] == "builtin:deepresearch"
+    assert data["description"] == "builtin deepresearch"
+    assert data["instructions"] == "Use builtin deepresearch."
+
+
+def test_load_skill_rejects_role_unauthorized_skill(tmp_path: Path) -> None:
+    skill_dir = tmp_path / "skills" / "planner"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: planner\ndescription: planning helper\n---\nPlan the work.\n",
+        encoding="utf-8",
+    )
+    registry = SkillRegistry(directory=SkillsDirectory(base_dir=tmp_path / "skills"))
+
+    result = asyncio.run(
+        registry.load_skill(
+            cast(ToolContext, cast(object, _FakeCtx())),
+            name="planner",
+        )
+    )
+
+    assert result["ok"] is False
+    error = cast(dict[str, JsonValue], result["error"])
+    assert (
+        error["message"] == "Role spec_coder is not authorized to load skill: planner"
+    )
+
+
+def test_load_skill_omits_large_dependency_trees_from_file_listing(
+    tmp_path: Path,
+) -> None:
+    skill_dir = tmp_path / "skills" / "deck"
+    docs_dir = skill_dir / "docs"
+    node_modules_dir = skill_dir / "node_modules" / "pkg"
+    docs_dir.mkdir(parents=True)
+    node_modules_dir.mkdir(parents=True)
+    manifest_path = skill_dir / "SKILL.md"
+    manifest_path.write_text(
+        "---\n"
+        "name: deck\n"
+        "description: build slide decks\n"
+        "---\n"
+        "Use the planner and designer workflow.\n",
+        encoding="utf-8",
+    )
+    bundled_dependency = node_modules_dir / "index.js"
+    bundled_dependency.write_text("export const bundled = true;\n", encoding="utf-8")
+    for index in range(240):
+        (docs_dir / f"section_{index:03}.md").write_text(
+            f"Section {index}\n",
+            encoding="utf-8",
+        )
+
+    registry = SkillRegistry(directory=SkillsDirectory(base_dir=tmp_path / "skills"))
+
+    result = asyncio.run(
+        registry.load_skill(
+            cast(ToolContext, cast(object, _FakeCtx())),
+            name="deck",
+        )
+    )
+
+    assert result["ok"] is True
+    data = cast(dict[str, JsonValue], result["data"])
+    assert data["ref"] == "app:deck"
+    files = cast(list[str], data["files"])
+    assert manifest_path.resolve().as_posix() in files
+    assert bundled_dependency.resolve().as_posix() not in files
+    assert all("node_modules" not in path for path in files)
+    assert data["files_truncated"] is True
+    assert cast(int, data["files_omitted_count"]) > 0
+    assert len(files) < 241
 
 
 def _write_skill(
@@ -267,6 +527,28 @@ def _write_skill(
         f"---\nname: {name}\ndescription: {description}\n---\n{instructions}\n",
         encoding="utf-8",
     )
+
+
+def test_validate_known_rejects_ambiguous_plain_name(tmp_path: Path) -> None:
+    builtin_skill_dir = tmp_path / "builtin" / "skills" / "time"
+    app_skill_dir = tmp_path / ".agent-teams" / "skills" / "time"
+    builtin_skill_dir.mkdir(parents=True)
+    app_skill_dir.mkdir(parents=True)
+    (builtin_skill_dir / "SKILL.md").write_text(
+        "---\nname: time\ndescription: builtin timezone helper\n---\nUse builtin.\n",
+        encoding="utf-8",
+    )
+    (app_skill_dir / "SKILL.md").write_text(
+        "---\nname: time\ndescription: app timezone helper\n---\nUse app.\n",
+        encoding="utf-8",
+    )
+    registry = SkillRegistry.from_skill_dirs(
+        app_skills_dir=tmp_path / ".agent-teams" / "skills",
+        builtin_skills_dir=tmp_path / "builtin" / "skills",
+    )
+
+    with pytest.raises(ValueError, match="Ambiguous skills require canonical refs"):
+        registry.validate_known(("time",))
 
 
 class _FakeRunEventHub:
@@ -334,9 +616,11 @@ class _FakeDeps:
                 description="Implements requested changes.",
                 version="1",
                 tools=(),
+                skills=("time", "deck"),
                 system_prompt="Implement tasks.",
             )
         )
+        self.runtime_role_resolver = None
         self.run_event_hub = _FakeRunEventHub()
         self.run_control_manager = _FakeRunControlManager()
         self.tool_approval_manager = _FakeApprovalManager()

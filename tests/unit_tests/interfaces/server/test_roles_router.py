@@ -4,18 +4,20 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from agent_teams.external_agents import ExternalAgentOption, ExternalAgentTransportType
-from agent_teams.interfaces.server.deps import (
+from relay_teams.computer import ExecutionSurface
+from relay_teams.external_agents import ExternalAgentOption, ExternalAgentTransportType
+from relay_teams.interfaces.server.deps import (
     get_external_agent_config_service,
     get_mcp_service,
     get_role_registry,
     get_role_settings_service,
+    get_skills_config_reload_service,
     get_skill_registry,
     get_tool_registry,
 )
-from agent_teams.interfaces.server.routers import roles
-from agent_teams.mcp.mcp_models import McpConfigScope, McpServerSummary
-from agent_teams.roles import (
+from relay_teams.interfaces.server.routers import roles
+from relay_teams.mcp.mcp_models import McpConfigScope, McpServerSummary
+from relay_teams.roles import (
     NormalModeRoleOption,
     RoleConfigSource,
     RoleAgentOption,
@@ -24,12 +26,17 @@ from agent_teams.roles import (
     RoleDocumentRecord,
     RoleDocumentSummary,
     RoleRegistry,
+    RoleSkillOption,
+    SystemRolesUnavailableError,
     RoleValidationResult,
 )
-from agent_teams.roles import default_memory_profile
+from relay_teams.skills.skill_models import SkillOptionEntry, SkillScope
+from relay_teams.roles import default_memory_profile
 
 
 class _FakeRoleSettingsService:
+    validate_all_error: Exception | None = None
+
     def list_role_documents(self) -> tuple[RoleDocumentSummary, ...]:
         return (
             RoleDocumentSummary(
@@ -39,6 +46,7 @@ class _FakeRoleSettingsService:
                 version="1.0.0",
                 model_profile="default",
                 source=RoleConfigSource.APP,
+                deletable=True,
             ),
         )
 
@@ -78,7 +86,15 @@ class _FakeRoleSettingsService:
         return RoleValidationResult(valid=True, role=self.get_role_document("writer"))
 
     def validate_all_roles(self) -> dict[str, int | bool]:
+        if self.validate_all_error is not None:
+            raise self.validate_all_error
         return {"valid": True, "loaded_count": 1}
+
+    def delete_role_document(self, role_id: str) -> None:
+        if role_id == "missing":
+            raise ValueError("Role not found: missing")
+        if role_id != "writer":
+            raise ValueError(f"Role cannot be deleted: {role_id}")
 
 
 class _FakeToolRegistry:
@@ -101,8 +117,37 @@ class _FakeMcpService:
 
 
 class _FakeSkillRegistry:
-    def list_names(self) -> tuple[str, ...]:
-        return ("diff", "time")
+    def __init__(
+        self,
+        options: tuple[SkillOptionEntry, ...] | None = None,
+    ) -> None:
+        self._options = options or (
+            SkillOptionEntry(
+                ref="builtin:diff",
+                name="diff",
+                description="Inspect file changes.",
+                scope=SkillScope.BUILTIN,
+            ),
+            SkillOptionEntry(
+                ref="app:time",
+                name="time",
+                description="Read the current time.",
+                scope=SkillScope.APP,
+            ),
+        )
+
+    def list_skill_options(self) -> tuple[SkillOptionEntry, ...]:
+        return self._options
+
+
+class _FakeSkillsReloadService:
+    def __init__(self, registry: _FakeSkillRegistry | None = None) -> None:
+        self._registry = registry or _FakeSkillRegistry()
+        self.reload_calls = 0
+
+    def reload_skills_config(self) -> _FakeSkillRegistry:
+        self.reload_calls += 1
+        return self._registry
 
 
 class _FakeExternalAgentService:
@@ -116,50 +161,63 @@ class _FakeExternalAgentService:
         )
 
 
-def _create_test_client() -> TestClient:
+def _create_test_client(
+    *,
+    registry: RoleRegistry | None = None,
+    service: _FakeRoleSettingsService | None = None,
+    skill_registry: _FakeSkillRegistry | None = None,
+    skills_reload_service: _FakeSkillsReloadService | None = None,
+) -> TestClient:
     app = FastAPI()
     app.include_router(roles.router, prefix="/api")
-    registry = RoleRegistry()
-    registry.register(
-        RoleDefinition(
-            role_id="Coordinator",
-            name="Coordinator",
-            description="Coordinates the run.",
-            version="1.0.0",
-            tools=("dispatch_task",),
-            model_profile="default",
-            system_prompt="Coordinate the run.",
+    resolved_registry = registry or RoleRegistry()
+    if registry is None:
+        resolved_registry.register(
+            RoleDefinition(
+                role_id="Coordinator",
+                name="Coordinator",
+                description="Coordinates the run.",
+                version="1.0.0",
+                tools=("dispatch_task",),
+                model_profile="default",
+                system_prompt="Coordinate the run.",
+            )
         )
-    )
-    registry.register(
-        RoleDefinition(
-            role_id="MainAgent",
-            name="Main Agent",
-            description="Executes normal-mode runs.",
-            version="1.0.0",
-            tools=("dispatch_task",),
-            model_profile="default",
-            system_prompt="Handle the run directly.",
+        resolved_registry.register(
+            RoleDefinition(
+                role_id="MainAgent",
+                name="Main Agent",
+                description="Executes normal-mode runs.",
+                version="1.0.0",
+                tools=("dispatch_task",),
+                model_profile="default",
+                system_prompt="Handle the run directly.",
+            )
         )
-    )
-    registry.register(
-        RoleDefinition(
-            role_id="writer",
-            name="Writer",
-            description="Drafts user-facing content.",
-            version="1.0.0",
-            tools=("dispatch_task",),
-            model_profile="default",
-            system_prompt="Write clearly.",
+        resolved_registry.register(
+            RoleDefinition(
+                role_id="writer",
+                name="Writer",
+                description="Drafts user-facing content.",
+                version="1.0.0",
+                tools=("dispatch_task",),
+                model_profile="default",
+                system_prompt="Write clearly.",
+            )
         )
+    resolved_service = service or _FakeRoleSettingsService()
+    resolved_skill_registry = skill_registry or _FakeSkillRegistry()
+    resolved_skills_reload_service = skills_reload_service or _FakeSkillsReloadService(
+        resolved_skill_registry
     )
-    app.dependency_overrides[get_role_registry] = lambda: registry
-    app.dependency_overrides[get_role_settings_service] = lambda: (
-        _FakeRoleSettingsService()
-    )
+    app.dependency_overrides[get_role_registry] = lambda: resolved_registry
+    app.dependency_overrides[get_role_settings_service] = lambda: resolved_service
     app.dependency_overrides[get_tool_registry] = lambda: _FakeToolRegistry()
     app.dependency_overrides[get_mcp_service] = lambda: _FakeMcpService()
-    app.dependency_overrides[get_skill_registry] = lambda: _FakeSkillRegistry()
+    app.dependency_overrides[get_skill_registry] = lambda: resolved_skill_registry
+    app.dependency_overrides[get_skills_config_reload_service] = lambda: (
+        resolved_skills_reload_service
+    )
     app.dependency_overrides[get_external_agent_config_service] = lambda: (
         _FakeExternalAgentService()
     )
@@ -180,7 +238,9 @@ def test_list_role_configs() -> None:
             "description": "Drafts user-facing content.",
             "version": "1.0.0",
             "model_profile": "default",
+            "execution_surface": "api",
             "source": "app",
+            "deletable": True,
         }
     ]
 
@@ -194,6 +254,7 @@ def test_get_role_config() -> None:
     payload = response.json()
     assert payload["role_id"] == "writer"
     assert payload["file_name"] == "writer.md"
+    assert payload["execution_surface"] == "api"
 
 
 def test_validate_role_config() -> None:
@@ -221,6 +282,67 @@ def test_validate_role_config() -> None:
     assert payload["role"]["role_id"] == "writer"
 
 
+def test_get_role_config_options_returns_503_when_system_roles_are_missing() -> None:
+    registry = RoleRegistry()
+    registry.register(
+        RoleDefinition(
+            role_id="writer",
+            name="Writer",
+            description="Drafts user-facing content.",
+            version="1.0.0",
+            tools=("dispatch_task",),
+            model_profile="default",
+            system_prompt="Write clearly.",
+        )
+    )
+    client = _create_test_client(registry=registry)
+
+    response = client.get("/api/roles:options")
+
+    assert response.status_code == 503
+    assert "Required system roles are unavailable" in response.json()["detail"]
+
+
+def test_validate_roles_returns_503_when_system_roles_are_missing() -> None:
+    service = _FakeRoleSettingsService()
+    service.validate_all_error = SystemRolesUnavailableError(
+        "Required system roles are unavailable: main_agent: missing"
+    )
+    client = _create_test_client(service=service)
+
+    response = client.post("/api/roles:validate")
+
+    assert response.status_code == 503
+    assert "Required system roles are unavailable" in response.json()["detail"]
+
+
+def test_delete_role_config() -> None:
+    client = _create_test_client()
+
+    response = client.delete("/api/roles/configs/writer")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_delete_role_config_returns_not_found() -> None:
+    client = _create_test_client()
+
+    response = client.delete("/api/roles/configs/missing")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Role not found: missing"}
+
+
+def test_delete_role_config_rejects_builtin_role() -> None:
+    client = _create_test_client()
+
+    response = client.delete("/api/roles/configs/MainAgent")
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Role cannot be deleted: MainAgent"}
+
+
 def test_get_role_config_options() -> None:
     client = _create_test_client()
 
@@ -244,7 +366,20 @@ def test_get_role_config_options() -> None:
         ),
         tools=("create_tasks", "dispatch_task"),
         mcp_servers=("docs",),
-        skills=("diff", "time"),
+        skills=(
+            RoleSkillOption(
+                ref="builtin:diff",
+                name="diff",
+                description="Inspect file changes.",
+                scope=SkillScope.BUILTIN,
+            ),
+            RoleSkillOption(
+                ref="app:time",
+                name="time",
+                description="Read the current time.",
+                scope=SkillScope.APP,
+            ),
+        ),
         agents=(
             RoleAgentOption(
                 agent_id="codex",
@@ -252,4 +387,125 @@ def test_get_role_config_options() -> None:
                 transport="stdio",
             ),
         ),
+        execution_surfaces=tuple(surface for surface in ExecutionSurface),
     ).model_dump(mode="json")
+
+
+def test_get_role_config_options_reloads_missing_builtin_skills() -> None:
+    registry = RoleRegistry()
+    registry.register(
+        RoleDefinition(
+            role_id="Coordinator",
+            name="Coordinator",
+            description="Coordinates the run.",
+            version="1.0.0",
+            tools=("dispatch_task",),
+            model_profile="default",
+            system_prompt="Coordinate the run.",
+        )
+    )
+    registry.register(
+        RoleDefinition(
+            role_id="MainAgent",
+            name="Main Agent",
+            description="Executes normal-mode runs.",
+            version="1.0.0",
+            tools=("dispatch_task",),
+            skills=("builtin:skill-installer",),
+            model_profile="default",
+            system_prompt="Handle the run directly.",
+        )
+    )
+    skill_registry = _FakeSkillRegistry(
+        (
+            SkillOptionEntry(
+                ref="app:time",
+                name="time",
+                description="Read the current time.",
+                scope=SkillScope.APP,
+            ),
+        )
+    )
+    reloaded_registry = _FakeSkillRegistry(
+        (
+            SkillOptionEntry(
+                ref="builtin:skill-installer",
+                name="skill-installer",
+                description="Install skills.",
+                scope=SkillScope.BUILTIN,
+            ),
+        )
+    )
+    reload_service = _FakeSkillsReloadService(reloaded_registry)
+    client = _create_test_client(
+        registry=registry,
+        skill_registry=skill_registry,
+        skills_reload_service=reload_service,
+    )
+
+    response = client.get("/api/roles:options")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["skills"] == [
+        {
+            "ref": "builtin:skill-installer",
+            "name": "skill-installer",
+            "description": "Install skills.",
+            "scope": "builtin",
+        }
+    ]
+    assert reload_service.reload_calls == 1
+
+
+def test_get_role_config_options_returns_503_when_builtin_skills_still_missing() -> (
+    None
+):
+    registry = RoleRegistry()
+    registry.register(
+        RoleDefinition(
+            role_id="Coordinator",
+            name="Coordinator",
+            description="Coordinates the run.",
+            version="1.0.0",
+            tools=("dispatch_task",),
+            model_profile="default",
+            system_prompt="Coordinate the run.",
+        )
+    )
+    registry.register(
+        RoleDefinition(
+            role_id="MainAgent",
+            name="Main Agent",
+            description="Executes normal-mode runs.",
+            version="1.0.0",
+            tools=("dispatch_task",),
+            skills=("builtin:skill-installer",),
+            model_profile="default",
+            system_prompt="Handle the run directly.",
+        )
+    )
+    skill_registry = _FakeSkillRegistry(
+        (
+            SkillOptionEntry(
+                ref="app:time",
+                name="time",
+                description="Read the current time.",
+                scope=SkillScope.APP,
+            ),
+        )
+    )
+    reload_service = _FakeSkillsReloadService(skill_registry)
+    client = _create_test_client(
+        registry=registry,
+        skill_registry=skill_registry,
+        skills_reload_service=reload_service,
+    )
+
+    response = client.get("/api/roles:options")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": "Builtin skills are unavailable: ['builtin:skill-installer']"
+    }
+    assert reload_service.reload_calls == 1

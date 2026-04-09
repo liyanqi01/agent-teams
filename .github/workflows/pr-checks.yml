@@ -1,0 +1,67 @@
+name: PR Checks
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  agents-self-check:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Require linked issue for PRs into main
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+          GITHUB_API_URL: ${{ github.api_url }}
+        run: python src/relay_teams/release/pull_request_issue_link.py
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Install dev dependencies
+        run: uv sync --extra dev --no-default-groups
+
+      - name: Ruff check --fix
+        run: uv run --extra dev ruff check --fix
+
+      - name: Ruff format
+        run: uv run --extra dev ruff format --no-cache --force-exclude
+
+      - name: basedpyright
+        run: uv run --extra dev basedpyright
+
+      - name: Unit tests
+        run: uv run --extra dev pytest -q tests/unit_tests
+
+      - name: Install Playwright Chromium
+        run: uv run --extra dev python -m playwright install --with-deps chromium
+
+      - name: Integration tests
+        run: uv run --extra dev pytest -q tests/integration_tests
+
+      - name: Verify repository is unchanged after checks
+        run: git diff --exit-code

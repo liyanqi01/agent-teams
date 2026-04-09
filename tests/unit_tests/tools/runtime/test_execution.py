@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import json
 from pydantic import JsonValue
 
 import asyncio
@@ -10,29 +11,32 @@ from pathlib import Path
 from tempfile import mkdtemp
 from typing import cast
 
-from agent_teams.persistence.shared_state_repo import SharedStateRepository
-from agent_teams.notifications import NotificationService, default_notification_config
-from agent_teams.roles.role_models import RoleDefinition
-from agent_teams.roles.role_registry import RoleRegistry
-from agent_teams.sessions.runs.enums import RunEventType
-from agent_teams.sessions.runs.event_stream import RunEventHub
+from relay_teams.persistence.shared_state_repo import SharedStateRepository
+from relay_teams.persistence.scope_models import ScopeRef, ScopeType, StateMutation
+from relay_teams.notifications import NotificationService, default_notification_config
+from relay_teams.roles.role_models import RoleDefinition
+from relay_teams.roles.role_registry import RoleRegistry
+from relay_teams.sessions.runs.enums import RunEventType
+from relay_teams.sessions.runs.event_stream import RunEventHub
 
-from agent_teams.tools.runtime.approval_ticket_repo import (
+from relay_teams.tools.runtime.approval_ticket_repo import (
     ApprovalTicketRepository,
     ApprovalTicketStatus,
 )
-from agent_teams.sessions.runs.run_runtime_repo import (
+from relay_teams.sessions.runs.run_runtime_repo import (
     RunRuntimePhase,
     RunRuntimeRepository,
     RunRuntimeStatus,
 )
-from agent_teams.tools.runtime import (
+from relay_teams.tools.runtime import (
     ToolApprovalPolicy,
     ToolContext,
+    ToolExecutionError,
     ToolResultProjection,
     execute_tool,
 )
-from agent_teams.tools.runtime.persisted_state import load_tool_call_state
+from relay_teams.tools.runtime.persisted_state import load_tool_call_state
+from relay_teams.tools.runtime.persisted_state import ToolApprovalMode
 
 
 class _FakeRunEventHub:
@@ -185,7 +189,13 @@ def test_execute_tool_returns_standard_envelope() -> None:
     assert record["tool"] == "read"
     assert cast(dict[str, JsonValue], record["visible_result"]) == result
     runtime_meta = cast(dict[str, JsonValue], record["runtime_meta"])
+    assert state.run_id == deps.run_id
+    assert state.session_id == deps.session_id
+    assert state.run_yolo is False
+    assert state.approval_mode == ToolApprovalMode.POLICY_EXEMPT
     assert runtime_meta["approval_required"] is False
+    assert runtime_meta["run_yolo"] is False
+    assert runtime_meta["approval_mode"] == "policy_exempt"
     assert runtime is not None
     assert runtime.status == RunRuntimeStatus.RUNNING
     assert runtime.phase == RunRuntimePhase.SUBAGENT_RUNNING
@@ -205,8 +215,10 @@ def test_execute_tool_skips_approval_flow_when_yolo_enabled() -> None:
     result = asyncio.run(
         execute_tool(
             cast(ToolContext, cast(object, ctx)),
-            tool_name="shell",
-            args_summary={"command": "pwd"},
+            tool_name="webfetch",
+            args_summary={"url": "https://example.com/docs"},
+            approval_args_summary={"host": "example.com"},
+            keep_approval_ticket_reusable=True,
             action=lambda: {"stdout": "/tmp"},
         )
     )
@@ -224,8 +236,12 @@ def test_execute_tool_skips_approval_flow_when_yolo_enabled() -> None:
         dict[str, JsonValue],
         cast(dict[str, JsonValue], state.result_envelope)["runtime_meta"],
     )
+    assert state.run_yolo is True
+    assert state.approval_mode == ToolApprovalMode.YOLO
     assert runtime_meta["approval_required"] is False
     assert runtime_meta["approval_status"] == "not_required"
+    assert runtime_meta["run_yolo"] is True
+    assert runtime_meta["approval_mode"] == "yolo"
     assert deps.approval_ticket_repo.get("call-model-yolo") is None
     assert manager.last_open is None
     assert not any(
@@ -265,8 +281,12 @@ def test_execute_tool_returns_denied_error_when_approval_rejected() -> None:
         dict[str, JsonValue],
         cast(dict[str, JsonValue], state.result_envelope)["runtime_meta"],
     )
+    assert state.run_yolo is False
+    assert state.approval_mode == ToolApprovalMode.APPROVAL_FLOW
     assert runtime_meta["approval_required"] is True
     assert runtime_meta["approval_status"] == "deny"
+    assert runtime_meta["run_yolo"] is False
+    assert runtime_meta["approval_mode"] == "approval_flow"
     assert any(
         event.event_type == RunEventType.TOOL_APPROVAL_REQUESTED
         for event in deps.run_event_hub.events
@@ -314,9 +334,75 @@ def test_execute_tool_returns_timeout_error_when_approval_times_out() -> None:
         dict[str, JsonValue],
         cast(dict[str, JsonValue], state.result_envelope)["runtime_meta"],
     )
+    assert state.approval_mode == ToolApprovalMode.APPROVAL_FLOW
     assert runtime_meta["approval_status"] == "timeout"
+    assert runtime_meta["approval_mode"] == "approval_flow"
     assert ticket is not None
     assert ticket.status == ApprovalTicketStatus.TIMED_OUT
+
+
+def test_execute_tool_preserves_custom_tool_error_details() -> None:
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("approve", "")),
+        policy=_FakePolicy(needs_approval=False),
+    )
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-webfetch-error"
+
+    result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="webfetch",
+            args_summary={"url": "https://example.com"},
+            action=lambda: _raise_tool_execution_error(),
+        )
+    )
+
+    error = cast(dict[str, JsonValue], result["error"])
+    meta = cast(dict[str, JsonValue], result["meta"])
+    assert result["ok"] is False
+    assert error["type"] == "source_access_denied"
+    assert error["retryable"] is False
+    assert cast(dict[str, JsonValue], error["details"]) == {
+        "url_host": "example.com",
+        "status_code": 403,
+    }
+    assert cast(dict[str, JsonValue], meta["error_details"]) == {
+        "url_host": "example.com",
+        "status_code": 403,
+    }
+
+
+def test_execute_tool_marks_value_error_as_non_retryable() -> None:
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("approve", "")),
+        policy=_FakePolicy(needs_approval=False),
+    )
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-validation-error-1"
+
+    result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="write",
+            args_summary={"path": "notes.txt"},
+            action=lambda: (_ for _ in ()).throw(ValueError("missing path")),
+        )
+    )
+
+    error = cast(dict[str, JsonValue], result["error"])
+    assert result["ok"] is False
+    assert error["type"] == "validation_error"
+    assert error["retryable"] is False
+
+
+def _raise_tool_execution_error() -> object:
+    raise ToolExecutionError(
+        error_type="source_access_denied",
+        message="Web fetch failed for example.com with HTTP 403",
+        retryable=False,
+        details={"url_host": "example.com", "status_code": 403},
+    )
 
 
 def test_execute_tool_approval_uses_model_tool_call_id_when_present() -> None:
@@ -387,6 +473,73 @@ def test_execute_tool_reuses_approved_ticket_without_reopening_request() -> None
     assert ticket.status == ApprovalTicketStatus.COMPLETED
 
 
+def test_execute_tool_reuses_host_scoped_approval_identity_after_success() -> None:
+    manager = _FakeApprovalManager(wait_result=("approve", ""))
+    deps = _FakeDeps(
+        manager=manager,
+        policy=_FakePolicy(needs_approval=True),
+    )
+    first_ctx = _FakeCtx(deps)
+    first_ctx.tool_call_id = "call-webfetch-1"
+    first_result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, first_ctx)),
+            tool_name="webfetch",
+            args_summary={"url": "https://example.com/docs/start"},
+            approval_args_summary={"host": "example.com"},
+            keep_approval_ticket_reusable=True,
+            action=lambda: "first",
+        )
+    )
+
+    first_state = load_tool_call_state(
+        shared_store=deps.shared_store,
+        task_id=deps.task_id,
+        tool_call_id="call-webfetch-1",
+    )
+    first_ticket = deps.approval_ticket_repo.get("call-webfetch-1")
+    assert first_result["ok"] is True
+    assert first_state is not None
+    assert first_state.args_preview == '{"url": "https://example.com/docs/start"}'
+    assert first_ticket is not None
+    assert first_ticket.status == ApprovalTicketStatus.APPROVED
+
+    manager.last_open = None
+    second_ctx = _FakeCtx(deps)
+    second_ctx.tool_call_id = "call-webfetch-2"
+    second_result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, second_ctx)),
+            tool_name="webfetch",
+            args_summary={"url": "https://example.com/docs/next"},
+            approval_args_summary={"host": "example.com"},
+            keep_approval_ticket_reusable=True,
+            action=lambda: "second",
+        )
+    )
+
+    second_state = load_tool_call_state(
+        shared_store=deps.shared_store,
+        task_id=deps.task_id,
+        tool_call_id="call-webfetch-2",
+    )
+    assert second_result["ok"] is True
+    assert second_result["data"] == "second"
+    assert second_state is not None
+    assert second_state.args_preview == '{"url": "https://example.com/docs/next"}'
+    assert manager.last_open is None
+    assert (
+        len(
+            [
+                event
+                for event in deps.run_event_hub.events
+                if event.event_type == RunEventType.TOOL_APPROVAL_REQUESTED
+            ]
+        )
+        == 1
+    )
+
+
 def test_execute_tool_republishes_requested_ticket_when_reopened() -> None:
     manager = _FakeApprovalManager(wait_result=("approve", ""))
     deps = _FakeDeps(
@@ -455,18 +608,61 @@ def test_execute_tool_supports_projection_with_separate_visible_and_internal_dat
         tool_call_id="call-projection-1",
     )
 
-    assert result == {
-        "ok": True,
-        "data": {"output": "/tmp", "exit_code": 0},
-        "error": None,
-    }
+    assert result["ok"] is True
+    assert result["data"] == {"output": "/tmp", "exit_code": 0}
+    assert result["error"] is None
+    meta = cast(dict[str, JsonValue], result["meta"])
+    assert meta["approval_required"] is False
+    assert meta["approval_status"] == "not_required"
+    assert meta["approval_mode"] == "policy_exempt"
+    duration_ms = cast(int, meta["duration_ms"])
+    assert duration_ms >= 0
     assert state is not None
     assert state.result_envelope is not None
+    assert state.approval_mode == ToolApprovalMode.POLICY_EXEMPT
     internal_data = cast(
         dict[str, JsonValue],
         cast(dict[str, JsonValue], state.result_envelope)["internal_data"],
     )
     assert internal_data["stdout"] == "/tmp\n"
+
+
+def test_load_tool_call_state_tolerates_legacy_rows_without_yolo_fields() -> None:
+    shared_store = SharedStateRepository(Path(mkdtemp()) / "legacy-state.db")
+    shared_store.manage_state(
+        StateMutation(
+            scope=ScopeRef(scope_type=ScopeType.TASK, scope_id="task-legacy"),
+            key="tool_call_state:call-legacy",
+            value_json=json.dumps(
+                {
+                    "tool_call_id": "call-legacy",
+                    "tool_name": "websearch",
+                    "instance_id": "inst-legacy",
+                    "role_id": "spec_coder",
+                    "args_preview": '{"query":"legacy"}',
+                    "approval_status": "not_required",
+                    "approval_feedback": "",
+                    "execution_status": "completed",
+                    "result_envelope": None,
+                    "call_state": {},
+                    "created_at": "2026-03-31T00:00:00+00:00",
+                    "updated_at": "2026-03-31T00:00:00+00:00",
+                }
+            ),
+        )
+    )
+
+    state = load_tool_call_state(
+        shared_store=shared_store,
+        task_id="task-legacy",
+        tool_call_id="call-legacy",
+    )
+
+    assert state is not None
+    assert state.run_id == ""
+    assert state.session_id == ""
+    assert state.run_yolo is False
+    assert state.approval_mode == ToolApprovalMode.UNKNOWN
 
 
 def test_execute_tool_marks_sqlite_lock_error_as_retryable() -> None:

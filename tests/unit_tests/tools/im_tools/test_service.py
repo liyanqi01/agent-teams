@@ -5,15 +5,19 @@ from pathlib import Path
 
 import pytest
 
-from agent_teams.automation import (
+from relay_teams.automation import (
     AutomationFeishuBinding,
     AutomationProjectRecord,
     AutomationProjectStatus,
+    AutomationRunDeliveryRecord,
     AutomationRunConfig,
     AutomationScheduleMode,
+    AutomationDeliveryStatus,
 )
-from agent_teams.gateway.feishu.models import (
+from relay_teams.gateway.feishu.models import (
     FEISHU_METADATA_CHAT_ID_KEY,
+    FEISHU_METADATA_CHAT_TYPE_KEY,
+    FEISHU_METADATA_MESSAGE_ID_KEY,
     FEISHU_METADATA_PLATFORM_KEY,
     FEISHU_METADATA_TRIGGER_ID_KEY,
     FeishuEnvironment,
@@ -21,14 +25,19 @@ from agent_teams.gateway.feishu.models import (
     FeishuTriggerSourceConfig,
     FeishuTriggerTargetConfig,
 )
-from agent_teams.gateway import (
+from relay_teams.gateway import (
     GatewayChannelType,
     GatewaySessionRecord,
 )
-from agent_teams.sessions.session_models import ProjectKind, SessionRecord
-from agent_teams.gateway.im import ImToolContextResolver, ImToolService
-from agent_teams.tools.registry import ToolResolutionContext
-from agent_teams.gateway.wechat.models import WeChatAccountRecord
+from relay_teams.media import content_parts_from_text
+from relay_teams.sessions.runs.run_models import (
+    IntentInput,
+    RuntimePromptConversationContext,
+)
+from relay_teams.sessions.session_models import ProjectKind, SessionRecord
+from relay_teams.gateway.im import ImToolContextResolver, ImToolService
+from relay_teams.tools.registry import ToolResolutionContext
+from relay_teams.gateway.wechat.models import WeChatAccountRecord
 
 
 _ENV = FeishuEnvironment(
@@ -55,6 +64,8 @@ def _make_session(
     platform: str = "feishu",
     chat_id: str = _CHAT_ID,
     trigger_id: str = _TRIGGER_ID,
+    chat_type: str = "group",
+    message_id: str = "om_1",
     project_kind: ProjectKind = ProjectKind.WORKSPACE,
     project_id: str | None = None,
 ) -> SessionRecord:
@@ -66,7 +77,9 @@ def _make_session(
         metadata={
             FEISHU_METADATA_PLATFORM_KEY: platform,
             FEISHU_METADATA_CHAT_ID_KEY: chat_id,
+            FEISHU_METADATA_CHAT_TYPE_KEY: chat_type,
             FEISHU_METADATA_TRIGGER_ID_KEY: trigger_id,
+            FEISHU_METADATA_MESSAGE_ID_KEY: message_id,
         },
     )
 
@@ -122,9 +135,32 @@ class _FakeGatewaySessionLookup:
         return self._sessions.get(internal_session_id)
 
 
+class _FakeRunIntentLookup:
+    def __init__(self, intents: dict[str, IntentInput] | None = None) -> None:
+        self._intents = intents or {}
+
+    def get(self, run_id: str) -> IntentInput:
+        if run_id not in self._intents:
+            raise KeyError(run_id)
+        return self._intents[run_id]
+
+
+class _FakeAutomationDeliveryLookup:
+    def __init__(
+        self, deliveries: dict[str, AutomationRunDeliveryRecord] | None = None
+    ):
+        self._deliveries = deliveries or {}
+
+    def get_by_run_id(self, run_id: str) -> AutomationRunDeliveryRecord:
+        if run_id not in self._deliveries:
+            raise KeyError(run_id)
+        return self._deliveries[run_id]
+
+
 class _FakeFeishuClient:
     def __init__(self) -> None:
         self.sent_texts: list[tuple[str, str]] = []
+        self.reply_texts: list[tuple[str, str]] = []
         self.sent_files: list[tuple[str, Path]] = []
 
     def send_text_message(
@@ -133,9 +169,21 @@ class _FakeFeishuClient:
         chat_id: str,
         text: str,
         environment: FeishuEnvironment | None = None,
-    ) -> None:
+    ) -> str:
         _ = environment
         self.sent_texts.append((chat_id, text))
+        return f"om_{len(self.sent_texts)}"
+
+    def reply_text_message(
+        self,
+        *,
+        message_id: str,
+        text: str,
+        environment: FeishuEnvironment | None = None,
+    ) -> str:
+        _ = environment
+        self.reply_texts.append((message_id, text))
+        return f"om_reply_{len(self.reply_texts)}"
 
     def send_file(
         self,
@@ -213,7 +261,9 @@ def _build_service(
     sessions: dict[str, SessionRecord] | None = None,
     configs: dict[str, FeishuTriggerRuntimeConfig] | None = None,
     projects: dict[str, AutomationProjectRecord] | None = None,
+    deliveries: dict[str, AutomationRunDeliveryRecord] | None = None,
     gateway_sessions: dict[str, GatewaySessionRecord] | None = None,
+    run_intents: dict[str, IntentInput] | None = None,
     wechat_token: str | None = "wechat-token",
     feishu_client: _FakeFeishuClient | None = None,
     wechat_client: _FakeWeChatClient | None = None,
@@ -224,7 +274,9 @@ def _build_service(
         config_dir=Path("C:/config"),
         session_repo=_FakeSessionRepo(sessions),
         runtime_config_lookup=_FakeRuntimeConfigLookup(configs),
+        run_intent_lookup=_FakeRunIntentLookup(run_intents),
         automation_project_repo=_FakeAutomationProjectRepo(projects),
+        automation_delivery_lookup=_FakeAutomationDeliveryLookup(deliveries),
         gateway_session_lookup=_FakeGatewaySessionLookup(gateway_sessions),
         feishu_client=resolved_feishu_client,
         wechat_account_repo=_FakeWeChatAccountRepo(),
@@ -304,6 +356,33 @@ def _automation_project(
             source_label="Release Updates",
         ),
         trigger_id="schedule-trigger",
+    )
+
+
+def _automation_delivery(
+    *,
+    run_id: str = "run-1",
+    reply_to_message_id: str | None = None,
+    started_message_id: str | None = None,
+) -> AutomationRunDeliveryRecord:
+    return AutomationRunDeliveryRecord(
+        automation_delivery_id=f"autd-{run_id}",
+        automation_project_id=_AUTOMATION_PROJECT_ID,
+        automation_project_name="Daily Briefing",
+        run_id=run_id,
+        session_id=_SESSION_ID,
+        reason="schedule",
+        binding=AutomationFeishuBinding(
+            trigger_id=_TRIGGER_ID,
+            tenant_key="tenant-1",
+            chat_id=_CHAT_ID,
+            chat_type="group",
+            source_label="Release Updates",
+        ),
+        reply_to_message_id=reply_to_message_id,
+        started_message_id=started_message_id,
+        started_status=AutomationDeliveryStatus.SENT,
+        terminal_status=AutomationDeliveryStatus.PENDING,
     )
 
 
@@ -406,7 +485,53 @@ def test_send_text_success_for_feishu() -> None:
     result = service.send_text(session_id=_SESSION_ID, text="hello")
 
     assert result == "Message sent."
+    assert feishu_client.sent_texts == []
+    assert feishu_client.reply_texts == [("om_1", "hello")]
+    assert wechat_client.sent_texts == []
+
+
+def test_send_text_success_for_feishu_p2p_uses_reply() -> None:
+    service, feishu_client, wechat_client = _build_service(
+        sessions={
+            _SESSION_ID: _make_session(
+                chat_type="p2p",
+                message_id="om_p2p_1",
+            )
+        },
+        configs=_default_configs(),
+    )
+
+    result = service.send_text(session_id=_SESSION_ID, text="hello")
+
+    assert result == "Message sent."
+    assert feishu_client.sent_texts == []
+    assert feishu_client.reply_texts == [("om_p2p_1", "hello")]
+    assert wechat_client.sent_texts == []
+
+
+def test_send_text_for_feishu_group_run_can_force_direct_send() -> None:
+    service, feishu_client, wechat_client = _build_service(
+        sessions=_default_sessions(),
+        configs=_default_configs(),
+        run_intents={
+            "run-1": IntentInput(
+                session_id=_SESSION_ID,
+                input=content_parts_from_text("hello"),
+                conversation_context=RuntimePromptConversationContext(
+                    source_provider="feishu",
+                    source_kind="im",
+                    feishu_chat_type="group",
+                    im_force_direct_send=True,
+                ),
+            )
+        },
+    )
+
+    result = service.send_text(session_id=_SESSION_ID, text="hello", run_id="run-1")
+
+    assert result == "Message sent."
     assert feishu_client.sent_texts == [(_CHAT_ID, "hello")]
+    assert feishu_client.reply_texts == []
     assert wechat_client.sent_texts == []
 
 
@@ -472,6 +597,56 @@ def test_send_text_success_for_automation_session_binding() -> None:
 
     assert result == "Message sent."
     assert feishu_client.sent_texts == [(_CHAT_ID, "hello")]
+    assert feishu_client.reply_texts == []
+    assert wechat_client.sent_texts == []
+
+
+def test_send_text_replies_to_automation_queue_receipt_for_run() -> None:
+    service, feishu_client, wechat_client = _build_service(
+        sessions={_SESSION_ID: _automation_session()},
+        configs=_default_configs(),
+        projects={_AUTOMATION_PROJECT_ID: _automation_project()},
+        deliveries={"run-1": _automation_delivery(reply_to_message_id="om_queue_1")},
+    )
+
+    result = service.send_text(session_id=_SESSION_ID, text="hello", run_id="run-1")
+
+    assert result == "Message sent."
+    assert feishu_client.sent_texts == []
+    assert feishu_client.reply_texts == [("om_queue_1", "hello")]
+    assert wechat_client.sent_texts == []
+
+
+def test_send_text_replies_to_automation_started_receipt_for_run() -> None:
+    service, feishu_client, wechat_client = _build_service(
+        sessions={_SESSION_ID: _automation_session()},
+        configs=_default_configs(),
+        projects={_AUTOMATION_PROJECT_ID: _automation_project()},
+        deliveries={"run-1": _automation_delivery(started_message_id="om_started_1")},
+    )
+
+    result = service.send_text(session_id=_SESSION_ID, text="hello", run_id="run-1")
+
+    assert result == "Message sent."
+    assert feishu_client.sent_texts == []
+    assert feishu_client.reply_texts == [("om_started_1", "hello")]
+    assert wechat_client.sent_texts == []
+
+
+def test_send_text_for_automation_run_without_receipt_falls_back_to_direct_send() -> (
+    None
+):
+    service, feishu_client, wechat_client = _build_service(
+        sessions=_default_sessions(),
+        configs=_default_configs(),
+        deliveries={"run-1": _automation_delivery()},
+    )
+
+    result = service.send_text(session_id=_SESSION_ID, text="hello", run_id="run-1")
+
+    assert result == "Message sent."
+    assert feishu_client.sent_texts == [(_CHAT_ID, "hello")]
+    assert feishu_client.reply_texts == []
     assert wechat_client.sent_texts == []
 
 

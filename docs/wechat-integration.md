@@ -4,11 +4,8 @@
 
 Agent Teams supports WeChat as a conversational `gateway` channel.
 
-This differs from Feishu:
-
-- WeChat inbound chat goes through `gateway -> session/run`
-- Feishu inbound chat currently still uses the `triggers` backend path
-- the settings UI groups both under the Gateway section, but the backend ownership is different
+This now shares the same internal session-ingress orchestration used by Feishu,
+automation-bound session delivery, and gateway ACP.
 
 The current WeChat scope is:
 
@@ -36,15 +33,17 @@ Each connected WeChat account stores:
 
 The bot token is stored in the unified Agent Teams secret store, not in SQLite.
 When a usable system keyring backend exists, that store uses keyring; otherwise
-it falls back to `~/.agent-teams/secrets.json`.
+it falls back to `~/.relay-teams/secrets.json` by default.
 
 Enabled accounts run a background long-poll worker. For each accepted message:
 
 1. the worker polls `getupdates`
 2. the service extracts direct-message text content
 3. `GatewaySessionService.resolve_or_create_session(...)` maps `wechat:{account_id}:{peer_user_id}` to one internal session
-4. the backend creates or reuses a run for that session
-5. terminal run output is sent back through WeChat `sendmessage`
+4. the message is persisted into `wechat_inbound_queue`
+5. the shared gateway session ingress path starts a detached run only when that internal session is idle
+6. if the session is already busy, the message stays queued and the user receives a queue receipt instead of being auto-attached to the active run
+7. terminal run output is sent back through WeChat `sendmessage`
 
 ## Login Flow
 

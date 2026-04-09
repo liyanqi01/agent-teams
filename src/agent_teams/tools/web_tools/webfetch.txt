@@ -1,3 +1,0 @@
-Fetch content from an http or https URL.
-
-Use this for reading current web pages or downloading files that need to be inspected.

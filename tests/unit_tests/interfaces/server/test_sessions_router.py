@@ -3,34 +3,44 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from agent_teams.interfaces.server.deps import get_session_service
-from agent_teams.interfaces.server.routers import sessions
-from agent_teams.providers import AgentTokenSummary, RunTokenUsage, SessionTokenUsage
-from agent_teams.sessions.session_models import SessionMode, SessionRecord
+from relay_teams.interfaces.server.deps import get_session_service
+from relay_teams.interfaces.server.routers import sessions
+from relay_teams.providers import AgentTokenSummary, RunTokenUsage, SessionTokenUsage
+from relay_teams.roles import SystemRolesUnavailableError
+from relay_teams.sessions.session_models import SessionMode, SessionRecord
 
 
 class _FakeSessionService:
     def __init__(self) -> None:
+        self.created_calls: list[tuple[str | None, str, dict[str, str] | None]] = []
         self.updated_calls: list[tuple[str, dict[str, str]]] = []
         self.topology_update_calls: list[tuple[str, str, str | None, str | None]] = []
         self.reflection_refresh_calls: list[tuple[str, str]] = []
         self.reflection_update_calls: list[tuple[str, str, str]] = []
         self.reflection_delete_calls: list[tuple[str, str]] = []
+        self.create_session_error: Exception | None = None
         self.raise_missing = False
 
-    def update_session(self, session_id: str, metadata: dict[str, str]) -> None:
-        if self.raise_missing:
-            raise KeyError(session_id)
-        self.updated_calls.append((session_id, metadata))
-
-    def create_session(  # pragma: no cover
+    def create_session(
         self,
         *,
         session_id: str | None = None,
         workspace_id: str,
         metadata: dict[str, str] | None = None,
     ) -> SessionRecord:
-        raise AssertionError("not used")
+        if self.create_session_error is not None:
+            raise self.create_session_error
+        self.created_calls.append((session_id, workspace_id, metadata))
+        return SessionRecord(
+            session_id=session_id or "session-created",
+            workspace_id=workspace_id,
+            metadata={} if metadata is None else dict(metadata),
+        )
+
+    def update_session(self, session_id: str, metadata: dict[str, str]) -> None:
+        if self.raise_missing:
+            raise KeyError(session_id)
+        self.updated_calls.append((session_id, metadata))
 
     def list_sessions(self) -> tuple[SessionRecord, ...]:  # pragma: no cover
         raise AssertionError("not used")
@@ -192,6 +202,46 @@ def test_update_session_route_accepts_metadata_payload() -> None:
     assert fake_service.updated_calls == [("session-1", {"title": "Renamed Session"})]
 
 
+def test_create_session_route_returns_created_session() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.post(
+        "/api/sessions",
+        json={"session_id": "session-1", "workspace_id": "default"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["session_id"] == "session-1"
+    assert fake_service.created_calls == [("session-1", "default", None)]
+
+
+def test_create_session_route_rejects_none_like_session_id() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.post(
+        "/api/sessions",
+        json={"session_id": "None", "workspace_id": "default"},
+    )
+
+    assert response.status_code == 422
+    assert fake_service.created_calls == []
+
+
+def test_create_session_route_returns_503_when_system_roles_are_missing() -> None:
+    fake_service = _FakeSessionService()
+    fake_service.create_session_error = SystemRolesUnavailableError(
+        "Required system roles are unavailable: main_agent: missing"
+    )
+    client = _create_client(fake_service)
+
+    response = client.post("/api/sessions", json={"workspace_id": "default"})
+
+    assert response.status_code == 503
+    assert "Required system roles are unavailable" in response.json()["detail"]
+
+
 def test_update_session_route_returns_not_found_for_missing_session() -> None:
     fake_service = _FakeSessionService()
     fake_service.raise_missing = True
@@ -204,6 +254,19 @@ def test_update_session_route_returns_not_found_for_missing_session() -> None:
 
     assert response.status_code == 404
     assert response.json() == {"detail": "Session not found"}
+
+
+def test_update_session_route_rejects_none_like_path_identifier() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.patch(
+        "/api/sessions/None",
+        json={"metadata": {"title": "Renamed Session"}},
+    )
+
+    assert response.status_code == 422
+    assert fake_service.updated_calls == []
 
 
 def test_update_session_topology_route_returns_updated_session() -> None:
