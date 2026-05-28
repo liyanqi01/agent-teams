@@ -288,7 +288,13 @@ def test_voice_button_hides_without_stt_config_and_space_remains_text_input() ->
                 "}",
                 timeout=_WAIT_TIMEOUT_MS,
             )
-            page.locator("#prompt-input").fill("hello")
+            prompt_input = page.locator("#prompt-input")
+            prompt_input.click()
+            page.keyboard.type("hello")
+            page.wait_for_function(
+                "() => document.querySelector('#prompt-input')?.value === 'hello'",
+                timeout=_WAIT_TIMEOUT_MS,
+            )
             page.keyboard.press("Space")
             result = page.evaluate(
                 "() => ({"

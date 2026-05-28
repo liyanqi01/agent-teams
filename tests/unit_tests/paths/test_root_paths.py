@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import subprocess
 
 from relay_teams.paths import root_paths
 
@@ -14,30 +13,12 @@ def test_get_project_root_or_none_returns_git_root(
     git_root = tmp_path / "repo"
     git_root.mkdir(parents=True)
 
-    def fake_run(
-        command: list[str],
-        *,
-        cwd: str,
-        check: bool,
-        capture_output: bool,
-        text: bool,
-        timeout: float,
-    ) -> subprocess.CompletedProcess[str]:
-        assert command == ["git", "rev-parse", "--show-toplevel"]
-        assert check is False
-        assert capture_output is True
-        assert text is True
-        assert timeout == 5.0
-        assert cwd == str(tmp_path.resolve())
-        return subprocess.CompletedProcess(
-            args=command,
-            returncode=0,
-            stdout=f"{git_root}\n",
-            stderr="",
-        )
+    def fake_git_toplevel(cwd: Path) -> tuple[int, str] | None:
+        assert cwd == tmp_path.resolve()
+        return 0, f"{git_root}\n"
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(root_paths.subprocess, "run", fake_run)
+    monkeypatch.setattr(root_paths, "_run_git_toplevel", fake_git_toplevel)
 
     resolved = root_paths.get_project_root_or_none()
 
@@ -48,25 +29,12 @@ def test_get_project_root_or_none_returns_none_when_git_fails(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    def fake_run(
-        command: list[str],
-        *,
-        cwd: str,
-        check: bool,
-        capture_output: bool,
-        text: bool,
-        timeout: float,
-    ) -> subprocess.CompletedProcess[str]:
-        _ = (cwd, check, capture_output, text, timeout)
-        return subprocess.CompletedProcess(
-            args=command,
-            returncode=1,
-            stdout="",
-            stderr="fatal: not a git repository",
-        )
+    def fake_git_toplevel(cwd: Path) -> tuple[int, str] | None:
+        _ = cwd
+        return 1, ""
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(root_paths.subprocess, "run", fake_run)
+    monkeypatch.setattr(root_paths, "_run_git_toplevel", fake_git_toplevel)
 
     resolved = root_paths.get_project_root_or_none()
 
@@ -81,31 +49,17 @@ def test_get_project_root_or_none_passes_start_dir_to_git(
     project_dir.mkdir(parents=True)
     git_root = tmp_path / "workspace"
 
-    captured: dict[str, str] = {}
+    captured: dict[str, Path] = {}
 
-    def fake_run(
-        command: list[str],
-        *,
-        cwd: str,
-        check: bool,
-        capture_output: bool,
-        text: bool,
-        timeout: float,
-    ) -> subprocess.CompletedProcess[str]:
-        _ = (check, capture_output, text, timeout)
+    def fake_git_toplevel(cwd: Path) -> tuple[int, str] | None:
         captured["cwd"] = cwd
-        return subprocess.CompletedProcess(
-            args=command,
-            returncode=0,
-            stdout=f"{git_root}\n",
-            stderr="",
-        )
+        return 0, f"{git_root}\n"
 
-    monkeypatch.setattr(root_paths.subprocess, "run", fake_run)
+    monkeypatch.setattr(root_paths, "_run_git_toplevel", fake_git_toplevel)
 
     resolved = root_paths.get_project_root_or_none(start_dir=project_dir)
 
-    assert captured["cwd"] == str(project_dir.resolve())
+    assert captured["cwd"] == project_dir.resolve()
     assert resolved == git_root.resolve()
 
 
@@ -113,24 +67,11 @@ def test_get_project_root_or_none_returns_none_on_git_failure(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    def fake_run(
-        command: list[str],
-        *,
-        cwd: str,
-        check: bool,
-        capture_output: bool,
-        text: bool,
-        timeout: float,
-    ) -> subprocess.CompletedProcess[str]:
-        _ = (command, cwd, check, capture_output, text, timeout)
-        return subprocess.CompletedProcess(
-            args=["git", "rev-parse", "--show-toplevel"],
-            returncode=1,
-            stdout="",
-            stderr="fatal: not a git repository",
-        )
+    def fake_git_toplevel(cwd: Path) -> tuple[int, str] | None:
+        _ = cwd
+        return 1, ""
 
-    monkeypatch.setattr(root_paths.subprocess, "run", fake_run)
+    monkeypatch.setattr(root_paths, "_run_git_toplevel", fake_git_toplevel)
 
     assert root_paths.get_project_root_or_none(start_dir=tmp_path) is None
 
@@ -139,19 +80,11 @@ def test_get_project_root_or_none_returns_none_on_os_error(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    def fake_run(
-        command: list[str],
-        *,
-        cwd: str,
-        check: bool,
-        capture_output: bool,
-        text: bool,
-        timeout: float,
-    ) -> subprocess.CompletedProcess[str]:
-        _ = (command, cwd, check, capture_output, text, timeout)
-        raise OSError("git unavailable")
+    def fake_git_toplevel(cwd: Path) -> tuple[int, str] | None:
+        _ = cwd
+        return None
 
-    monkeypatch.setattr(root_paths.subprocess, "run", fake_run)
+    monkeypatch.setattr(root_paths, "_run_git_toplevel", fake_git_toplevel)
 
     assert root_paths.get_project_root_or_none(start_dir=tmp_path) is None
 
@@ -160,19 +93,11 @@ def test_get_project_root_or_none_returns_none_on_timeout(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    def fake_run(
-        command: list[str],
-        *,
-        cwd: str,
-        check: bool,
-        capture_output: bool,
-        text: bool,
-        timeout: float,
-    ) -> subprocess.CompletedProcess[str]:
-        _ = (command, cwd, check, capture_output, text, timeout)
-        raise subprocess.TimeoutExpired(cmd="git", timeout=5.0)
+    def fake_git_toplevel(cwd: Path) -> tuple[int, str] | None:
+        _ = cwd
+        return None
 
-    monkeypatch.setattr(root_paths.subprocess, "run", fake_run)
+    monkeypatch.setattr(root_paths, "_run_git_toplevel", fake_git_toplevel)
 
     assert root_paths.get_project_root_or_none(start_dir=tmp_path) is None
 
@@ -181,24 +106,11 @@ def test_get_project_root_or_none_returns_none_on_blank_stdout(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    def fake_run(
-        command: list[str],
-        *,
-        cwd: str,
-        check: bool,
-        capture_output: bool,
-        text: bool,
-        timeout: float,
-    ) -> subprocess.CompletedProcess[str]:
-        _ = (cwd, check, capture_output, text, timeout)
-        return subprocess.CompletedProcess(
-            args=command,
-            returncode=0,
-            stdout="\n\n",
-            stderr="",
-        )
+    def fake_git_toplevel(cwd: Path) -> tuple[int, str] | None:
+        _ = cwd
+        return 0, "\n\n"
 
-    monkeypatch.setattr(root_paths.subprocess, "run", fake_run)
+    monkeypatch.setattr(root_paths, "_run_git_toplevel", fake_git_toplevel)
 
     assert root_paths.get_project_root_or_none(start_dir=tmp_path) is None
 
@@ -420,7 +332,6 @@ def test_resolve_start_dir_uses_parent_for_file_path(tmp_path: Path) -> None:
 
 
 def test_find_git_marker_root_uses_parent_for_file_path(
-    monkeypatch,
     tmp_path: Path,
 ) -> None:
     repo_dir = tmp_path / "repo"
@@ -429,58 +340,27 @@ def test_find_git_marker_root_uses_parent_for_file_path(
     file_path = repo_dir / "source.py"
     file_path.write_text("", encoding="utf-8")
 
-    def fake_run(
-        command: list[str],
-        *,
-        cwd: str,
-        check: bool,
-        capture_output: bool,
-        text: bool,
-        timeout: float,
-    ) -> subprocess.CompletedProcess[str]:
-        _ = (check, capture_output, text, timeout)
-        assert command == ["git", "rev-parse", "--show-toplevel"]
-        assert cwd == str(repo_dir.resolve())
-        return subprocess.CompletedProcess(
-            args=command,
-            returncode=0,
-            stdout=f"{repo_dir}\n",
-            stderr="",
-        )
-
-    monkeypatch.setattr(root_paths.subprocess, "run", fake_run)
-
     assert root_paths._find_git_marker_root(file_path) == repo_dir.resolve()
 
 
 def test_find_git_marker_root_rejects_invalid_git_marker(
-    monkeypatch,
     tmp_path: Path,
 ) -> None:
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
     (repo_dir / ".git").write_text("not a git marker", encoding="utf-8")
 
-    def fake_run(
-        command: list[str],
-        *,
-        cwd: str,
-        check: bool,
-        capture_output: bool,
-        text: bool,
-        timeout: float,
-    ) -> subprocess.CompletedProcess[str]:
-        _ = (command, cwd, check, capture_output, text, timeout)
-        return subprocess.CompletedProcess(
-            args=["git", "rev-parse", "--show-toplevel"],
-            returncode=1,
-            stdout="",
-            stderr="fatal: not a git repository",
-        )
-
-    monkeypatch.setattr(root_paths.subprocess, "run", fake_run)
-
     assert root_paths._find_git_marker_root(repo_dir) is None
+
+
+def test_find_git_marker_root_accepts_gitdir_file(tmp_path: Path) -> None:
+    repo_dir = tmp_path / "repo"
+    git_dir = tmp_path / "repo-git"
+    repo_dir.mkdir()
+    git_dir.mkdir()
+    (repo_dir / ".git").write_text(f"gitdir: {git_dir}\n", encoding="utf-8")
+
+    assert root_paths._find_git_marker_root(repo_dir) == repo_dir.resolve()
 
 
 def test_find_git_marker_root_returns_none_without_marker(tmp_path: Path) -> None:

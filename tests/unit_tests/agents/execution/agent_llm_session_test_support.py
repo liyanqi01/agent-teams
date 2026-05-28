@@ -381,7 +381,7 @@ class _FakeCompactionService:
             plan=self._plan,
         )
 
-    def build_prompt_section(
+    async def build_prompt_section(
         self,
         *,
         session_id: str,

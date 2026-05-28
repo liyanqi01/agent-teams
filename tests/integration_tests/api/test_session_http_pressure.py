@@ -153,35 +153,41 @@ def _run_pressure_requests(
     workers: int,
 ) -> list[PressureResult]:
     results: list[PressureResult] = []
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [
-            executor.submit(_send_pressure_request, base_url, method, path)
-            for method, path in request_plan
-        ]
-        for future in as_completed(futures, timeout=60.0):
-            results.append(future.result())
+    limits = httpx.Limits(max_connections=workers, max_keepalive_connections=workers)
+    with httpx.Client(
+        base_url=base_url,
+        timeout=15.0,
+        trust_env=False,
+        limits=limits,
+    ) as client:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [
+                executor.submit(_send_pressure_request, client, method, path)
+                for method, path in request_plan
+            ]
+            for future in as_completed(futures, timeout=60.0):
+                results.append(future.result())
     assert len(results) == len(request_plan)
     return results
 
 
 def _send_pressure_request(
-    base_url: str,
+    client: httpx.Client,
     method: HttpMethod,
     path: str,
 ) -> PressureResult:
-    with httpx.Client(base_url=base_url, timeout=15.0, trust_env=False) as client:
-        started = time.perf_counter()
-        if method == "POST":
-            response = client.post(path)
-        else:
-            response = client.get(path)
-        _consume_response(response)
-        return {
-            "method": method,
-            "path": path,
-            "status_code": response.status_code,
-            "duration_ms": int((time.perf_counter() - started) * 1000),
-        }
+    started = time.perf_counter()
+    if method == "POST":
+        response = client.post(path)
+    else:
+        response = client.get(path)
+    _consume_response(response)
+    return {
+        "method": method,
+        "path": path,
+        "status_code": response.status_code,
+        "duration_ms": int((time.perf_counter() - started) * 1000),
+    }
 
 
 def _consume_response(response: httpx.Response) -> None:

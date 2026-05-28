@@ -385,6 +385,14 @@ def root_command(
             "If omitted, the current default orchestration is used."
         ),
     ),
+    model: str | None = typer.Option(
+        None,
+        "--model",
+        help=(
+            "Select the model profile to use for this quick prompt run. "
+            "Requires --message."
+        ),
+    ),
     workspace: Path | None = typer.Option(
         None,
         "--workspace",
@@ -417,6 +425,7 @@ def root_command(
         mode,
         role,
         orchestration,
+        model,
         workspace,
         daemon,
         force,
@@ -430,6 +439,7 @@ def _run_single_prompt(
     session_mode: SessionMode,
     normal_root_role_id: str | None,
     orchestration_id: str | None,
+    model_profile: str | None,
     workspace: Path | None,
     daemon: bool,
     force: bool,
@@ -440,6 +450,7 @@ def _run_single_prompt(
         session_mode,
         normal_root_role_id,
         orchestration_id,
+        model_profile,
         workspace,
         daemon,
         force,
@@ -458,6 +469,7 @@ def _execute_prompt(
     session_mode: SessionMode = SessionMode.NORMAL,
     normal_root_role_id: str | None = None,
     orchestration_id: str | None = None,
+    model_profile: str | None = None,
     workspace: Path | None = None,
     autostart: bool = True,
     daemon: bool = False,
@@ -473,6 +485,7 @@ def _execute_prompt(
         session_mode,
         normal_root_role_id,
         orchestration_id,
+        model_profile,
         workspace,
         autostart,
         daemon,

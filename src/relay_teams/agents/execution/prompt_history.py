@@ -515,7 +515,7 @@ class PromptHistoryService:
             reserve_user_prompt_tokens=reserve_user_prompt_tokens,
         )
         source_history = list(history)
-        provisional_system_prompt = self.inject_compaction_summary(
+        provisional_system_prompt = await self.inject_compaction_summary(
             session_id=request.session_id,
             conversation_id=conversation_id,
             system_prompt=system_prompt,
@@ -565,7 +565,7 @@ class PromptHistoryService:
         )
         if protected_current_prompt is not None:
             history.append(protected_current_prompt)
-        final_system_prompt = self.inject_compaction_summary(
+        final_system_prompt = await self.inject_compaction_summary(
             session_id=request.session_id,
             conversation_id=conversation_id,
             system_prompt=system_prompt,
@@ -1064,7 +1064,7 @@ class PromptHistoryService:
             )
         return compacted_history
 
-    def inject_compaction_summary(
+    async def inject_compaction_summary(
         self,
         *,
         session_id: str,
@@ -1073,9 +1073,11 @@ class PromptHistoryService:
     ) -> str:
         if self._conversation_compaction_service is None:
             return system_prompt
-        prompt_section = self._conversation_compaction_service.build_prompt_section(
-            session_id=session_id,
-            conversation_id=conversation_id,
+        prompt_section = (
+            await self._conversation_compaction_service.build_prompt_section(
+                session_id=session_id,
+                conversation_id=conversation_id,
+            )
         )
         if not prompt_section:
             return system_prompt

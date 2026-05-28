@@ -325,14 +325,15 @@ def test_commit_ready_messages_commits_only_safe_prefix() -> None:
     assert validation_failures is False
 
 
-def test_inject_compaction_summary_returns_original_without_compaction_service() -> (
+@pytest.mark.asyncio
+async def test_inject_compaction_summary_returns_original_without_compaction_service() -> (
     None
 ):
     session = object.__new__(AgentLlmSession)
     session._conversation_compaction_service = None
 
     assert (
-        AgentLlmSession._inject_compaction_summary(
+        await AgentLlmSession._inject_compaction_summary(
             session,
             session_id="session-1",
             conversation_id="conv-1",
@@ -342,7 +343,8 @@ def test_inject_compaction_summary_returns_original_without_compaction_service()
     )
 
 
-def test_inject_compaction_summary_ignores_empty_prompt_section() -> None:
+@pytest.mark.asyncio
+async def test_inject_compaction_summary_ignores_empty_prompt_section() -> None:
     session = object.__new__(AgentLlmSession)
     session._conversation_compaction_service = cast(
         ConversationCompactionService,
@@ -350,7 +352,7 @@ def test_inject_compaction_summary_ignores_empty_prompt_section() -> None:
     )
 
     assert (
-        AgentLlmSession._inject_compaction_summary(
+        await AgentLlmSession._inject_compaction_summary(
             session,
             session_id="session-1",
             conversation_id="conv-1",
@@ -360,14 +362,15 @@ def test_inject_compaction_summary_ignores_empty_prompt_section() -> None:
     )
 
 
-def test_inject_compaction_summary_appends_prompt_section() -> None:
+@pytest.mark.asyncio
+async def test_inject_compaction_summary_appends_prompt_section() -> None:
     session = object.__new__(AgentLlmSession)
     session._conversation_compaction_service = cast(
         ConversationCompactionService,
         _FakeCompactionService(prompt_section="## Summary\nKeep prior work."),
     )
 
-    combined = AgentLlmSession._inject_compaction_summary(
+    combined = await AgentLlmSession._inject_compaction_summary(
         session,
         session_id="session-1",
         conversation_id="conv-1",

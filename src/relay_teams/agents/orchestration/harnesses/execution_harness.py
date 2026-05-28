@@ -55,6 +55,9 @@ from relay_teams.roles.role_registry import RoleRegistry
 from relay_teams.roles.runtime_role_resolver import RuntimeRoleResolver
 from relay_teams.sessions.runs.event_log import EventLog
 from relay_teams.sessions.runs.event_stream import RunEventHub
+from relay_teams.sessions.runs.model_profile_override import (
+    apply_run_model_profile_override,
+)
 from relay_teams.sessions.runs.run_intent_repo import RunIntentRepository
 from relay_teams.sessions.runs.run_models import (
     RunKind,
@@ -209,6 +212,7 @@ class ExecutionHarness(BaseModel):
         )
         session_mode = "normal"
         run_kind = RunKind.CONVERSATION
+        model_profile: str | None = None
         if self.run_intent_repo is not None:
             try:
                 intent = await self.run_intent_repo.get_async(
@@ -217,6 +221,7 @@ class ExecutionHarness(BaseModel):
                 )
                 session_mode = intent.session_mode.value
                 run_kind = intent.run_kind
+                model_profile = intent.model_profile
             except KeyError:
                 LOGGER.debug(
                     "Missing run intent for trace_id=%s session_id=%s; using defaults",
@@ -226,6 +231,10 @@ class ExecutionHarness(BaseModel):
         if task.parent_task_id is not None:
             session_mode = "normal"
             run_kind = RunKind.CONVERSATION
+        role_for_run = apply_run_model_profile_override(
+            role_for_run,
+            model_profile,
+        )
 
         runner = SubAgentRunner(
             role=role_for_run,

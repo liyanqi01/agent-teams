@@ -505,6 +505,53 @@ async def test_execute_omits_objective_when_task_history_exists(
 
 
 @pytest.mark.asyncio
+async def test_execute_uses_run_model_profile_override(
+    tmp_path: Path,
+) -> None:
+    provider = _CapturingProvider()
+    service, task_repo, agent_repo, message_repo = _build_service(
+        tmp_path / "task_execution_service_model_profile.db",
+        provider,
+    )
+    captured_profiles: list[str] = []
+
+    def provider_factory(
+        role: RoleDefinition,
+        session_id: str | None = None,
+    ) -> object:
+        _ = session_id
+        captured_profiles.append(role.model_profile)
+        return provider
+
+    service.provider_factory = provider_factory
+    task, instance_id = _seed_task(
+        task_repo=task_repo,
+        agent_repo=agent_repo,
+        message_repo=message_repo,
+    )
+    run_intent_repo = service.run_intent_repo
+    assert run_intent_repo is not None
+    await run_intent_repo.upsert_async(
+        run_id=task.trace_id,
+        session_id=task.session_id,
+        intent=IntentInput(
+            session_id=task.session_id,
+            input=content_parts_from_text("query time"),
+            model_profile="fast",
+        ),
+    )
+
+    result = await service.execute(
+        instance_id=instance_id,
+        role_id="time",
+        task=task,
+    )
+
+    assert result.output == "ok"
+    assert captured_profiles == ["fast"]
+
+
+@pytest.mark.asyncio
 async def test_execute_injects_memory_bank_project_memory(
     tmp_path: Path,
 ) -> None:

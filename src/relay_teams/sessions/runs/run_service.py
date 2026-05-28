@@ -484,6 +484,7 @@ class SessionRunService:
     def _prepare_intent(self, intent: IntentInput) -> IntentInput:
         session = self._session_repo.get(intent.session_id)
         target_role_id = str(intent.target_role_id or "").strip() or None
+        model_profile = str(intent.model_profile or "").strip() or None
         skills = tuple(str(skill or "").strip() for skill in (intent.skills or ()))
         skills = tuple(skill for skill in skills if skill) or None
         if self._orchestration_settings_service is None:
@@ -491,6 +492,7 @@ class SessionRunService:
                 update={
                     "session_mode": session.session_mode,
                     "target_role_id": target_role_id,
+                    "model_profile": model_profile,
                     "skills": skills,
                 }
             )
@@ -502,6 +504,7 @@ class SessionRunService:
             update={
                 "session_mode": session.session_mode,
                 "target_role_id": target_role_id,
+                "model_profile": model_profile,
                 "skills": skills,
                 "topology": topology,
             }
@@ -510,6 +513,7 @@ class SessionRunService:
     async def _prepare_intent_async(self, intent: IntentInput) -> IntentInput:
         session = await self._session_repo.get_async(intent.session_id)
         target_role_id = str(intent.target_role_id or "").strip() or None
+        model_profile = str(intent.model_profile or "").strip() or None
         skills = tuple(str(skill or "").strip() for skill in (intent.skills or ()))
         skills = tuple(skill for skill in skills if skill) or None
         if self._orchestration_settings_service is None:
@@ -517,6 +521,7 @@ class SessionRunService:
                 update={
                     "session_mode": session.session_mode,
                     "target_role_id": target_role_id,
+                    "model_profile": model_profile,
                     "skills": skills,
                 }
             )
@@ -528,6 +533,7 @@ class SessionRunService:
             update={
                 "session_mode": session.session_mode,
                 "target_role_id": target_role_id,
+                "model_profile": model_profile,
                 "skills": skills,
                 "topology": topology,
             }

@@ -98,6 +98,8 @@ from relay_teams.tools.runtime.approval_state import ToolApprovalManager
 from relay_teams.tools.runtime.policy import ToolApprovalPolicy
 from relay_teams.workspace import WorkspaceManager, build_conversation_id
 
+pytestmark = pytest.mark.timeout(15)
+
 
 class _LlmModulePatchProxy:
     @property
@@ -225,7 +227,7 @@ class _FakeConversationCompactionService:
         result = await self.maybe_compact_with_result(**kwargs)
         return list(result.messages)
 
-    def build_prompt_section(
+    async def build_prompt_section(
         self,
         *,
         session_id: str,

@@ -178,6 +178,7 @@ class CreateRunRequest(BaseModel):
     shell_safety_policy_enabled: bool | None = None
     thinking: RunThinkingConfig = Field(default_factory=RunThinkingConfig)
     target_role_id: OptionalIdentifierStr = None
+    model_profile: OptionalIdentifierStr = None
     skills: tuple[str, ...] | None = None
     orchestration_policy: OrchestrationPolicy | None = None
 
@@ -193,6 +194,30 @@ class CreateRunResponse(BaseModel):
     run_id: RequiredIdentifierStr
     session_id: RequiredIdentifierStr
     target_role_id: OptionalIdentifierStr = None
+
+
+def _validate_requested_model_profile(
+    request: Request,
+    model_profile: str | None,
+) -> str | None:
+    normalized = model_profile.strip() if model_profile is not None else None
+    if normalized is None:
+        return None
+    if normalized == "default":
+        return normalized
+    container = getattr(request.app.state, "container", None)
+    if container is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Model profile validation requires the server container to be initialized",
+        )
+    runtime = container.runtime
+    if normalized not in runtime.llm_profiles:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown model profile: {normalized}",
+        )
+    return normalized
 
 
 class InjectMessageRequest(BaseModel):
@@ -347,6 +372,7 @@ async def create_run(
                 strict=True,
                 consumer="interfaces.server.routers.runs.create_run",
             )
+        model_profile = _validate_requested_model_profile(request, req.model_profile)
         shell_safety_policy_enabled = req.shell_safety_policy_enabled
         shell_safety_policy_override_provided = shell_safety_policy_enabled is not None
         if shell_safety_policy_enabled is None:
@@ -365,6 +391,7 @@ async def create_run(
             shell_safety_policy_override_provided=shell_safety_policy_override_provided,
             thinking=req.thinking,
             target_role_id=req.target_role_id,
+            model_profile=model_profile,
             skills=resolved_skills,
             orchestration_policy=req.orchestration_policy,
         )
@@ -382,6 +409,7 @@ async def create_run(
                     "execution_mode": req.execution_mode.value,
                     "yolo": req.yolo,
                     "shell_safety_policy_enabled": shell_safety_policy_enabled,
+                    "model_profile": model_profile or "",
                 },
             )
         return CreateRunResponse(

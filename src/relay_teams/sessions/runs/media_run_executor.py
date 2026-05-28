@@ -33,6 +33,9 @@ from relay_teams.roles.role_models import RoleDefinition
 from relay_teams.roles.role_registry import RoleRegistry
 from relay_teams.sessions.runs.assistant_errors import RunCompletionReason
 from relay_teams.sessions.runs.enums import RunEventType
+from relay_teams.sessions.runs.model_profile_override import (
+    apply_run_model_profile_override,
+)
 from relay_teams.sessions.runs.run_event_publisher import RunEventPublisher
 from relay_teams.sessions.runs.run_models import (
     IntentInput,
@@ -79,7 +82,10 @@ class MediaRunExecutor:
         session = await self._session_repo.get_async(intent.session_id)
         role_id = self.resolve_generation_role_id(intent)
         role_registry = self._require_role_registry()
-        role = role_registry.get(role_id)
+        role = apply_run_model_profile_override(
+            role_registry.get(role_id),
+            intent.model_profile,
+        )
         provider = self._provider_factory(role, intent.session_id)
         conversation_id = build_conversation_id(intent.session_id, role_id)
         instance = create_subagent_instance(

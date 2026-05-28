@@ -479,7 +479,7 @@ async def test_conversation_compaction_service_hides_messages_and_creates_marker
     )
 
     assert len(next_history) == 2
-    latest_marker = marker_repo.get_latest(
+    latest_marker = await marker_repo.get_latest_async(
         "session-1",
         marker_type=SessionHistoryMarkerType.COMPACTION,
     )
@@ -505,7 +505,7 @@ async def test_conversation_compaction_service_hides_messages_and_creates_marker
     ]
     assert len(hidden_messages) == 2
     assert (
-        service.get_latest_summary(
+        await service.get_latest_summary(
             session_id="session-1",
             conversation_id=conversation_id,
         )
@@ -1213,10 +1213,15 @@ async def test_maybe_compact_with_result_returns_not_applied_when_hide_count_is_
             )
         ),
     )
+
+    async def _hide_no_messages(**kwargs: object) -> int:
+        _ = kwargs
+        return 0
+
     monkeypatch.setattr(
         service._message_repo,
-        "hide_conversation_messages_for_compaction",
-        lambda **kwargs: 0,
+        "hide_conversation_messages_for_compaction_async",
+        _hide_no_messages,
     )
     monkeypatch.setattr(
         service,
@@ -1244,7 +1249,8 @@ async def test_maybe_compact_with_result_returns_not_applied_when_hide_count_is_
     assert list(result.messages) == history
 
 
-def test_compaction_prompt_section_ignores_summaries_before_latest_clear(
+@pytest.mark.asyncio
+async def test_compaction_prompt_section_ignores_summaries_before_latest_clear(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "conversation_compaction_prompt.db"
@@ -1276,7 +1282,7 @@ def test_compaction_prompt_section_ignores_summaries_before_latest_clear(
     _ = marker_repo.create_clear_marker("session-1")
 
     assert (
-        service.build_prompt_section(
+        await service.build_prompt_section(
             session_id="session-1",
             conversation_id=conversation_id,
         )

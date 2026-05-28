@@ -1006,6 +1006,7 @@ CREATE TABLE IF NOT EXISTS run_intents (
     thinking_enabled TEXT NOT NULL DEFAULT 'false',
     thinking_effort TEXT,
     target_role_id TEXT,
+    model_profile TEXT,
     topology_json  TEXT,
     conversation_context_json TEXT,
     created_at     TEXT NOT NULL,
@@ -1028,6 +1029,7 @@ Notes:
 - `shell_safety_policy_enabled` controls whether shell execution keeps the local shell safety deny layer enabled for that run.
 - `thinking_enabled` and `thinking_effort` capture per-run thinking configuration for providers that support reasoning streams.
 - `target_role_id` stores an optional one-run direct-chat override, such as a leading `@Role` mention from the web composer.
+- `model_profile` stores an optional one-run model profile override used by CLI quick prompt runs and any explicit `/api/runs` request.
 - `session_mode` and `topology_json` snapshot the resolved root-agent topology, including the selected normal-mode root role, selected fixed orchestration graph when present, and effective orchestration policy, used when the run was created, so recoverable resumes do not drift when global orchestration settings change later. The policy snapshot includes DelegationPlanner auto-planning fields such as `auto_plan_long_tasks`, `planner_role_id`, and `max_temporary_roles_per_run`.
 - `conversation_context_json` stores optional source-channel context, including Feishu group-chat markers used by runtime prompt assembly and the automation direct-send override used by IM-bound scheduled runs.
 

@@ -3225,7 +3225,9 @@ def test_root_message_uses_fast_prompt_path_without_full_cli(
         lambda: (_ for _ in ()).throw(AssertionError("full CLI should not load")),
     )
 
-    handled = cli_app._handle_fast_local_command(["-m", "你好啊", "--no-yolo"])
+    handled = cli_app._handle_fast_local_command(
+        ["-m", "你好啊", "--model", "fast", "--no-yolo"]
+    )
 
     assert handled is True
     assert requests == [
@@ -3250,6 +3252,7 @@ def test_root_message_uses_fast_prompt_path_without_full_cli(
                 "input": [{"kind": "text", "text": "你好啊"}],
                 "execution_mode": "ai",
                 "yolo": False,
+                "model_profile": "fast",
             },
         ),
     ]
@@ -3404,6 +3407,7 @@ def test_root_message_fast_path_autostarts_server(
         (["-m", "hi", "--mode", "bad"], "--mode must be normal or orchestration"),
         (["-m", "hi", "--role", ""], "--role must not be empty"),
         (["-m", "hi", "--orchestration", ""], "--orchestration must not be empty"),
+        (["-m", "hi", "--model", ""], "--model must not be empty"),
         (
             ["-m", "hi", "--mode", "orchestration", "--role", "dev"],
             "--role can only be used with --mode normal",

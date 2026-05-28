@@ -98,6 +98,55 @@ def test_root_message_runs_single_prompt(monkeypatch, tmp_path: Path) -> None:
     }
 
 
+def test_root_message_supports_model_profile(monkeypatch, tmp_path: Path) -> None:
+    calls: list[tuple[str, str, dict[str, object] | None]] = []
+
+    def fake_autostart(
+        base_url: str, autostart: bool, daemon: bool = False, force: bool = False
+    ) -> None:
+        _ = (base_url, autostart, daemon, force)
+
+    def fake_request_json(
+        base_url: str,
+        method: str,
+        path: str,
+        payload: dict[str, object] | None = None,
+        timeout_seconds: float = 30.0,
+    ) -> dict[str, object] | list[object]:
+        _ = (base_url, timeout_seconds)
+        calls.append((method, path, payload))
+        if path == "/api/workspaces/pick":
+            return _workspace_response(tmp_path)
+        if path == "/api/sessions":
+            return {"session_id": "session-1"}
+        if path == "/api/runs":
+            return {"run_id": "run-1"}
+        raise AssertionError(f"unexpected path: {path}")
+
+    def fake_stream(base_url: str, run_id: str, debug: bool) -> None:
+        _ = (base_url, run_id, debug)
+
+    monkeypatch.setattr(cli_app, "_auto_start_if_needed", fake_autostart)
+    monkeypatch.setattr(cli_app, "_request_json", fake_request_json)
+    monkeypatch.setattr(cli_app, "_stream_events", fake_stream)
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(cli_app.app, ["-m", "hello", "--model", "fast"])
+
+    assert result.exit_code == 0
+    assert calls[-1] == (
+        "POST",
+        "/api/runs",
+        {
+            "session_id": "session-1",
+            "input": [{"kind": "text", "text": "hello"}],
+            "execution_mode": "ai",
+            "yolo": True,
+            "model_profile": "fast",
+        },
+    )
+
+
 def test_root_message_supports_workspace_selection(monkeypatch, tmp_path: Path) -> None:
     calls: list[tuple[str, str, dict[str, object] | None]] = []
     streamed: dict[str, object] = {}
@@ -808,6 +857,15 @@ def test_root_message_rejects_role_with_orchestration_mode() -> None:
     assert "--role can only be used with --mode normal" in normalized_output
 
 
+def test_root_message_rejects_model_without_message() -> None:
+    result = runner.invoke(cli_app.app, ["--model", "fast"])
+
+    normalized_output = _normalized_output(result.output)
+    assert result.exit_code == 2
+    assert "--model" in normalized_output
+    assert "require --message" in normalized_output
+
+
 def test_root_message_invalid_role_lists_available_ids(
     monkeypatch,
     tmp_path: Path,
@@ -1035,6 +1093,7 @@ def test_root_help_lists_env_module() -> None:
     assert "--mode" in normalized_output
     assert "--role" in normalized_output
     assert "--orchestration" in normalized_output
+    assert "--model" in normalized_output
     assert "--workspace" in normalized_output
     assert "Defaults" in normalized_output
     assert "directory. Requires" in normalized_output

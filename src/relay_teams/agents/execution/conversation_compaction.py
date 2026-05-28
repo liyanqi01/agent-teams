@@ -446,7 +446,7 @@ class ConversationCompactionService:
                 applied=False,
                 plan=resolved_plan,
             )
-        existing_summary = self.get_latest_summary(
+        existing_summary = await self.get_latest_summary(
             session_id=session_id,
             conversation_id=conversation_id,
         )
@@ -463,7 +463,7 @@ class ConversationCompactionService:
                 plan=resolved_plan,
             )
 
-        marker = self._session_history_marker_repo.create(
+        marker = await self._session_history_marker_repo.create_async(
             session_id=session_id,
             marker_type=SessionHistoryMarkerType.COMPACTION,
             metadata={
@@ -491,10 +491,12 @@ class ConversationCompactionService:
                 "protected_tail_messages": str(resolved_plan.protected_tail_messages),
             },
         )
-        hidden_count = self._message_repo.hide_conversation_messages_for_compaction(
-            conversation_id=conversation_id,
-            hide_message_count=resolved_plan.compacted_message_count,
-            hidden_marker_id=marker.marker_id,
+        hidden_count = (
+            await self._message_repo.hide_conversation_messages_for_compaction_async(
+                conversation_id=conversation_id,
+                hide_message_count=resolved_plan.compacted_message_count,
+                hidden_marker_id=marker.marker_id,
+            )
         )
         if hidden_count <= 0:
             return ConversationCompactionResult(
@@ -553,13 +555,13 @@ class ConversationCompactionService:
         )
         return list(result.messages)
 
-    def get_latest_summary(
+    async def get_latest_summary(
         self,
         *,
         session_id: str,
         conversation_id: str,
     ) -> str:
-        marker = self._get_latest_active_compaction_marker(
+        marker = await self._get_latest_active_compaction_marker(
             session_id=session_id,
             conversation_id=conversation_id,
         )
@@ -567,13 +569,13 @@ class ConversationCompactionService:
             return ""
         return str(marker.metadata.get("summary_markdown") or "").strip()
 
-    def build_prompt_section(
+    async def build_prompt_section(
         self,
         *,
         session_id: str,
         conversation_id: str,
     ) -> str:
-        summary = self.get_latest_summary(
+        summary = await self.get_latest_summary(
             session_id=session_id,
             conversation_id=conversation_id,
         )
@@ -747,19 +749,22 @@ class ConversationCompactionService:
             return
         emitted_text_chunks.append(suffix)
 
-    def _get_latest_active_compaction_marker(
+    async def _get_latest_active_compaction_marker(
         self,
         *,
         session_id: str,
         conversation_id: str,
     ) -> SessionHistoryMarkerRecord | None:
-        latest_clear = self._session_history_marker_repo.get_latest(
+        latest_clear = await self._session_history_marker_repo.get_latest_async(
             session_id,
             marker_type=SessionHistoryMarkerType.CLEAR,
         )
         latest_clear_at = latest_clear.created_at if latest_clear is not None else None
         latest_marker: SessionHistoryMarkerRecord | None = None
-        for marker in self._session_history_marker_repo.list_by_session(session_id):
+        markers = await self._session_history_marker_repo.list_by_session_async(
+            session_id
+        )
+        for marker in markers:
             if marker.marker_type != SessionHistoryMarkerType.COMPACTION:
                 continue
             if marker.metadata.get("conversation_id") != conversation_id:

@@ -683,6 +683,42 @@ async def test_media_generation_run_uses_native_provider(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_media_generation_run_uses_model_profile_override(
+    tmp_path: Path,
+) -> None:
+    provider = _NativeImageProvider()
+    captured_profiles: list[str] = []
+
+    def provider_factory(
+        role: RoleDefinition,
+        session_id: str | None,
+    ) -> LLMProvider:
+        _ = session_id
+        captured_profiles.append(role.model_profile)
+        return provider
+
+    manager = _build_manager(
+        tmp_path / "run_media_generation_model_profile.db",
+        provider_factory=provider_factory,
+        role_registry=_media_role_registry(),
+        media_asset_service=cast(MediaAssetService, object()),
+    )
+
+    result = await manager.run_intent(
+        IntentInput(
+            session_id="session-1",
+            run_kind=RunKind.GENERATE_IMAGE,
+            generation_config=ImageGenerationConfig(),
+            input=content_parts_from_text("draw a compact icon"),
+            model_profile="fast",
+        )
+    )
+
+    assert result.status == "completed"
+    assert captured_profiles == ["fast"]
+
+
+@pytest.mark.asyncio
 async def test_audio_generation_run_uses_native_provider(tmp_path: Path) -> None:
     provider = _NativeImageProvider()
     manager = _build_manager(

@@ -47,6 +47,26 @@ def test_run_intent_repo_round_trips_yolo(tmp_path: Path) -> None:
     assert record.yolo is True
 
 
+def test_run_intent_repo_round_trips_model_profile(tmp_path: Path) -> None:
+    db_path = tmp_path / "run_intent_model_profile.db"
+    repo = RunIntentRepository(db_path)
+
+    repo.upsert(
+        run_id="run-1",
+        session_id="session-1",
+        intent=IntentInput(
+            session_id="session-1",
+            input=content_parts_from_text("ship it"),
+            model_profile="fast",
+        ),
+    )
+
+    record = repo.get("run-1")
+
+    assert record.intent == "ship it"
+    assert record.model_profile == "fast"
+
+
 def test_run_intent_repo_round_trips_display_input(tmp_path: Path) -> None:
     db_path = tmp_path / "run_intent_display_input.db"
     repo = RunIntentRepository(db_path)

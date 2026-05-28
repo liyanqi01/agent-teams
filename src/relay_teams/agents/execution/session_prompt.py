@@ -503,14 +503,14 @@ class SessionPromptMixin(AgentLlmSessionMixinBase):
             estimated_tokens_after_microcompact=estimated_tokens_after_microcompact,
         )
 
-    def _inject_compaction_summary(
+    async def _inject_compaction_summary(
         self,
         *,
         session_id: str,
         conversation_id: str,
         system_prompt: str,
     ) -> str:
-        return self._prompt_history_service().inject_compaction_summary(
+        return await self._prompt_history_service().inject_compaction_summary(
             session_id=session_id,
             conversation_id=conversation_id,
             system_prompt=system_prompt,

@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import subprocess
+from tempfile import TemporaryDirectory
 
 
 _APP_CONFIG_DIR_ENV_VAR = "RELAY_TEAMS_CONFIG_DIR"
@@ -62,24 +63,15 @@ def get_project_root_or_none(start_dir: Path | None = None) -> Path | None:
     marker_root = _find_git_marker_root(command_cwd)
     if marker_root is not None:
         return marker_root
-    try:
-        completed = subprocess.run(
-            list(_GIT_TOPLEVEL_CMD),
-            cwd=str(command_cwd),
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=_GIT_TIMEOUT_SECONDS,
-        )
-    except OSError:
-        return None
-    except subprocess.TimeoutExpired:
+    result = _run_git_toplevel(command_cwd)
+    if result is None:
         return None
 
-    if completed.returncode != 0:
+    returncode, stdout = result
+    if returncode != 0:
         return None
 
-    raw_stdout = completed.stdout.strip()
+    raw_stdout = stdout.strip()
     if not raw_stdout:
         return None
     return Path(raw_stdout).expanduser().resolve()
@@ -99,25 +91,44 @@ def _find_git_marker_root(start_dir: Path) -> Path | None:
 
 
 def _is_valid_git_worktree_root(candidate: Path) -> bool:
+    marker = candidate / ".git"
+    if marker.is_dir():
+        return True
+    if not marker.is_file():
+        return False
     try:
-        completed = subprocess.run(
-            list(_GIT_TOPLEVEL_CMD),
-            cwd=str(candidate.resolve()),
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=_GIT_TIMEOUT_SECONDS,
-        )
+        content = marker.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return False
-    except subprocess.TimeoutExpired:
-        return False
-    if completed.returncode != 0:
-        return False
-    raw_stdout = completed.stdout.strip()
-    if not raw_stdout:
-        return False
-    return Path(raw_stdout).expanduser().resolve() == candidate.resolve()
+    return content.strip().startswith("gitdir:")
+
+
+def _run_git_toplevel(cwd: Path) -> tuple[int, str] | None:
+    command = list(_GIT_TOPLEVEL_CMD)
+    try:
+        with TemporaryDirectory(prefix="relay-teams-git-") as temp_dir:
+            stdout_path = Path(temp_dir) / "stdout.txt"
+            with stdout_path.open("w+b") as stdout_file:
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(cwd),
+                    stdout=stdout_file,
+                    stderr=subprocess.DEVNULL,
+                )
+                try:
+                    returncode = process.wait(timeout=_GIT_TIMEOUT_SECONDS)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    try:
+                        process.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        return None
+                    return None
+                stdout_file.seek(0)
+                stdout = stdout_file.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    return returncode, stdout
 
 
 def get_project_config_dir(project_root: Path | None = None) -> Path:

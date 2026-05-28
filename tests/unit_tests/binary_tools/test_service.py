@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 from collections.abc import AsyncIterator, Mapping
 import hashlib
 import io
@@ -1406,6 +1407,18 @@ def test_binary_tools_package_imports_without_net_github_cli_cycle() -> None:
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == "BinaryToolService"
+
+    imported_modules: set[str] = set()
+    for path in (Path("src") / "relay_teams" / "binary_tools").glob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported_modules.update(alias.name for alias in node.names)
+            if isinstance(node, ast.ImportFrom) and node.module is not None:
+                imported_modules.add(node.module)
+
+    assert BinaryToolService.__name__ == "BinaryToolService"
+    assert "relay_teams.net.github_cli" not in imported_modules
 
 
 def test_normalize_rejects_unknown_tool(tmp_path: Path) -> None:

@@ -120,6 +120,7 @@ class IntentInput(BaseModel):
     reuse_root_instance: bool = True
     thinking: RunThinkingConfig = Field(default_factory=RunThinkingConfig)
     target_role_id: OptionalIdentifierStr = None
+    model_profile: OptionalIdentifierStr = None
     skills: tuple[str, ...] | None = None
     orchestration_policy: OrchestrationPolicy | None = None
     session_mode: SessionMode = SessionMode.NORMAL

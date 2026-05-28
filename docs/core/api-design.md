@@ -1713,11 +1713,12 @@ Request:
     }
   ],
   "run_kind": "conversation",
-    "generation_config": null,
-    "execution_mode": "ai",
-    "yolo": false,
-    "shell_safety_policy_enabled": true,
-    "target_role_id": "Architect",
+  "generation_config": null,
+  "execution_mode": "ai",
+  "yolo": false,
+  "shell_safety_policy_enabled": true,
+  "target_role_id": "Architect",
+  "model_profile": "fast",
   "thinking": {
     "enabled": false,
     "effort": null
@@ -1769,9 +1770,11 @@ Notes:
 - `thinking.effort` optionally sets provider reasoning effort (`minimal`, `low`, `medium`, `high`); when set, it is forwarded to OpenAI-compatible providers as `openai_reasoning_effort`.
 - `target_role_id` is optional. When set, that run starts from the specified role instead of the session-default root role, without mutating the saved session topology.
 - `target_role_id` may point to `Coordinator`, `MainAgent`, or any normal role known to the role registry.
+- `model_profile` is optional. When set, that run uses the named saved model profile instead of the selected role's `model_profile`, without mutating role or session configuration.
+- Unknown explicit `model_profile` values are rejected. The literal `default` is accepted and resolves through the current default model profile.
 - `orchestration_policy` is optional. When provided, it overrides the selected orchestration preset policy for that run only and is stored in the run topology snapshot.
 - The backend resolves the session mode at run creation time and snapshots the chosen root topology into the run intent for queued and recoverable resume flows.
-- `session_id`, `target_role_id`, `run_id`, and other identifier-style request fields follow the common identifier validation rules above.
+- `session_id`, `target_role_id`, `model_profile`, `run_id`, and other identifier-style request fields follow the common identifier validation rules above.
 
 Response:
 

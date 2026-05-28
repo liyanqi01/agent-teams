@@ -493,10 +493,22 @@ class _FakeMediaAssetService:
         return tuple(normalized)
 
 
+class _FakeRuntime:
+    def __init__(self, profile_names: tuple[str, ...] = ("default",)) -> None:
+        self.llm_profiles: dict[str, object] = {
+            profile_name: object() for profile_name in profile_names
+        }
+
+
 class _FakeContainer:
-    def __init__(self, media_asset_service: _FakeMediaAssetService) -> None:
+    def __init__(
+        self,
+        media_asset_service: _FakeMediaAssetService | None = None,
+        profile_names: tuple[str, ...] = ("default",),
+    ) -> None:
         self.session_service = _FakeSessionService()
-        self.media_asset_service = media_asset_service
+        self.media_asset_service = media_asset_service or _FakeMediaAssetService()
+        self.runtime = _FakeRuntime(profile_names=profile_names)
 
 
 class _FakeGeneralConfigService:
@@ -656,6 +668,51 @@ def test_create_run_route_accepts_yolo() -> None:
     assert created.intent == "hello"
     assert created.yolo is True
     assert fake_service.started_run_ids == ["run-1"]
+
+
+def test_create_run_route_accepts_model_profile() -> None:
+    fake_service = _FakeRunService()
+    client = _create_client(
+        fake_service,
+        fake_container=_FakeContainer(profile_names=("fast",)),
+    )
+
+    response = client.post(
+        "/api/runs",
+        json={
+            "session_id": "session-1",
+            "input": [{"kind": "text", "text": "hello"}],
+            "execution_mode": "ai",
+            "model_profile": "fast",
+        },
+    )
+
+    assert response.status_code == 200
+    created = fake_service.created_run_inputs[0]
+    assert created.intent == "hello"
+    assert created.model_profile == "fast"
+
+
+def test_create_run_route_rejects_unknown_model_profile() -> None:
+    fake_service = _FakeRunService()
+    client = _create_client(
+        fake_service,
+        fake_container=_FakeContainer(profile_names=("fast",)),
+    )
+
+    response = client.post(
+        "/api/runs",
+        json={
+            "session_id": "session-1",
+            "input": [{"kind": "text", "text": "hello"}],
+            "execution_mode": "ai",
+            "model_profile": "missing",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Unknown model profile: missing"
+    assert fake_service.created_run_inputs == []
 
 
 def test_create_run_route_uses_saved_general_shell_policy_by_default() -> None:
