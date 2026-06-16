@@ -28,6 +28,34 @@ export async function fetchSessions(options = {}) {
     );
 }
 
+export async function fetchWorkspaceSidebarSessions(workspaceId, options = {}) {
+    const safeWorkspaceId = String(workspaceId || '').trim();
+    if (!safeWorkspaceId) {
+        return { items: [], next_cursor: null, has_more: false };
+    }
+    const params = new URLSearchParams();
+    const parsedLimit = Number.parseInt(String(options.limit ?? 50), 10);
+    if (Number.isFinite(parsedLimit) && parsedLimit > 0) {
+        params.set('limit', String(parsedLimit));
+    }
+    const cursor = String(options.cursor || '').trim();
+    if (cursor) {
+        params.set('cursor', cursor);
+    }
+    const query = params.toString();
+    const requestKey = `sessions:sidebar:workspace:${safeWorkspaceId}:${query}`;
+    if (options.forceRefresh === true) {
+        invalidateManagedRequests(`sessions:sidebar:workspace:${safeWorkspaceId}:`);
+    }
+    return requestJsonManaged(
+        requestKey,
+        `/api/workspaces/${encodeURIComponent(safeWorkspaceId)}/sessions/sidebar${query ? `?${query}` : ''}`,
+        { signal: options.signal },
+        'Failed to fetch sessions',
+        { ttlMs: 500 },
+    );
+}
+
 export async function startNewSession(workspaceId, options = {}) {
     const normalModelProfile = String(options.normalModelProfile || '').trim();
     const payload = { workspace_id: workspaceId };

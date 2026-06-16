@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import difflib
+import json
 import mimetypes
 import posixpath
 import re
@@ -12,7 +14,10 @@ import shutil
 import subprocess
 import threading
 import time
+from collections.abc import Mapping
+from datetime import datetime
 from pathlib import Path
+from typing import NamedTuple
 
 from relay_teams.logger import get_logger, log_event
 from relay_teams.paths import (
@@ -39,6 +44,7 @@ from relay_teams.workspace.workspace_models import (
     WorkspaceMountProvider,
     WorkspaceMountRecord,
     WorkspaceMountCapabilities,
+    WorkspacePage,
     WorkspaceLocalMountConfig,
     WorkspaceProfile,
     WorkspaceRecord,
@@ -54,7 +60,6 @@ from relay_teams.workspace.workspace_models import (
     legacy_workspace_mount_from_profile,
 )
 from relay_teams.workspace.workspace_repository import WorkspaceRepository
-import asyncio
 
 
 _NON_WORKSPACE_ID_CHARS = re.compile(r"[^a-z0-9]+")
@@ -76,6 +81,8 @@ _SEARCH_CACHE_TTL_SECONDS = 300.0
 _SEARCH_COLD_BUILD_TIMEOUT_SECONDS = 0.35
 _SEARCH_RIPGREP_TIMEOUT_SECONDS = 15.0
 _WORKSPACE_FILE_PREVIEW_MAX_BYTES = 512 * 1024
+_WORKSPACE_PAGE_DEFAULT_LIMIT = 50
+_WORKSPACE_PAGE_MAX_LIMIT = 200
 _SEARCH_SKIP_DIRECTORY_NAMES = frozenset(
     {
         ".git",
@@ -178,6 +185,55 @@ _WORKSPACE_IMAGE_MEDIA_TYPES = frozenset(
     }
 )
 _logger = get_logger(__name__)
+
+
+class _WorkspacePageCursor(NamedTuple):
+    created_at: datetime
+    workspace_id: str
+
+
+def _validate_workspace_page_limit(limit: int) -> int:
+    safe_limit = int(limit)
+    if safe_limit < 1 or safe_limit > _WORKSPACE_PAGE_MAX_LIMIT:
+        raise ValueError("limit must be between 1 and 200")
+    return safe_limit
+
+
+def _encode_workspace_page_cursor(record: WorkspaceRecord) -> str:
+    payload = json.dumps(
+        {
+            "created_at": record.created_at.isoformat(),
+            "workspace_id": record.workspace_id,
+        },
+        separators=(",", ":"),
+    )
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _decode_workspace_page_cursor(cursor: str | None) -> _WorkspacePageCursor | None:
+    safe_cursor = str(cursor or "").strip()
+    if not safe_cursor:
+        return None
+    padding = "=" * (-len(safe_cursor) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(f"{safe_cursor}{padding}".encode("ascii"))
+        decoded: object = json.loads(raw.decode("utf-8"))
+    except (binascii.Error, UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("Invalid workspace pagination cursor") from exc
+    if not isinstance(decoded, Mapping):
+        raise ValueError("Invalid workspace pagination cursor")
+    created_at_raw = decoded.get("created_at")
+    workspace_id_raw = decoded.get("workspace_id")
+    if not isinstance(created_at_raw, str) or not isinstance(workspace_id_raw, str):
+        raise ValueError("Invalid workspace pagination cursor")
+    try:
+        created_at = datetime.fromisoformat(created_at_raw)
+    except ValueError as exc:
+        raise ValueError("Invalid workspace pagination cursor") from exc
+    workspace_id = workspace_id_raw.strip()
+    if not workspace_id:
+        raise ValueError("Invalid workspace pagination cursor")
+    return _WorkspacePageCursor(created_at=created_at, workspace_id=workspace_id)
 
 
 def _read_workspace_file_preview(resolved_path: Path) -> tuple[int, bytes]:
@@ -1547,6 +1603,31 @@ class WorkspaceService:
     async def list_workspaces_async(self) -> tuple[WorkspaceRecord, ...]:
 
         return await asyncio.to_thread(self.list_workspaces)
+
+    async def list_workspaces_page_async(
+        self,
+        *,
+        limit: int = _WORKSPACE_PAGE_DEFAULT_LIMIT,
+        cursor: str | None = None,
+    ) -> WorkspacePage:
+        safe_limit = _validate_workspace_page_limit(limit)
+        marker = _decode_workspace_page_cursor(cursor)
+        records = await self._repository.list_page_async(
+            limit=safe_limit + 1,
+            before_created_at=marker.created_at if marker is not None else None,
+            before_workspace_id=marker.workspace_id if marker is not None else None,
+        )
+        has_more = len(records) > safe_limit
+        selected_records = tuple(records[:safe_limit])
+        return WorkspacePage(
+            items=selected_records,
+            next_cursor=(
+                _encode_workspace_page_cursor(selected_records[-1])
+                if has_more and selected_records
+                else None
+            ),
+            has_more=has_more,
+        )
 
     def delete_workspace(self, workspace_id: str) -> None:
         _ = self.delete_workspace_with_options(

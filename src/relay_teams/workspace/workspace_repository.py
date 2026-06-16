@@ -97,6 +97,12 @@ class WorkspaceRepository(SharedSqliteRepository):
                 ON workspace_mounts(workspace_id)
                 """
             )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_workspaces_created_id
+                ON workspaces(created_at DESC, workspace_id DESC)
+                """
+            )
             self._migrate_legacy_workspace_rows()
 
         run_sqlite_write_with_retry(
@@ -493,6 +499,84 @@ class WorkspaceRepository(SharedSqliteRepository):
             mounts_by_workspace: dict[str, list[sqlite3.Row]] = {}
             for row in mount_rows:
                 mounts_by_workspace.setdefault(str(row["workspace_id"]), []).append(row)
+            records: list[WorkspaceRecord] = []
+            for row in rows:
+                try:
+                    records.append(
+                        self._to_record(
+                            row=row,
+                            mount_rows=tuple(
+                                mounts_by_workspace.get(str(row["workspace_id"]), [])
+                            ),
+                        )
+                    )
+                except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+                    _log_invalid_workspace_row(row=row, error=exc)
+            return tuple(records)
+
+        return await self._run_async_read(operation)
+
+    async def list_page_async(
+        self,
+        *,
+        limit: int,
+        before_created_at: datetime | None = None,
+        before_workspace_id: str | None = None,
+    ) -> tuple[WorkspaceRecord, ...]:
+        async def operation(conn: aiosqlite.Connection) -> tuple[WorkspaceRecord, ...]:
+            safe_limit = max(1, int(limit))
+            if before_created_at is None or before_workspace_id is None:
+                rows = await async_fetchall(
+                    conn,
+                    """
+                    SELECT * FROM workspaces
+                    ORDER BY created_at DESC, workspace_id DESC
+                    LIMIT ?
+                    """,
+                    (safe_limit,),
+                )
+            else:
+                cursor_created_at = before_created_at.isoformat()
+                rows = await async_fetchall(
+                    conn,
+                    """
+                    SELECT * FROM workspaces
+                    WHERE created_at < ?
+                       OR (created_at = ? AND workspace_id < ?)
+                    ORDER BY created_at DESC, workspace_id DESC
+                    LIMIT ?
+                    """,
+                    (
+                        cursor_created_at,
+                        cursor_created_at,
+                        before_workspace_id,
+                        safe_limit,
+                    ),
+                )
+            workspace_ids = tuple(str(row["workspace_id"]) for row in rows)
+            mounts_by_workspace: dict[str, list[sqlite3.Row]] = {}
+            if workspace_ids:
+                placeholders = ",".join("?" for _ in workspace_ids)
+                mount_rows = await async_fetchall(
+                    conn,
+                    f"""
+                    SELECT * FROM workspace_mounts
+                    WHERE workspace_id IN ({placeholders})
+                    ORDER BY
+                        workspace_id ASC,
+                        CASE provider
+                            WHEN 'local' THEN 0
+                            WHEN 'ssh' THEN 1
+                            ELSE 2
+                        END ASC,
+                        mount_name ASC
+                    """,
+                    workspace_ids,
+                )
+                for row in mount_rows:
+                    mounts_by_workspace.setdefault(str(row["workspace_id"]), []).append(
+                        row
+                    )
             records: list[WorkspaceRecord] = []
             for row in rows:
                 try:

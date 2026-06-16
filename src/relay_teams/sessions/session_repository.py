@@ -20,6 +20,7 @@ from relay_teams.validation import (
 )
 
 LOGGER = get_logger(__name__)
+_SQLITE_SAFE_VARIABLE_LIMIT = 900
 
 
 class SessionRepository(SharedSqliteRepository):
@@ -94,6 +95,12 @@ class SessionRepository(SharedSqliteRepository):
                 UPDATE sessions
                 SET started_at=NULL
                 WHERE LOWER(TRIM(COALESCE(started_at, ''))) IN ('', 'none', 'null')
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_sessions_workspace_created_session
+                ON sessions(workspace_id, created_at DESC, session_id DESC)
                 """
             )
 
@@ -660,31 +667,24 @@ class SessionRepository(SharedSqliteRepository):
     def list_all(self) -> tuple[SessionRecord, ...]:
         rows = self._run_read(
             lambda: self._conn.execute(
-                "SELECT * FROM sessions ORDER BY created_at DESC"
+                "SELECT * FROM sessions ORDER BY created_at DESC, session_id DESC"
             ).fetchall()
         )
-        records: list[SessionRecord] = []
-        for row in rows:
-            try:
-                records.append(self._to_record(row))
-            except (ValidationError, ValueError) as exc:
-                _log_invalid_session_row(row=row, error=exc)
-        return tuple(records)
+        return self._records_from_rows(rows)
 
     def list_by_workspace(self, workspace_id: str) -> tuple[SessionRecord, ...]:
         rows = self._run_read(
             lambda: self._conn.execute(
-                "SELECT * FROM sessions WHERE workspace_id=? ORDER BY created_at DESC",
+                """
+                SELECT *
+                FROM sessions
+                WHERE workspace_id=?
+                ORDER BY created_at DESC, session_id DESC
+                """,
                 (workspace_id,),
             ).fetchall()
         )
-        records: list[SessionRecord] = []
-        for row in rows:
-            try:
-                records.append(self._to_record(row))
-            except (ValidationError, ValueError) as exc:
-                _log_invalid_session_row(row=row, error=exc)
-        return tuple(records)
+        return self._records_from_rows(rows)
 
     async def list_by_workspace_async(
         self, workspace_id: str
@@ -692,25 +692,155 @@ class SessionRepository(SharedSqliteRepository):
         rows = await self._run_async_read(
             lambda conn: async_fetchall(
                 conn,
-                "SELECT * FROM sessions WHERE workspace_id=? ORDER BY created_at DESC",
+                """
+                SELECT *
+                FROM sessions
+                WHERE workspace_id=?
+                ORDER BY created_at DESC, session_id DESC
+                """,
                 (workspace_id,),
             )
         )
-        records: list[SessionRecord] = []
-        for row in rows:
-            try:
-                records.append(self._to_record(row))
-            except (ValidationError, ValueError) as exc:
-                _log_invalid_session_row(row=row, error=exc)
-        return tuple(records)
+        return self._records_from_rows(rows)
+
+    async def list_by_workspace_page_async(
+        self,
+        workspace_id: str,
+        *,
+        limit: int,
+        before_created_at: datetime | None = None,
+        before_session_id: str | None = None,
+    ) -> tuple[SessionRecord, ...]:
+        if limit <= 0:
+            return ()
+        if (before_created_at is None) != (before_session_id is None):
+            raise ValueError(
+                "Both before_created_at and before_session_id are required "
+                "for paged session queries"
+            )
+        if before_created_at is None:
+            rows = await self._run_async_read(
+                lambda conn: async_fetchall(
+                    conn,
+                    """
+                    SELECT *
+                    FROM sessions
+                    WHERE workspace_id=?
+                    ORDER BY created_at DESC, session_id DESC
+                    LIMIT ?
+                    """,
+                    (workspace_id, limit),
+                )
+            )
+            return self._records_from_rows(rows)
+        cursor_created_at = before_created_at.isoformat()
+        rows = await self._run_async_read(
+            lambda conn: async_fetchall(
+                conn,
+                """
+                SELECT *
+                FROM sessions
+                WHERE workspace_id=?
+                  AND (
+                    created_at < ?
+                    OR (created_at = ? AND session_id < ?)
+                  )
+                ORDER BY created_at DESC, session_id DESC
+                LIMIT ?
+                """,
+                (
+                    workspace_id,
+                    cursor_created_at,
+                    cursor_created_at,
+                    before_session_id,
+                    limit,
+                ),
+            )
+        )
+        return self._records_from_rows(rows)
+
+    async def list_by_ids_async(
+        self,
+        session_ids: tuple[str, ...],
+    ) -> tuple[SessionRecord, ...]:
+        normalized_ids = _normalize_identifier_tuple(session_ids)
+        if not normalized_ids:
+            return ()
+        rows: list[sqlite3.Row] = []
+        for chunk in _chunked_identifiers(normalized_ids):
+            placeholders = ", ".join("?" for _ in chunk)
+            query = f"""
+                SELECT *
+                FROM sessions
+                WHERE session_id IN ({placeholders})
+                ORDER BY created_at DESC, session_id DESC
+                """
+            fetched = await self._run_async_read(
+                lambda conn, query=query, params=chunk: async_fetchall(
+                    conn,
+                    query,
+                    params,
+                )
+            )
+            rows.extend(fetched)
+        rows.sort(
+            key=lambda row: (
+                str(row["created_at"] or ""),
+                str(row["session_id"] or ""),
+            ),
+            reverse=True,
+        )
+        return self._records_from_rows(rows)
+
+    async def list_by_project_refs_async(
+        self,
+        *,
+        project_kind: ProjectKind,
+        project_ids: tuple[str, ...],
+    ) -> tuple[SessionRecord, ...]:
+        normalized_ids = _normalize_identifier_tuple(project_ids)
+        if not normalized_ids:
+            return ()
+        rows: list[sqlite3.Row] = []
+        for chunk in _chunked_identifiers(normalized_ids):
+            placeholders = ", ".join("?" for _ in chunk)
+            query = f"""
+                SELECT *
+                FROM sessions
+                WHERE project_kind=? AND project_id IN ({placeholders})
+                ORDER BY created_at DESC, session_id DESC
+                """
+            params = (project_kind.value, *chunk)
+            fetched = await self._run_async_read(
+                lambda conn, query=query, params=params: async_fetchall(
+                    conn,
+                    query,
+                    params,
+                )
+            )
+            rows.extend(fetched)
+        rows.sort(
+            key=lambda row: (
+                str(row["created_at"] or ""),
+                str(row["session_id"] or ""),
+            ),
+            reverse=True,
+        )
+        return self._records_from_rows(rows)
 
     async def list_all_async(self) -> tuple[SessionRecord, ...]:
         rows = await self._run_async_read(
             lambda conn: async_fetchall(
                 conn,
-                "SELECT * FROM sessions ORDER BY created_at DESC",
+                "SELECT * FROM sessions ORDER BY created_at DESC, session_id DESC",
             )
         )
+        return self._records_from_rows(rows)
+
+    def _records_from_rows(
+        self,
+        rows: list[sqlite3.Row] | tuple[sqlite3.Row, ...],
+    ) -> tuple[SessionRecord, ...]:
         records: list[SessionRecord] = []
         for row in rows:
             try:
@@ -855,6 +985,21 @@ def _metadata_from_json(value: object, *, session_id: str) -> dict[str, str]:
             payload=payload,
         )
     return normalized
+
+
+def _normalize_identifier_tuple(values: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            value for value in (str(item or "").strip() for item in values) if value
+        )
+    )
+
+
+def _chunked_identifiers(values: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
+    return tuple(
+        values[index : index + _SQLITE_SAFE_VARIABLE_LIMIT]
+        for index in range(0, len(values), _SQLITE_SAFE_VARIABLE_LIMIT)
+    )
 
 
 def _persisted_value_preview(value: object) -> str:
