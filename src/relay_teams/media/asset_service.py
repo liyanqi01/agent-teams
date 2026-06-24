@@ -1,0 +1,488 @@
+from __future__ import annotations
+
+import base64
+import asyncio
+import binascii
+import mimetypes
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import ParseResult, urlparse
+from uuid import uuid4
+
+from pydantic_ai.messages import (
+    AudioUrl,
+    BinaryContent,
+    ImageUrl,
+    UserContent,
+    VideoUrl,
+)
+
+from relay_teams.media.asset_repository import MediaAssetRepository
+from relay_teams.media.prompt_content import UserPromptContent
+from relay_teams.media.models import (
+    ContentPart,
+    InlineMediaContentPart,
+    MediaAssetRecord,
+    MediaAssetStorageKind,
+    MediaModality,
+    MediaRefContentPart,
+    TextContentPart,
+)
+from relay_teams.workspace import WorkspaceManager
+
+_LOCAL_ASSET_URL_PATTERN = re.compile(
+    r"^/api/sessions/(?P<session_id>[^/]+)/media/(?P<asset_id>[^/]+)/file$"
+)
+_LOCAL_PROVIDER_HOSTS = {"127.0.0.1", "localhost", "::1"}
+_DEFAULT_LOCAL_SERVER_BASE_URL = "http://127.0.0.1:8000"
+
+
+class MediaAssetService:
+    def __init__(
+        self,
+        *,
+        repository: MediaAssetRepository,
+        workspace_manager: WorkspaceManager,
+        local_server_base_url: str = _DEFAULT_LOCAL_SERVER_BASE_URL,
+    ) -> None:
+        self._repository = repository
+        self._workspace_manager = workspace_manager
+        self._local_server_base_url = local_server_base_url.rstrip("/")
+        parsed_base_url = urlparse(self._local_server_base_url)
+        self._local_provider_netloc = parsed_base_url.netloc.strip().lower()
+        self._local_provider_host = (parsed_base_url.hostname or "").strip().lower()
+        self._local_provider_port = parsed_base_url.port
+        self._local_provider_base_path = parsed_base_url.path.rstrip("/")
+
+    def normalize_content_parts(
+        self,
+        *,
+        session_id: str,
+        workspace_id: str,
+        parts: tuple[ContentPart, ...],
+    ) -> tuple[ContentPart, ...]:
+        normalized: list[ContentPart] = []
+        for part in parts:
+            if isinstance(part, InlineMediaContentPart):
+                record = self.store_inline_media(
+                    session_id=session_id,
+                    workspace_id=workspace_id,
+                    part=part,
+                )
+                normalized.append(self.to_content_part(record))
+                continue
+            normalized.append(part)
+        return tuple(normalized)
+
+    def store_inline_media(
+        self,
+        *,
+        session_id: str,
+        workspace_id: str,
+        part: InlineMediaContentPart,
+        source: str = "inline_input",
+    ) -> MediaAssetRecord:
+        compact = "".join(part.base64_data.split())
+        try:
+            payload = base64.b64decode(compact, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("Invalid base64 media payload") from exc
+        return self.store_bytes(
+            session_id=session_id,
+            workspace_id=workspace_id,
+            modality=part.modality,
+            mime_type=part.mime_type,
+            data=payload,
+            name=part.name,
+            size_bytes=part.size_bytes,
+            width=part.width,
+            height=part.height,
+            duration_ms=part.duration_ms,
+            thumbnail_asset_id=part.thumbnail_asset_id,
+            source=source,
+        )
+
+    def store_bytes(
+        self,
+        *,
+        session_id: str,
+        workspace_id: str,
+        modality: MediaModality,
+        mime_type: str,
+        data: bytes,
+        name: str = "",
+        size_bytes: int | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        duration_ms: int | None = None,
+        thumbnail_asset_id: str | None = None,
+        source: str = "generated",
+    ) -> MediaAssetRecord:
+        asset_id = f"asset-{uuid4().hex[:12]}"
+        storage_dir = self._storage_dir(
+            workspace_id=workspace_id,
+            session_id=session_id,
+        )
+        storage_dir.mkdir(parents=True, exist_ok=True)
+        suffix = _suffix_for_media(name=name, mime_type=mime_type)
+        file_name = f"{asset_id}{suffix}"
+        file_path = storage_dir / file_name
+        file_path.write_bytes(data)
+        now = datetime.now(tz=timezone.utc)
+        return self._repository.upsert(
+            MediaAssetRecord(
+                asset_id=asset_id,
+                session_id=session_id,
+                workspace_id=workspace_id,
+                storage_kind=MediaAssetStorageKind.LOCAL,
+                modality=modality,
+                mime_type=mime_type,
+                name=name.strip(),
+                relative_path=file_name,
+                size_bytes=size_bytes if size_bytes is not None else len(data),
+                width=width,
+                height=height,
+                duration_ms=duration_ms,
+                thumbnail_asset_id=thumbnail_asset_id,
+                source=source,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+    def store_remote_reference(
+        self,
+        *,
+        session_id: str,
+        workspace_id: str,
+        modality: MediaModality,
+        mime_type: str,
+        url: str,
+        name: str = "",
+        size_bytes: int | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        duration_ms: int | None = None,
+        thumbnail_asset_id: str | None = None,
+        source: str = "remote_reference",
+    ) -> MediaAssetRecord:
+        asset_id = f"asset-{uuid4().hex[:12]}"
+        now = datetime.now(tz=timezone.utc)
+        return self._repository.upsert(
+            MediaAssetRecord(
+                asset_id=asset_id,
+                session_id=session_id,
+                workspace_id=workspace_id,
+                storage_kind=MediaAssetStorageKind.REMOTE,
+                modality=modality,
+                mime_type=mime_type,
+                name=name.strip(),
+                external_url=url.strip(),
+                size_bytes=size_bytes,
+                width=width,
+                height=height,
+                duration_ms=duration_ms,
+                thumbnail_asset_id=thumbnail_asset_id,
+                source=source,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+    def get_asset(self, asset_id: str) -> MediaAssetRecord:
+        return self._repository.get(asset_id)
+
+    def list_session_assets(self, session_id: str) -> tuple[MediaAssetRecord, ...]:
+        return self._repository.list_by_session(session_id)
+
+    def delete_session_assets(self, session_id: str) -> None:
+        self._repository.delete_by_session(session_id)
+
+    def get_asset_file(self, *, session_id: str, asset_id: str) -> tuple[Path, str]:
+        record = self._repository.get(asset_id)
+        if record.session_id != session_id:
+            raise KeyError(f"Asset {asset_id} does not belong to session {session_id}")
+        if (
+            record.storage_kind != MediaAssetStorageKind.LOCAL
+            or record.relative_path is None
+        ):
+            raise FileNotFoundError(f"Asset file is not available locally: {asset_id}")
+        file_path = (
+            self._storage_dir(
+                workspace_id=record.workspace_id,
+                session_id=record.session_id,
+            )
+            / record.relative_path
+        )
+        if not file_path.exists() or not file_path.is_file():
+            raise FileNotFoundError(f"Asset file not found: {asset_id}")
+        return file_path, record.mime_type
+
+    async def get_asset_async(self, asset_id: str) -> MediaAssetRecord:
+        return await self._repository.get_async(asset_id)
+
+    async def list_session_assets_async(
+        self, session_id: str
+    ) -> tuple[MediaAssetRecord, ...]:
+        return await self._repository.list_by_session_async(session_id)
+
+    async def store_bytes_async(
+        self,
+        *,
+        session_id: str,
+        workspace_id: str,
+        modality: MediaModality,
+        mime_type: str,
+        data: bytes,
+        name: str = "",
+        size_bytes: int | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        duration_ms: int | None = None,
+        thumbnail_asset_id: str | None = None,
+        source: str = "generated",
+    ) -> MediaAssetRecord:
+        return await asyncio.to_thread(
+            self.store_bytes,
+            session_id=session_id,
+            workspace_id=workspace_id,
+            modality=modality,
+            mime_type=mime_type,
+            data=data,
+            name=name,
+            size_bytes=size_bytes,
+            width=width,
+            height=height,
+            duration_ms=duration_ms,
+            thumbnail_asset_id=thumbnail_asset_id,
+            source=source,
+        )
+
+    async def delete_session_assets_async(self, session_id: str) -> None:
+        await self._repository.delete_by_session_async(session_id)
+
+    async def get_asset_file_async(
+        self, *, session_id: str, asset_id: str
+    ) -> tuple[Path, str]:
+        return await asyncio.to_thread(
+            self.get_asset_file, session_id=session_id, asset_id=asset_id
+        )
+
+    def to_content_part(self, record: MediaAssetRecord) -> MediaRefContentPart:
+        return MediaRefContentPart(
+            asset_id=record.asset_id,
+            session_id=record.session_id,
+            modality=record.modality,
+            mime_type=record.mime_type,
+            name=record.name,
+            url=self.asset_url(record.session_id, record.asset_id, record.external_url),
+            size_bytes=record.size_bytes,
+            width=record.width,
+            height=record.height,
+            duration_ms=record.duration_ms,
+            thumbnail_asset_id=record.thumbnail_asset_id,
+        )
+
+    def asset_url(
+        self,
+        session_id: str,
+        asset_id: str,
+        external_url: str | None = None,
+    ) -> str:
+        if external_url is not None and external_url.strip():
+            return external_url.strip()
+        return f"/api/sessions/{session_id}/media/{asset_id}/file"
+
+    def load_provider_content(
+        self,
+        *,
+        part: MediaRefContentPart,
+    ) -> ImageUrl | AudioUrl | VideoUrl | BinaryContent:
+        record = self._repository.get(part.asset_id)
+        url = (
+            self.asset_url(record.session_id, record.asset_id, record.external_url)
+            if record.storage_kind == MediaAssetStorageKind.REMOTE
+            else self.provider_asset_url(record.session_id, record.asset_id)
+        )
+        force_download = (
+            False
+            if record.storage_kind == MediaAssetStorageKind.REMOTE
+            else "allow-local"
+        )
+        if record.modality == MediaModality.IMAGE:
+            return ImageUrl(
+                url=url,
+                media_type=record.mime_type,
+                force_download=force_download,
+            )
+        if record.modality == MediaModality.AUDIO:
+            return AudioUrl(
+                url=url,
+                media_type=record.mime_type,
+                force_download=force_download,
+            )
+        return VideoUrl(
+            url=url,
+            media_type=record.mime_type,
+            force_download=force_download,
+        )
+
+    def provider_asset_url(self, session_id: str, asset_id: str) -> str:
+        return (
+            f"{self._local_server_base_url}"
+            f"/api/sessions/{session_id}/media/{asset_id}/file"
+        )
+
+    def to_persisted_user_prompt_content(
+        self,
+        *,
+        parts: tuple[ContentPart, ...],
+    ) -> UserPromptContent:
+        if not parts:
+            return ""
+        if all(isinstance(part, TextContentPart) for part in parts):
+            return "\n\n".join(
+                part.text for part in parts if isinstance(part, TextContentPart)
+            ).strip()
+        content: list[UserContent] = []
+        for part in parts:
+            if isinstance(part, TextContentPart):
+                content.append(part.text)
+                continue
+            if isinstance(part, InlineMediaContentPart):
+                raise ValueError(
+                    "Inline media must be normalized before provider execution"
+                )
+            url = str(part.url).strip()
+            if part.modality == MediaModality.IMAGE:
+                content.append(ImageUrl(url=url, media_type=part.mime_type))
+                continue
+            if part.modality == MediaModality.AUDIO:
+                content.append(AudioUrl(url=url, media_type=part.mime_type))
+                continue
+            content.append(VideoUrl(url=url, media_type=part.mime_type))
+        return tuple(content)
+
+    def to_provider_user_prompt_content(
+        self,
+        *,
+        parts: tuple[ContentPart, ...],
+    ) -> UserPromptContent:
+        if not parts:
+            return ""
+        if all(isinstance(part, TextContentPart) for part in parts):
+            return "\n\n".join(
+                part.text for part in parts if isinstance(part, TextContentPart)
+            ).strip()
+        content: list[UserContent] = []
+        for part in parts:
+            if isinstance(part, TextContentPart):
+                content.append(part.text)
+                continue
+            if isinstance(part, InlineMediaContentPart):
+                raise ValueError(
+                    "Inline media must be normalized before provider execution"
+                )
+            content.append(self.load_provider_content(part=part))
+        return tuple(content)
+
+    def hydrate_user_prompt_content(
+        self,
+        *,
+        content: UserPromptContent,
+    ) -> UserPromptContent:
+        if isinstance(content, str):
+            return content
+        hydrated: list[UserContent] = []
+        for item in content:
+            local_reference = self._parse_local_asset_url(item)
+            if local_reference is None:
+                hydrated.append(item)
+                continue
+            session_id, asset_id = local_reference
+            file_path, media_type = self.get_asset_file(
+                session_id=session_id,
+                asset_id=asset_id,
+            )
+            hydrated.append(
+                BinaryContent(
+                    data=file_path.read_bytes(),
+                    media_type=media_type,
+                )
+            )
+        return tuple(hydrated)
+
+    def _storage_dir(self, *, workspace_id: str, session_id: str) -> Path:
+        return (
+            self._workspace_manager.session_artifact_dir(
+                workspace_id=workspace_id,
+                session_id=session_id,
+            )
+            / "media"
+        )
+
+    def _parse_local_asset_url(self, item: UserContent) -> tuple[str, str] | None:
+        if isinstance(item, BinaryContent):
+            return None
+        url = ""
+        if isinstance(item, (ImageUrl, AudioUrl, VideoUrl)):
+            url = str(item.url).strip()
+        if not url:
+            return None
+        parsed = urlparse(url)
+        candidate_path = url
+        if parsed.scheme or parsed.netloc:
+            is_configured_local = self._matches_local_provider_url(parsed)
+            if not is_configured_local:
+                return None
+            candidate_path = parsed.path or ""
+            if (
+                is_configured_local
+                and self._local_provider_base_path
+                and candidate_path.startswith(f"{self._local_provider_base_path}/")
+            ):
+                candidate_path = candidate_path[len(self._local_provider_base_path) :]
+        match = _LOCAL_ASSET_URL_PATTERN.match(candidate_path)
+        if match is None:
+            return None
+        return match.group("session_id"), match.group("asset_id")
+
+    def _matches_local_provider_url(self, parsed_url: ParseResult) -> bool:
+        netloc = parsed_url.netloc.strip().lower()
+        if netloc == self._local_provider_netloc:
+            return True
+        host = (parsed_url.hostname or "").strip().lower()
+        if host not in _LOCAL_PROVIDER_HOSTS:
+            return False
+        if self._local_provider_host not in _LOCAL_PROVIDER_HOSTS:
+            return False
+        try:
+            port = parsed_url.port
+        except ValueError:
+            return False
+        return port == self._local_provider_port
+
+
+def infer_media_modality(content_type: str, filename: str = "") -> MediaModality:
+    normalized = str(content_type or "").strip().lower()
+    if normalized.startswith("image/"):
+        return MediaModality.IMAGE
+    if normalized.startswith("audio/"):
+        return MediaModality.AUDIO
+    if normalized.startswith("video/"):
+        return MediaModality.VIDEO
+    guessed_type, _ = mimetypes.guess_type(filename)
+    if isinstance(guessed_type, str):
+        return infer_media_modality(guessed_type)
+    raise ValueError(f"Unsupported media type: {content_type or filename}")
+
+
+def _suffix_for_media(*, name: str, mime_type: str) -> str:
+    candidate = Path(name).suffix.strip()
+    if candidate:
+        return candidate if candidate.startswith(".") else f".{candidate}"
+    guessed = mimetypes.guess_extension(mime_type, strict=False)
+    if guessed is not None:
+        return guessed
+    return ""

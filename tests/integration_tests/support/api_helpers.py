@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import time
 from uuid import uuid4
 
 import httpx
 
 TERMINAL_EVENT_TYPES = {"run_completed", "run_failed", "run_stopped"}
+STREAM_READ_TIMEOUT_SECONDS = 120.0
 
 
 def new_session_id(prefix: str) -> str:
@@ -37,7 +39,7 @@ def create_run(
         "/api/runs",
         json={
             "session_id": session_id,
-            "intent": intent,
+            "input": [{"kind": "text", "text": intent}],
             "execution_mode": execution_mode,
             "yolo": yolo,
         },
@@ -54,28 +56,48 @@ def stream_run_until_terminal(
     client: httpx.Client, *, run_id: str, timeout_seconds: float = 40.0
 ) -> list[dict[str, object]]:
     events: list[dict[str, object]] = []
-    with client.stream(
-        "GET",
-        f"/api/runs/{run_id}/events",
-        timeout=timeout_seconds,
-    ) as response:
-        response.raise_for_status()
-        for raw_line in response.iter_lines():
-            line = raw_line.strip()
-            if not line.startswith("data:"):
-                continue
-            payload = line[5:].strip()
-            if not payload:
-                continue
-            event = json.loads(payload)
-            if not isinstance(event, dict):
-                continue
-            if "error" in event:
-                raise AssertionError(f"Run stream returned error: {event['error']}")
-            events.append(event)
-            event_type = event.get("event_type")
-            if isinstance(event_type, str) and event_type in TERMINAL_EVENT_TYPES:
-                return events
+    deadline = time.monotonic() + timeout_seconds
+    read_timeout = max(1.0, min(STREAM_READ_TIMEOUT_SECONDS, timeout_seconds))
+    stream_timeout = httpx.Timeout(
+        timeout_seconds,
+        connect=min(5.0, timeout_seconds),
+        read=read_timeout,
+        write=min(5.0, timeout_seconds),
+        pool=min(5.0, timeout_seconds),
+    )
+    try:
+        with client.stream(
+            "GET",
+            f"/api/runs/{run_id}/events",
+            timeout=stream_timeout,
+        ) as response:
+            response.raise_for_status()
+            for raw_line in response.iter_lines():
+                if time.monotonic() > deadline:
+                    raise AssertionError(
+                        f"Timed out waiting for terminal event for run_id={run_id}; "
+                        f"received {len(events)} events"
+                    )
+                line = raw_line.strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if not payload:
+                    continue
+                event = json.loads(payload)
+                if not isinstance(event, dict):
+                    continue
+                if "error" in event:
+                    raise AssertionError(f"Run stream returned error: {event['error']}")
+                events.append(event)
+                event_type = event.get("event_type")
+                if isinstance(event_type, str) and event_type in TERMINAL_EVENT_TYPES:
+                    return events
+    except httpx.TimeoutException as exc:
+        raise AssertionError(
+            f"Timed out waiting for terminal event for run_id={run_id}; "
+            f"received {len(events)} events"
+        ) from exc
     raise AssertionError(f"Stream ended without terminal event for run_id={run_id}")
 
 
@@ -117,21 +139,3 @@ def get_coordinator_role_id(client: httpx.Client) -> str:
     if not isinstance(role_id, str) or not role_id:
         raise AssertionError(f"Missing coordinator_role_id in response: {body}")
     return role_id
-
-
-def dispatch_task(
-    client: httpx.Client,
-    *,
-    task_id: str,
-    role_id: str,
-    prompt: str = "",
-) -> dict[str, object]:
-    response = client.post(
-        f"/api/tasks/{task_id}/dispatch",
-        json={"role_id": role_id, "prompt": prompt},
-    )
-    response.raise_for_status()
-    body = response.json()
-    if not isinstance(body, dict):
-        raise AssertionError(f"Invalid dispatch response: {body}")
-    return body

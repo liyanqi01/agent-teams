@@ -1,0 +1,387 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+from relay_teams.sessions.runs.enums import RunEventType
+from relay_teams.sessions.runs.event_log import EventLog
+from relay_teams.sessions.runs.run_models import RunEvent
+
+
+@pytest.mark.asyncio
+async def test_event_log_async_methods_share_persisted_state(tmp_path: Path) -> None:
+    event_log = EventLog(tmp_path / "event_log_async.db")
+    event = RunEvent(
+        session_id="session-1",
+        run_id="run-1",
+        trace_id="run-1",
+        task_id="task-1",
+        instance_id="instance-1",
+        event_type=RunEventType.RUN_STARTED,
+        payload_json="{}",
+    )
+
+    try:
+        event_id = await event_log.emit_run_event_async(event)
+        by_trace = await event_log.list_by_trace_with_ids_async("run-1")
+        by_session = await event_log.list_by_session_with_ids_async("session-1")
+        run_state = await event_log.get_run_state_async("run-1")
+    finally:
+        await event_log.close_async()
+
+    assert event_id > 0
+    assert tuple(item["id"] for item in by_trace) == (event_id,)
+    assert tuple(item["id"] for item in by_session) == (event_id,)
+    assert run_state is not None
+    assert run_state.run_id == "run-1"
+    assert run_state.checkpoint_event_id == event_id
+
+
+@pytest.mark.asyncio
+async def test_event_log_emits_run_events_in_one_ordered_batch(
+    tmp_path: Path,
+) -> None:
+    event_log = EventLog(tmp_path / "event_log_batch.db")
+    events = tuple(
+        RunEvent(
+            session_id="session-1",
+            run_id="run-1",
+            trace_id="run-1",
+            task_id="task-1",
+            instance_id="instance-1",
+            event_type=event_type,
+            payload_json="{}",
+        )
+        for event_type in (
+            RunEventType.RUN_STARTED,
+            RunEventType.MODEL_STEP_STARTED,
+            RunEventType.RUN_COMPLETED,
+        )
+    )
+
+    try:
+        event_ids = await event_log.emit_run_events_async(events)
+        by_trace = await event_log.list_by_trace_with_ids_async("run-1")
+    finally:
+        await event_log.close_async()
+
+    assert event_ids == tuple(range(event_ids[0], event_ids[0] + len(events)))
+    assert tuple(row["id"] for row in by_trace) == event_ids
+    assert tuple(row["event_type"] for row in by_trace) == (
+        RunEventType.RUN_STARTED.value,
+        RunEventType.MODEL_STEP_STARTED.value,
+        RunEventType.RUN_COMPLETED.value,
+    )
+
+
+@pytest.mark.asyncio
+async def test_event_log_emit_run_events_async_returns_empty_for_empty_batch(
+    tmp_path: Path,
+) -> None:
+    event_log = EventLog(tmp_path / "event_log_empty_batch.db")
+    try:
+        event_ids = await event_log.emit_run_events_async(())
+    finally:
+        await event_log.close_async()
+
+    assert event_ids == ()
+
+
+@pytest.mark.asyncio
+async def test_event_log_async_hot_paths_do_not_reinitialize_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event_log = EventLog(tmp_path / "event_log_async_no_reinit.db")
+    event = RunEvent(
+        session_id="session-1",
+        run_id="run-1",
+        trace_id="run-1",
+        task_id="task-1",
+        instance_id="instance-1",
+        event_type=RunEventType.RUN_STARTED,
+        payload_json="{}",
+    )
+
+    async def _fail_init() -> None:
+        raise AssertionError("async schema init must not run on hot paths")
+
+    monkeypatch.setattr(event_log, "_init_tables_async", _fail_init)
+
+    try:
+        event_id = await event_log.emit_run_event_async(event)
+        by_trace = await event_log.list_by_trace_with_ids_async("run-1")
+        await event_log.delete_by_trace_async("run-1")
+    finally:
+        await event_log.close_async()
+
+    assert event_id > 0
+    assert tuple(item["id"] for item in by_trace) == (event_id,)
+
+
+@pytest.mark.asyncio
+async def test_event_log_lists_session_run_events_by_type(
+    tmp_path: Path,
+) -> None:
+    event_log = EventLog(tmp_path / "event_log_session_run_event_types.db")
+    run_started_id = event_log.emit_run_event(
+        RunEvent(
+            session_id="session-1",
+            run_id="run-1",
+            trace_id="run-1",
+            task_id="task-1",
+            instance_id="instance-1",
+            event_type=RunEventType.RUN_STARTED,
+            payload_json='{"started": true}',
+        )
+    )
+    _ = event_log.emit_run_event(
+        RunEvent(
+            session_id="session-1",
+            run_id="run-2",
+            trace_id="run-2",
+            task_id="task-2",
+            instance_id="instance-2",
+            event_type=RunEventType.MODEL_STEP_STARTED,
+            payload_json="{}",
+        )
+    )
+    _ = event_log.emit_run_event(
+        RunEvent(
+            session_id="session-2",
+            run_id="run-1",
+            trace_id="run-1",
+            task_id="task-3",
+            instance_id="instance-3",
+            event_type=RunEventType.RUN_STARTED,
+            payload_json="{}",
+        )
+    )
+
+    try:
+        empty_by_type = event_log.list_by_session_event_types("session-1", ("", "  "))
+        by_type = await event_log.list_by_session_event_types_async(
+            "session-1",
+            (RunEventType.RUN_STARTED.value,),
+        )
+        empty_by_run_and_type = event_log.list_by_session_run_ids_event_types(
+            "session-1",
+            (),
+            (RunEventType.RUN_STARTED.value,),
+        )
+        by_run_and_type = await event_log.list_by_session_run_ids_event_types_async(
+            "session-1",
+            ("run-1", "run-2", "run-1"),
+            (RunEventType.RUN_STARTED.value,),
+        )
+    finally:
+        await event_log.close_async()
+
+    assert empty_by_type == ()
+    assert empty_by_run_and_type == ()
+    assert tuple(row["trace_id"] for row in by_type) == ("run-1",)
+    assert tuple(row["id"] for row in by_run_and_type) == (run_started_id,)
+
+
+@pytest.mark.asyncio
+async def test_event_log_lists_run_events_by_type_across_sessions(
+    tmp_path: Path,
+) -> None:
+    event_log = EventLog(tmp_path / "event_log_run_event_types.db")
+    run_one_id = event_log.emit_run_event(
+        RunEvent(
+            session_id="session-1",
+            run_id="run-1",
+            trace_id="run-1",
+            task_id="task-1",
+            instance_id="instance-1",
+            event_type=RunEventType.RUN_COMPLETED,
+            payload_json='{"ok": true}',
+        )
+    )
+    _ = event_log.emit_run_event(
+        RunEvent(
+            session_id="session-1",
+            run_id="run-2",
+            trace_id="run-2",
+            task_id="task-2",
+            instance_id="instance-2",
+            event_type=RunEventType.RUN_STARTED,
+            payload_json="{}",
+        )
+    )
+    run_three_id = event_log.emit_run_event(
+        RunEvent(
+            session_id="session-2",
+            run_id="run-3",
+            trace_id="run-3",
+            task_id="task-3",
+            instance_id="instance-3",
+            event_type=RunEventType.RUN_COMPLETED,
+            payload_json='{"ok": true}',
+        )
+    )
+
+    try:
+        empty = event_log.list_by_run_ids_event_types(
+            (),
+            (RunEventType.RUN_COMPLETED.value,),
+        )
+        rows = event_log.list_by_run_ids_event_types(
+            ("run-3", "run-1", "run-3"),
+            (RunEventType.RUN_COMPLETED.value,),
+        )
+        async_rows = await event_log.list_by_run_ids_event_types_async(
+            ("run-1", "run-3"),
+            (RunEventType.RUN_COMPLETED.value,),
+        )
+    finally:
+        await event_log.close_async()
+
+    assert empty == ()
+    assert tuple(row["id"] for row in rows) == (run_one_id, run_three_id)
+    assert tuple(row["trace_id"] for row in rows) == ("run-1", "run-3")
+    assert tuple(row["id"] for row in async_rows) == (run_one_id, run_three_id)
+
+
+@pytest.mark.asyncio
+async def test_event_log_lists_session_events_after_id_and_filters_subagent_runs(
+    tmp_path: Path,
+) -> None:
+    event_log = EventLog(tmp_path / "event_log_session_after_id.db")
+    first_id = event_log.emit_run_event(
+        RunEvent(
+            session_id="session-1",
+            run_id="run-main",
+            trace_id="run-main",
+            event_type=RunEventType.RUN_STARTED,
+            payload_json="{}",
+        )
+    )
+    subagent_id = event_log.emit_run_event(
+        RunEvent(
+            session_id="session-1",
+            run_id="subagent_run_1",
+            trace_id="subagent_run_1",
+            event_type=RunEventType.MODEL_STEP_STARTED,
+            payload_json="{}",
+        )
+    )
+    _ = event_log.emit_run_event(
+        RunEvent(
+            session_id="session-2",
+            run_id="subagent_run_2",
+            trace_id="subagent_run_2",
+            event_type=RunEventType.MODEL_STEP_STARTED,
+            payload_json="{}",
+        )
+    )
+
+    session_rows = event_log.list_by_session_after_id("session-1", first_id)
+    subagent_rows = event_log.list_subagent_run_events_by_session_after_id(
+        "session-1",
+        0,
+    )
+    async_session_rows = await event_log.list_by_session_after_id_async(
+        "session-1",
+        first_id,
+    )
+    async_subagent_rows = (
+        await event_log.list_subagent_run_events_by_session_after_id_async(
+            "session-1",
+            0,
+        )
+    )
+    await event_log.close_async()
+
+    assert tuple(row["id"] for row in session_rows) == (subagent_id,)
+    assert tuple(row["id"] for row in async_session_rows) == (subagent_id,)
+    assert tuple(row["id"] for row in subagent_rows) == (subagent_id,)
+    assert tuple(row["id"] for row in async_subagent_rows) == (subagent_id,)
+
+
+@pytest.mark.asyncio
+async def test_event_log_lists_multiple_traces_after_offsets_in_one_batch(
+    tmp_path: Path,
+) -> None:
+    event_log = EventLog(tmp_path / "event_log_multi_trace_after_id.db")
+    run_1_first = event_log.emit_run_event(
+        RunEvent(
+            session_id="session-1",
+            run_id="run-1",
+            trace_id="run-1",
+            event_type=RunEventType.RUN_STARTED,
+            payload_json='{"run": 1, "seq": 1}',
+        )
+    )
+    run_2_first = event_log.emit_run_event(
+        RunEvent(
+            session_id="session-2",
+            run_id="run-2",
+            trace_id="run-2",
+            event_type=RunEventType.RUN_STARTED,
+            payload_json='{"run": 2, "seq": 1}',
+        )
+    )
+    run_1_second = event_log.emit_run_event(
+        RunEvent(
+            session_id="session-1",
+            run_id="run-1",
+            trace_id="run-1",
+            event_type=RunEventType.MODEL_STEP_STARTED,
+            payload_json='{"run": 1, "seq": 2}',
+        )
+    )
+    run_2_second = event_log.emit_run_event(
+        RunEvent(
+            session_id="session-2",
+            run_id="run-2",
+            trace_id="run-2",
+            event_type=RunEventType.MODEL_STEP_STARTED,
+            payload_json='{"run": 2, "seq": 2}',
+        )
+    )
+    _ = event_log.emit_run_event(
+        RunEvent(
+            session_id="session-3",
+            run_id="run-3",
+            trace_id="run-3",
+            event_type=RunEventType.RUN_STARTED,
+            payload_json='{"run": 3}',
+        )
+    )
+
+    try:
+        rows = await event_log.list_by_traces_after_ids_async(
+            (("run-1", run_1_first), ("run-2", run_2_first), ("run-1", 0))
+        )
+    finally:
+        await event_log.close_async()
+
+    assert run_2_first > run_1_first
+    assert tuple(row["id"] for row in rows) == (run_1_second, run_2_second)
+
+
+def test_event_log_multi_trace_replay_ignores_empty_offsets(tmp_path: Path) -> None:
+    event_log = EventLog(tmp_path / "event_log_multi_trace_empty_offsets.db")
+    try:
+        rows = event_log.list_by_traces_after_ids(((" ", 4),))
+    finally:
+        event_log.close()
+
+    assert rows == ()
+
+
+def test_event_log_has_trace_id_replay_index(tmp_path: Path) -> None:
+    db_path = tmp_path / "event_log_trace_id_index.db"
+    event_log = EventLog(db_path)
+    event_log.close()
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("PRAGMA index_list(events)").fetchall()
+
+    assert "idx_events_trace_id" in {str(row["name"]) for row in rows}

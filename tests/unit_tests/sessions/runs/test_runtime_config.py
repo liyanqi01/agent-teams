@@ -6,8 +6,21 @@ from pathlib import Path
 
 import pytest
 
-from agent_teams.providers.model_config import DEFAULT_LLM_CONNECT_TIMEOUT_SECONDS
-from agent_teams.sessions.runs import runtime_config
+from relay_teams.providers.codeagent_auth import (
+    codeagent_access_token_secret_field_name,
+    codeagent_password_secret_field_name,
+    codeagent_refresh_token_secret_field_name,
+)
+from relay_teams.providers.model_header_utils import model_header_secret_field_name
+from relay_teams.providers.maas_auth import maas_password_secret_field_name
+from relay_teams.providers.model_config import (
+    DEFAULT_ANTHROPIC_BASE_URL,
+    DEFAULT_CODEAGENT_BASE_URL,
+    DEFAULT_LLM_CONNECT_TIMEOUT_SECONDS,
+    DEFAULT_MAAS_BASE_URL,
+)
+from relay_teams.secrets import get_secret_store
+import relay_teams.sessions.runs.runtime_config as runtime_config
 
 
 def test_load_runtime_config_uses_project_config_dir_by_default(
@@ -36,7 +49,7 @@ def test_load_runtime_config_uses_project_config_dir_by_default(
     assert resolved.paths.config_dir == config_dir.resolve()
     assert resolved.paths.env_file == (config_dir / ".env").resolve()
     assert resolved.paths.roles_dir == (config_dir / "roles")
-    assert resolved.paths.db_path == (config_dir / "agent_teams.db")
+    assert resolved.paths.db_path == (config_dir / "relay_teams.db")
     assert resolved.paths.prompts_file == (config_dir / "prompts.json").resolve()
     assert resolved.llm_retry.max_retries == 5
     assert resolved.llm_retry.initial_delay_ms == 2000
@@ -131,6 +144,7 @@ def test_load_llm_configs_error_mentions_model_file_only(tmp_path: Path) -> None
     with pytest.raises(FileNotFoundError) as exc_info:
         runtime_config.load_llm_configs(tmp_path, {})
 
+    assert f'"{tmp_path / "model.json"}"' in str(exc_info.value)
     assert "Please create model.json with at least one profile." in str(exc_info.value)
 
 
@@ -163,7 +177,7 @@ def test_load_llm_configs_reads_bigmodel_provider_field(tmp_path: Path) -> None:
                 "default": {
                     "provider": "bigmodel",
                     "model": "glm-4.5",
-                    "base_url": "https://open.bigmodel.cn/api/paas/v4",
+                    "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
                     "api_key": "plain-text-key",
                 }
             }
@@ -174,6 +188,30 @@ def test_load_llm_configs_reads_bigmodel_provider_field(tmp_path: Path) -> None:
     profiles = runtime_config.load_llm_configs(tmp_path, {})
 
     assert profiles["default"].provider.value == "bigmodel"
+
+
+def test_load_llm_configs_defaults_anthropic_base_url_when_blank(
+    tmp_path: Path,
+) -> None:
+    model_file = tmp_path / "model.json"
+    model_file.write_text(
+        json.dumps(
+            {
+                "default": {
+                    "provider": "anthropic",
+                    "model": "claude-sonnet-4-5",
+                    "base_url": " ",
+                    "api_key": "plain-text-key",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    profiles = runtime_config.load_llm_configs(tmp_path, {})
+
+    assert profiles["default"].provider.value == "anthropic"
+    assert profiles["default"].base_url == DEFAULT_ANTHROPIC_BASE_URL
 
 
 def test_load_runtime_config_reads_explicit_default_profile_name(
@@ -231,6 +269,38 @@ def test_load_runtime_config_uses_first_profile_when_no_default_is_marked(
     resolved = runtime_config.load_runtime_config(config_dir=config_dir)
 
     assert resolved.default_model_profile == "alpha"
+
+
+def test_load_runtime_config_skips_w3_profile_when_connector_secret_is_missing(
+    tmp_path: Path,
+) -> None:
+    config_dir = tmp_path / ".agent-teams"
+    config_dir.mkdir(parents=True)
+    (config_dir / "model.json").write_text(
+        json.dumps(
+            {
+                "w3-maas": {
+                    "provider": "maas",
+                    "model": "pangu",
+                    "base_url": DEFAULT_MAAS_BASE_URL,
+                    "maas_auth": {"auth_source": "w3"},
+                    "is_default": True,
+                },
+                "fallback": {
+                    "model": "fallback-model",
+                    "base_url": "https://fallback.example/v1",
+                    "api_key": "fallback-key",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    resolved = runtime_config.load_runtime_config(config_dir=config_dir)
+
+    assert set(resolved.llm_profiles) == {"fallback"}
+    assert resolved.default_model_profile == "fallback"
+    assert resolved.model_status.loaded is True
 
 
 def test_load_runtime_config_rejects_multiple_explicit_default_profiles(
@@ -311,6 +381,43 @@ def test_load_llm_configs_reads_connect_timeout_seconds(tmp_path: Path) -> None:
     assert profiles["default"].connect_timeout_seconds == 45.0
 
 
+def test_load_llm_configs_preserves_speech_realtime_config(tmp_path: Path) -> None:
+    model_file = tmp_path / "model.json"
+    model_file.write_text(
+        json.dumps(
+            {
+                "stt": {
+                    "model": "qwen3-plus",
+                    "base_url": "https://dashscope.example.test/v1",
+                    "api_key": "plain-text-key",
+                    "speech_realtime": {
+                        "model": "qwen3-omni-flash-realtime",
+                        "websocket_url_template": (
+                            "wss://dashscope.example.test/realtime?model={model}"
+                        ),
+                        "send_model_in_session_update": False,
+                        "stop_event_type": "session.finish",
+                        "send_openai_beta_header": False,
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    profiles = runtime_config.load_llm_configs(tmp_path, {})
+
+    speech_realtime = profiles["stt"].speech_realtime
+    assert speech_realtime.model == "qwen3-omni-flash-realtime"
+    assert (
+        speech_realtime.websocket_url_template
+        == "wss://dashscope.example.test/realtime?model={model}"
+    )
+    assert speech_realtime.send_model_in_session_update is False
+    assert speech_realtime.stop_event_type == "session.finish"
+    assert speech_realtime.send_openai_beta_header is False
+
+
 def test_load_llm_configs_reads_context_window(tmp_path: Path) -> None:
     model_file = tmp_path / "model.json"
     model_file.write_text(
@@ -330,6 +437,29 @@ def test_load_llm_configs_reads_context_window(tmp_path: Path) -> None:
     profiles = runtime_config.load_llm_configs(tmp_path, {})
 
     assert profiles["default"].context_window == 128000
+
+
+def test_load_llm_configs_infers_known_context_window_when_missing(
+    tmp_path: Path,
+) -> None:
+    model_file = tmp_path / "model.json"
+    model_file.write_text(
+        json.dumps(
+            {
+                "default": {
+                    "provider": "openai_compatible",
+                    "model": "gpt-4.1",
+                    "base_url": "https://example.test/v1",
+                    "api_key": "plain-text-key",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    profiles = runtime_config.load_llm_configs(tmp_path, {})
+
+    assert profiles["default"].context_window == 1000000
 
 
 def test_load_llm_configs_resolves_api_key_env_placeholder(tmp_path: Path) -> None:
@@ -379,3 +509,473 @@ def test_load_llm_configs_errors_when_api_key_env_placeholder_is_missing(
         "environment variable 'OPENAI_API_KEY' referenced by api_key is not set"
         in str(exc_info.value)
     )
+
+
+def test_load_llm_configs_allows_header_only_profiles(tmp_path: Path) -> None:
+    model_file = tmp_path / "model.json"
+    model_file.write_text(
+        json.dumps(
+            {
+                "default": {
+                    "model": "gpt-4o-mini",
+                    "base_url": "https://example.test/v1",
+                    "headers": [
+                        {
+                            "name": "Authorization",
+                            "value": "Bearer header-only",
+                        }
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    profiles = runtime_config.load_llm_configs(tmp_path, {})
+
+    assert profiles["default"].api_key is None
+    assert profiles["default"].headers[0].name == "Authorization"
+    assert profiles["default"].headers[0].value == "Bearer header-only"
+
+
+def test_load_llm_configs_resolves_secret_headers_from_secret_store(
+    tmp_path: Path,
+) -> None:
+    model_file = tmp_path / "model.json"
+    model_file.write_text(
+        json.dumps(
+            {
+                "default": {
+                    "model": "gpt-4o-mini",
+                    "base_url": "https://example.test/v1",
+                    "headers": [
+                        {
+                            "name": "Authorization",
+                            "secret": True,
+                            "configured": False,
+                        }
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    get_secret_store().set_secret(
+        tmp_path,
+        namespace="model_profile",
+        owner_id="default",
+        field_name=model_header_secret_field_name("Authorization"),
+        value="Bearer stored-secret",
+    )
+
+    profiles = runtime_config.load_llm_configs(tmp_path, {})
+
+    assert profiles["default"].headers[0].value == "Bearer stored-secret"
+
+
+def test_load_llm_configs_resolves_maas_password_from_secret_store(
+    tmp_path: Path,
+) -> None:
+    model_file = tmp_path / "model.json"
+    model_file.write_text(
+        json.dumps(
+            {
+                "maas-profile": {
+                    "provider": "maas",
+                    "model": "maas-chat",
+                    "base_url": "https://maas.example/api/v2",
+                    "maas_auth": {
+                        "username": "relay-user",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    get_secret_store().set_secret(
+        tmp_path,
+        namespace="model_profile",
+        owner_id="maas-profile",
+        field_name=maas_password_secret_field_name(),
+        value="relay-password",
+    )
+
+    profiles = runtime_config.load_llm_configs(tmp_path, {})
+
+    assert profiles["maas-profile"].provider.value == "maas"
+    assert profiles["maas-profile"].base_url == DEFAULT_MAAS_BASE_URL
+    assert profiles["maas-profile"].api_key is None
+    assert profiles["maas-profile"].maas_auth is not None
+    assert profiles["maas-profile"].maas_auth.password == "relay-password"
+
+
+def test_load_llm_configs_resolves_codeagent_tokens_from_secret_store(
+    tmp_path: Path,
+) -> None:
+    model_file = tmp_path / "model.json"
+    model_file.write_text(
+        json.dumps(
+            {
+                "codeagent-profile": {
+                    "provider": "codeagent",
+                    "model": "codeagent-chat",
+                    "base_url": "https://codeagent.example/codeAgentPro",
+                    "codeagent_auth": {
+                        "client_id": "codeagent-client",
+                        "scope": "SCOPE",
+                        "scope_resource": "devuc",
+                        "has_access_token": True,
+                        "has_refresh_token": True,
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    get_secret_store().set_secret(
+        tmp_path,
+        namespace="model_profile",
+        owner_id="codeagent-profile",
+        field_name=codeagent_access_token_secret_field_name(),
+        value="codeagent-access-token",
+    )
+    get_secret_store().set_secret(
+        tmp_path,
+        namespace="model_profile",
+        owner_id="codeagent-profile",
+        field_name=codeagent_refresh_token_secret_field_name(),
+        value="codeagent-refresh-token",
+    )
+
+    profiles = runtime_config.load_llm_configs(tmp_path, {})
+
+    assert profiles["codeagent-profile"].provider.value == "codeagent"
+    assert profiles["codeagent-profile"].base_url == DEFAULT_CODEAGENT_BASE_URL
+    assert profiles["codeagent-profile"].api_key is None
+    assert profiles["codeagent-profile"].codeagent_auth is not None
+    assert (
+        profiles["codeagent-profile"].codeagent_auth.access_token
+        == "codeagent-access-token"
+    )
+    assert (
+        profiles["codeagent-profile"].codeagent_auth.refresh_token
+        == "codeagent-refresh-token"
+    )
+    assert profiles["codeagent-profile"].codeagent_auth._secret_config_dir == tmp_path
+    assert profiles["codeagent-profile"].codeagent_auth._secret_owner_id == (
+        "codeagent-profile"
+    )
+
+
+def test_load_llm_configs_rejects_codeagent_profile_without_completed_auth(
+    tmp_path: Path,
+) -> None:
+    model_file = tmp_path / "model.json"
+    model_file.write_text(
+        json.dumps(
+            {
+                "codeagent-profile": {
+                    "provider": "codeagent",
+                    "model": "codeagent-chat",
+                    "base_url": "https://codeagent.example/codeAgentPro",
+                    "codeagent_auth": {
+                        "has_refresh_token": True,
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="CodeAgent profiles require codeagent_auth from completed SSO login.",
+    ):
+        runtime_config.load_llm_configs(tmp_path, {})
+
+
+def test_load_llm_configs_rejects_codeagent_profile_without_codeagent_auth(
+    tmp_path: Path,
+) -> None:
+    model_file = tmp_path / "model.json"
+    model_file.write_text(
+        json.dumps(
+            {
+                "codeagent-profile": {
+                    "provider": "codeagent",
+                    "model": "codeagent-chat",
+                    "base_url": "https://codeagent.example/codeAgentPro",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="CodeAgent profiles require codeagent_auth configuration.",
+    ):
+        runtime_config.load_llm_configs(tmp_path, {})
+
+
+def test_load_llm_configs_rejects_codeagent_password_auth_without_password(
+    tmp_path: Path,
+) -> None:
+    model_file = tmp_path / "model.json"
+    model_file.write_text(
+        json.dumps(
+            {
+                "codeagent-profile": {
+                    "provider": "codeagent",
+                    "model": "codeagent-chat",
+                    "base_url": "https://codeagent.example/codeAgentPro",
+                    "codeagent_auth": {
+                        "auth_method": "password",
+                        "username": "relay-user",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="CodeAgent password profiles require codeagent_auth.username and password.",
+    ):
+        runtime_config.load_llm_configs(tmp_path, {})
+
+
+def test_load_llm_configs_rejects_non_object_codeagent_auth(tmp_path: Path) -> None:
+    model_file = tmp_path / "model.json"
+    model_file.write_text(
+        json.dumps(
+            {
+                "codeagent-profile": {
+                    "provider": "codeagent",
+                    "model": "codeagent-chat",
+                    "base_url": "https://codeagent.example/codeAgentPro",
+                    "codeagent_auth": "invalid",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="codeagent_auth must be an object.",
+    ):
+        runtime_config.load_llm_configs(tmp_path, {})
+
+
+def test_load_llm_configs_resolves_codeagent_tokens_from_env_placeholders(
+    tmp_path: Path,
+) -> None:
+    model_file = tmp_path / "model.json"
+    model_file.write_text(
+        json.dumps(
+            {
+                "codeagent-profile": {
+                    "provider": "codeagent",
+                    "model": "codeagent-chat",
+                    "base_url": "https://codeagent.example/codeAgentPro",
+                    "codeagent_auth": {
+                        "access_token": "${CODEAGENT_ACCESS_TOKEN}",
+                        "refresh_token": "${CODEAGENT_REFRESH_TOKEN}",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    profiles = runtime_config.load_llm_configs(
+        tmp_path,
+        {
+            "CODEAGENT_ACCESS_TOKEN": "env-codeagent-access-token",
+            "CODEAGENT_REFRESH_TOKEN": "env-codeagent-refresh-token",
+        },
+    )
+
+    assert profiles["codeagent-profile"].codeagent_auth is not None
+    assert (
+        profiles["codeagent-profile"].codeagent_auth.access_token
+        == "env-codeagent-access-token"
+    )
+    assert (
+        profiles["codeagent-profile"].codeagent_auth.refresh_token
+        == "env-codeagent-refresh-token"
+    )
+
+
+def test_load_llm_configs_accepts_codeagent_password_auth(
+    tmp_path: Path,
+) -> None:
+    model_file = tmp_path / "model.json"
+    model_file.write_text(
+        json.dumps(
+            {
+                "codeagent-profile": {
+                    "provider": "codeagent",
+                    "model": "codeagent-chat",
+                    "base_url": "https://codeagent.example/codeAgentPro",
+                    "codeagent_auth": {
+                        "auth_method": "password",
+                        "username": "relay-user",
+                        "has_password": True,
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    get_secret_store().set_secret(
+        tmp_path,
+        namespace="model_profile",
+        owner_id="codeagent-profile",
+        field_name=codeagent_password_secret_field_name(),
+        value="relay-password",
+    )
+
+    profiles = runtime_config.load_llm_configs(tmp_path, {})
+
+    assert profiles["codeagent-profile"].codeagent_auth is not None
+    assert profiles["codeagent-profile"].codeagent_auth.auth_method.value == "password"
+    assert profiles["codeagent-profile"].codeagent_auth.username == "relay-user"
+    assert profiles["codeagent-profile"].codeagent_auth.password == "relay-password"
+
+
+def test_load_llm_configs_resolves_codeagent_password_env_placeholder(
+    tmp_path: Path,
+) -> None:
+    model_file = tmp_path / "model.json"
+    model_file.write_text(
+        json.dumps(
+            {
+                "codeagent-profile": {
+                    "provider": "codeagent",
+                    "model": "codeagent-chat",
+                    "base_url": "https://codeagent.example/codeAgentPro",
+                    "codeagent_auth": {
+                        "auth_method": "password",
+                        "username": "relay-user",
+                        "password": "${CODEAGENT_PASSWORD}",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    profiles = runtime_config.load_llm_configs(
+        tmp_path,
+        {"CODEAGENT_PASSWORD": "env-codeagent-password"},
+    )
+
+    assert profiles["codeagent-profile"].codeagent_auth is not None
+    assert (
+        profiles["codeagent-profile"].codeagent_auth.password
+        == "env-codeagent-password"
+    )
+
+
+def test_load_llm_configs_resolves_secret_backed_codeagent_password_env_placeholder(
+    tmp_path: Path,
+) -> None:
+    model_file = tmp_path / "model.json"
+    model_file.write_text(
+        json.dumps(
+            {
+                "codeagent-profile": {
+                    "provider": "codeagent",
+                    "model": "codeagent-chat",
+                    "base_url": "https://codeagent.example/codeAgentPro",
+                    "codeagent_auth": {
+                        "auth_method": "password",
+                        "username": "relay-user",
+                        "has_password": True,
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    get_secret_store().set_secret(
+        tmp_path,
+        namespace="model_profile",
+        owner_id="codeagent-profile",
+        field_name=codeagent_password_secret_field_name(),
+        value="${CODEAGENT_PASSWORD}",
+    )
+
+    profiles = runtime_config.load_llm_configs(
+        tmp_path,
+        {"CODEAGENT_PASSWORD": "env-codeagent-password"},
+    )
+
+    assert profiles["codeagent-profile"].codeagent_auth is not None
+    assert (
+        profiles["codeagent-profile"].codeagent_auth.password
+        == "env-codeagent-password"
+    )
+
+
+def test_load_llm_configs_accepts_legacy_maas_auth_fields(tmp_path: Path) -> None:
+    model_file = tmp_path / "model.json"
+    model_file.write_text(
+        json.dumps(
+            {
+                "maas-profile": {
+                    "provider": "maas",
+                    "model": "maas-chat",
+                    "base_url": "https://maas.example/api/v2",
+                    "maas_auth": {
+                        "auth_type": "maas_password_login",
+                        "login_url": "https://legacy.example/login",
+                        "username": "relay-user",
+                        "app_id": "LegacyApp",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    get_secret_store().set_secret(
+        tmp_path,
+        namespace="model_profile",
+        owner_id="maas-profile",
+        field_name=maas_password_secret_field_name(),
+        value="relay-password",
+    )
+
+    profiles = runtime_config.load_llm_configs(tmp_path, {})
+
+    assert profiles["maas-profile"].base_url == DEFAULT_MAAS_BASE_URL
+    assert profiles["maas-profile"].maas_auth is not None
+    assert profiles["maas-profile"].maas_auth.username == "relay-user"
+    assert profiles["maas-profile"].maas_auth.password == "relay-password"
+
+
+def test_load_llm_configs_rejects_maas_profile_without_password(tmp_path: Path) -> None:
+    model_file = tmp_path / "model.json"
+    model_file.write_text(
+        json.dumps(
+            {
+                "maas-profile": {
+                    "provider": "maas",
+                    "model": "maas-chat",
+                    "base_url": "https://maas.example/api/v2",
+                    "maas_auth": {
+                        "username": "relay-user",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        runtime_config.load_llm_configs(tmp_path, {})
+
+    assert "MAAS profiles require maas_auth with a password" in str(exc_info.value)

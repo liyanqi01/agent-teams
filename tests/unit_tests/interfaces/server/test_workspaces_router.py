@@ -7,12 +7,20 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import pytest
+import relay_teams.workspace.workspace_service as workspace_service_module
 
-from agent_teams.interfaces.server.deps import get_workspace_service
-from agent_teams.interfaces.server.routers import workspaces
-from agent_teams.workspace import (
+from relay_teams.interfaces.server.deps import (
+    get_session_service,
+    get_workspace_service,
+)
+from relay_teams.interfaces.server.routers import workspaces
+from relay_teams.sessions import SessionSidebarPage, SessionSidebarRecord
+from relay_teams.workspace import (
     FileScopeBackend,
     GitWorktreeClient,
+    SshProfileRepository,
+    SshProfileService,
+    WorkspaceRecord,
     WorkspaceFileScope,
     WorkspaceProfile,
     WorkspaceRepository,
@@ -20,10 +28,12 @@ from agent_teams.workspace import (
     WorkspaceDiffChangeType,
     WorkspaceDiffFile,
     WorkspaceDiffListing,
+    WorkspaceFileContent,
     WorkspaceSnapshot,
     WorkspaceTreeListing,
     WorkspaceTreeNode,
     WorkspaceTreeNodeKind,
+    build_local_workspace_mount,
 )
 
 
@@ -55,6 +65,19 @@ class FakeGitWorktreeClient(GitWorktreeClient):
     def current_head(self, repository_root: Path) -> str:
         return "abc123"
 
+    def fetch_ref(
+        self,
+        repository_root: Path,
+        *,
+        remote: str = "origin",
+        ref: str = "main",
+    ) -> None:
+        _ = (repository_root, remote, ref)
+
+    def resolve_ref(self, repository_root: Path, ref_name: str) -> str:
+        _ = repository_root
+        return f"resolved:{ref_name}"
+
     def add_worktree(
         self,
         *,
@@ -74,10 +97,48 @@ class FakeGitWorktreeClient(GitWorktreeClient):
         _ = repository_root
 
 
+class FakeSessionSidebarService:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, int, str | None]] = []
+
+    async def list_workspace_sidebar_sessions_page_async(
+        self,
+        workspace_id: str,
+        *,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> SessionSidebarPage:
+        self.calls.append((workspace_id, limit, cursor))
+        return SessionSidebarPage(
+            items=(
+                SessionSidebarRecord(
+                    session_id="session-1",
+                    workspace_id=workspace_id,
+                    metadata={"title": "Run"},
+                ),
+            ),
+            next_cursor="cursor-next",
+            has_more=True,
+        )
+
+
+class FailingSessionSidebarService:
+    async def list_workspace_sidebar_sessions_page_async(
+        self,
+        workspace_id: str,
+        *,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> SessionSidebarPage:
+        _ = (workspace_id, limit, cursor)
+        raise ValueError("Invalid session pagination cursor")
+
+
 def _create_test_client(
     tmp_path: Path,
     *,
     service: WorkspaceService | None = None,
+    session_service: object | None = None,
 ) -> tuple[TestClient, WorkspaceService]:
     app = FastAPI()
     app.include_router(workspaces.router, prefix="/api")
@@ -85,6 +146,8 @@ def _create_test_client(
         repository=WorkspaceRepository(tmp_path / "workspaces_router.db")
     )
     app.dependency_overrides[get_workspace_service] = lambda: resolved_service
+    if session_service is not None:
+        app.dependency_overrides[get_session_service] = lambda: session_service
     return TestClient(app), resolved_service
 
 
@@ -107,6 +170,163 @@ def test_create_workspace(tmp_path: Path) -> None:
     assert payload["root_path"] == str(root_path.resolve())
 
 
+def test_create_workspace_rejects_none_like_workspace_id(tmp_path: Path) -> None:
+    client, _ = _create_test_client(tmp_path)
+    root_path = tmp_path / "workspace-root"
+    root_path.mkdir()
+
+    response = client.post(
+        "/api/workspaces",
+        json={
+            "workspace_id": "None",
+            "root_path": str(root_path),
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_create_workspace_with_mounts_and_mount_scoped_tree_query(
+    tmp_path: Path,
+) -> None:
+    client, _ = _create_test_client(tmp_path)
+    app_root = tmp_path / "app-root"
+    ops_root = tmp_path / "ops-root"
+    app_root.mkdir()
+    ops_root.mkdir()
+    (ops_root / "deploy.sh").write_text("echo deploy\n", encoding="utf-8")
+
+    response = client.post(
+        "/api/workspaces",
+        json={
+            "workspace_id": "project-alpha",
+            "default_mount_name": "app",
+            "mounts": [
+                {
+                    "mount_name": "app",
+                    "provider": "local",
+                    "provider_config": {"root_path": str(app_root)},
+                },
+                {
+                    "mount_name": "ops",
+                    "provider": "local",
+                    "provider_config": {"root_path": str(ops_root)},
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["default_mount_name"] == "app"
+    assert payload["root_path"] == str(app_root.resolve())
+    assert [item["mount_name"] for item in payload["mounts"]] == ["app", "ops"]
+
+    tree_response = client.get("/api/workspaces/project-alpha/tree?path=.&mount=ops")
+
+    assert tree_response.status_code == 200
+    tree_payload = tree_response.json()
+    assert tree_payload["mount_name"] == "ops"
+    assert [item["path"] for item in tree_payload["children"]] == ["deploy.sh"]
+
+
+def test_create_workspace_returns_mounts_in_provider_then_name_order(
+    tmp_path: Path,
+) -> None:
+    client, _ = _create_test_client(tmp_path)
+    app_root = tmp_path / "app-root"
+    ops_root = tmp_path / "ops-root"
+    app_root.mkdir()
+    ops_root.mkdir()
+
+    response = client.post(
+        "/api/workspaces",
+        json={
+            "workspace_id": "project-alpha",
+            "default_mount_name": "prod",
+            "mounts": [
+                {
+                    "mount_name": "prod",
+                    "provider": "ssh",
+                    "provider_config": {
+                        "ssh_profile_id": "prod",
+                        "remote_root": "/srv/prod",
+                    },
+                },
+                {
+                    "mount_name": "ops",
+                    "provider": "local",
+                    "provider_config": {"root_path": str(ops_root)},
+                },
+                {
+                    "mount_name": "app",
+                    "provider": "local",
+                    "provider_config": {"root_path": str(app_root)},
+                },
+                {
+                    "mount_name": "stage",
+                    "provider": "ssh",
+                    "provider_config": {
+                        "ssh_profile_id": "stage",
+                        "remote_root": "/srv/stage",
+                    },
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert [item["mount_name"] for item in response.json()["mounts"]] == [
+        "app",
+        "ops",
+        "prod",
+        "stage",
+    ]
+
+
+def test_create_workspace_rejects_missing_ssh_profile_as_client_error(
+    tmp_path: Path,
+) -> None:
+    app_root = tmp_path / "app-root"
+    app_root.mkdir()
+    service = WorkspaceService(
+        repository=WorkspaceRepository(tmp_path / "workspaces_router.db"),
+        ssh_profile_service=SshProfileService(
+            repository=SshProfileRepository(tmp_path / "ssh_profiles.db"),
+            config_dir=tmp_path,
+        ),
+    )
+    client, _ = _create_test_client(tmp_path, service=service)
+
+    response = client.post(
+        "/api/workspaces",
+        json={
+            "workspace_id": "project-alpha",
+            "default_mount_name": "app",
+            "mounts": [
+                {
+                    "mount_name": "app",
+                    "provider": "local",
+                    "provider_config": {"root_path": str(app_root)},
+                },
+                {
+                    "mount_name": "prod",
+                    "provider": "ssh",
+                    "provider_config": {
+                        "ssh_profile_id": "missing",
+                        "remote_root": "/srv/app",
+                    },
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "detail": "Workspace ssh mount references unknown ssh profile: missing"
+    }
+
+
 def test_list_and_get_workspaces(tmp_path: Path) -> None:
     client, service = _create_test_client(tmp_path)
     root_path = tmp_path / "workspace-root"
@@ -120,9 +340,179 @@ def test_list_and_get_workspaces(tmp_path: Path) -> None:
     get_response = client.get("/api/workspaces/project-alpha")
 
     assert list_response.status_code == 200
-    assert [item["workspace_id"] for item in list_response.json()] == ["project-alpha"]
+    list_payload = list_response.json()
+    assert list_payload["has_more"] is False
+    assert list_payload["next_cursor"] is None
+    assert [item["workspace_id"] for item in list_payload["items"]] == ["project-alpha"]
     assert get_response.status_code == 200
     assert get_response.json()["root_path"] == str(root_path.resolve())
+
+
+def test_list_workspaces_supports_cursor_pagination(tmp_path: Path) -> None:
+    client, service = _create_test_client(tmp_path)
+    for workspace_id in ("project-alpha", "project-bravo", "project-charlie"):
+        root_path = tmp_path / workspace_id
+        root_path.mkdir()
+        _ = service.create_workspace(
+            workspace_id=workspace_id,
+            root_path=root_path,
+        )
+
+    first_response = client.get("/api/workspaces?limit=2")
+
+    assert first_response.status_code == 200
+    first_payload = first_response.json()
+    assert [item["workspace_id"] for item in first_payload["items"]] == [
+        "project-charlie",
+        "project-bravo",
+    ]
+    assert first_payload["has_more"] is True
+    assert isinstance(first_payload["next_cursor"], str)
+
+    second_response = client.get(
+        "/api/workspaces",
+        params={"limit": "2", "cursor": first_payload["next_cursor"]},
+    )
+
+    assert second_response.status_code == 200
+    second_payload = second_response.json()
+    assert [item["workspace_id"] for item in second_payload["items"]] == [
+        "project-alpha"
+    ]
+    assert second_payload["has_more"] is False
+    assert second_payload["next_cursor"] is None
+
+
+def test_list_workspaces_rejects_invalid_cursor(tmp_path: Path) -> None:
+    client, _ = _create_test_client(tmp_path)
+
+    response = client.get("/api/workspaces?cursor=not-a-cursor")
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Invalid workspace pagination cursor"}
+
+
+def test_update_workspace_replaces_mounts_and_default_mount(tmp_path: Path) -> None:
+    client, service = _create_test_client(tmp_path)
+    app_root = tmp_path / "app-root"
+    ops_root = tmp_path / "ops-root"
+    app_root.mkdir()
+    ops_root.mkdir()
+    _ = service.create_workspace(
+        workspace_id="project-alpha",
+        root_path=app_root,
+    )
+
+    response = client.put(
+        "/api/workspaces/project-alpha",
+        json={
+            "default_mount_name": "ops",
+            "mounts": [
+                {
+                    "mount_name": "app",
+                    "provider": "local",
+                    "provider_config": {"root_path": str(app_root)},
+                },
+                {
+                    "mount_name": "ops",
+                    "provider": "local",
+                    "provider_config": {"root_path": str(ops_root)},
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["default_mount_name"] == "ops"
+    assert payload["root_path"] == str(ops_root.resolve())
+    assert [item["mount_name"] for item in payload["mounts"]] == ["app", "ops"]
+
+
+def test_update_workspace_rejects_missing_ssh_profile_as_client_error(
+    tmp_path: Path,
+) -> None:
+    app_root = tmp_path / "app-root"
+    app_root.mkdir()
+    service = WorkspaceService(
+        repository=WorkspaceRepository(tmp_path / "workspaces_router.db"),
+        ssh_profile_service=SshProfileService(
+            repository=SshProfileRepository(tmp_path / "ssh_profiles.db"),
+            config_dir=tmp_path,
+        ),
+    )
+    _ = service.create_workspace(
+        workspace_id="project-alpha",
+        root_path=app_root,
+    )
+    client, _ = _create_test_client(tmp_path, service=service)
+
+    response = client.put(
+        "/api/workspaces/project-alpha",
+        json={
+            "default_mount_name": "app",
+            "mounts": [
+                {
+                    "mount_name": "app",
+                    "provider": "local",
+                    "provider_config": {"root_path": str(app_root)},
+                },
+                {
+                    "mount_name": "prod",
+                    "provider": "ssh",
+                    "provider_config": {
+                        "ssh_profile_id": "missing",
+                        "remote_root": "/srv/app",
+                    },
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "detail": "Workspace ssh mount references unknown ssh profile: missing"
+    }
+
+
+def test_get_workspace_rejects_none_like_path_identifier(tmp_path: Path) -> None:
+    client, _ = _create_test_client(tmp_path)
+
+    response = client.get("/api/workspaces/None")
+
+    assert response.status_code == 422
+
+
+def test_list_workspace_sidebar_sessions_forwards_pagination(
+    tmp_path: Path,
+) -> None:
+    session_service = FakeSessionSidebarService()
+    client, _ = _create_test_client(tmp_path, session_service=session_service)
+
+    response = client.get(
+        "/api/workspaces/project-alpha/sessions/sidebar?limit=25&cursor=cursor-1"
+    )
+
+    assert response.status_code == 200
+    assert session_service.calls == [("project-alpha", 25, "cursor-1")]
+    assert response.json()["items"][0]["session_id"] == "session-1"
+    assert response.json()["items"][0]["workspace_id"] == "project-alpha"
+    assert response.json()["next_cursor"] == "cursor-next"
+    assert response.json()["has_more"] is True
+
+
+def test_list_workspace_sidebar_sessions_maps_cursor_errors(
+    tmp_path: Path,
+) -> None:
+    client, _ = _create_test_client(
+        tmp_path,
+        session_service=FailingSessionSidebarService(),
+    )
+
+    response = client.get("/api/workspaces/project-alpha/sessions/sidebar")
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Invalid session pagination cursor"}
 
 
 def test_create_workspace_rejects_missing_root(tmp_path: Path) -> None:
@@ -140,15 +530,115 @@ def test_create_workspace_rejects_missing_root(tmp_path: Path) -> None:
     assert "does not exist" in response.json()["detail"]
 
 
+def test_open_workspace_root_uses_native_directory_opener(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, service = _create_test_client(tmp_path)
+    root_path = tmp_path / "workspace-root"
+    root_path.mkdir()
+    _ = service.create_workspace(
+        workspace_id="project-alpha",
+        root_path=root_path,
+    )
+    captured: dict[str, Path] = {}
+
+    def fake_open_workspace_directory(path: Path) -> None:
+        captured["path"] = path
+
+    monkeypatch.setattr(
+        workspace_service_module,
+        "open_workspace_directory",
+        fake_open_workspace_directory,
+    )
+
+    response = client.post("/api/workspaces/project-alpha:open-root")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert captured["path"] == root_path.resolve()
+
+
+def test_open_workspace_root_returns_service_unavailable_when_opener_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, service = _create_test_client(tmp_path)
+    root_path = tmp_path / "workspace-root"
+    root_path.mkdir()
+    _ = service.create_workspace(
+        workspace_id="project-alpha",
+        root_path=root_path,
+    )
+
+    def fail_open_workspace_directory(path: Path) -> None:
+        _ = path
+        raise RuntimeError("Native file manager is unavailable")
+
+    monkeypatch.setattr(
+        workspace_service_module,
+        "open_workspace_directory",
+        fail_open_workspace_directory,
+    )
+
+    response = client.post("/api/workspaces/project-alpha:open-root")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Native file manager is unavailable"}
+
+
+def test_open_workspace_root_uses_selected_local_mount(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, service = _create_test_client(tmp_path)
+    app_root = tmp_path / "workspace-app"
+    ops_root = tmp_path / "workspace-ops"
+    app_root.mkdir()
+    ops_root.mkdir()
+    _ = service.create_workspace(
+        workspace_id="project-alpha",
+        mounts=(
+            build_local_workspace_mount(
+                mount_name="app",
+                root_path=app_root,
+            ),
+            build_local_workspace_mount(
+                mount_name="ops",
+                root_path=ops_root,
+            ),
+        ),
+        default_mount_name="app",
+    )
+    captured: dict[str, Path] = {}
+
+    def fake_open_workspace_directory(path: Path) -> None:
+        captured["path"] = path
+
+    monkeypatch.setattr(
+        workspace_service_module,
+        "open_workspace_directory",
+        fake_open_workspace_directory,
+    )
+
+    response = client.post("/api/workspaces/project-alpha:open-root?mount=ops")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert captured["path"] == ops_root.resolve()
+
+
 def test_get_workspace_snapshot_tree_and_diffs(tmp_path: Path) -> None:
     class SnapshotWorkspaceService(WorkspaceService):
         def get_workspace_snapshot(self, workspace_id: str) -> WorkspaceSnapshot:
             record = self.get_workspace(workspace_id)
+            root_path = record.root_path
+            assert root_path is not None
             return WorkspaceSnapshot(
                 workspace_id=record.workspace_id,
-                root_path=record.root_path,
+                default_mount_root=root_path,
                 tree=WorkspaceTreeNode(
-                    name=record.root_path.name,
+                    name=root_path.name,
                     path=".",
                     kind=WorkspaceTreeNodeKind.DIRECTORY,
                     has_children=True,
@@ -169,8 +659,9 @@ def test_get_workspace_snapshot_tree_and_diffs(tmp_path: Path) -> None:
             workspace_id: str,
             *,
             directory_path: str,
+            mount_name: str | None = None,
         ) -> WorkspaceTreeListing:
-            _ = workspace_id
+            _ = (workspace_id, mount_name)
             return WorkspaceTreeListing(
                 workspace_id="project-alpha",
                 directory_path=directory_path,
@@ -185,14 +676,22 @@ def test_get_workspace_snapshot_tree_and_diffs(tmp_path: Path) -> None:
                 ),
             )
 
-        def get_workspace_diffs(self, workspace_id: str) -> WorkspaceDiffListing:
+        def get_workspace_diffs(
+            self,
+            workspace_id: str,
+            *,
+            mount_name: str | None = None,
+        ) -> WorkspaceDiffListing:
             record = self.get_workspace(workspace_id)
+            _ = mount_name
+            root_path = record.root_path
+            assert root_path is not None
             return WorkspaceDiffListing(
                 workspace_id=record.workspace_id,
-                root_path=record.root_path,
+                root_path=root_path,
                 diff_files=(),
                 is_git_repository=True,
-                git_root_path=record.root_path,
+                git_root_path=root_path,
                 diff_message=None,
             )
 
@@ -201,8 +700,9 @@ def test_get_workspace_snapshot_tree_and_diffs(tmp_path: Path) -> None:
             workspace_id: str,
             *,
             path: str,
+            mount_name: str | None = None,
         ) -> WorkspaceDiffFile:
-            _ = self.get_workspace(workspace_id)
+            _ = (self.get_workspace(workspace_id), mount_name)
             return WorkspaceDiffFile(
                 path=path,
                 change_type=WorkspaceDiffChangeType.MODIFIED,
@@ -252,6 +752,131 @@ def test_get_workspace_snapshot_tree_and_diffs(tmp_path: Path) -> None:
     assert diff_file_payload["diff"] == "patched content"
 
 
+def test_get_workspace_tree_listing_runs_service_call_in_threadpool(
+    tmp_path: Path,
+) -> None:
+    class TreeWorkspaceService(WorkspaceService):
+        def get_workspace_tree_listing(
+            self,
+            workspace_id: str,
+            *,
+            directory_path: str,
+            mount_name: str | None = None,
+        ) -> WorkspaceTreeListing:
+            _ = (workspace_id, mount_name)
+            return WorkspaceTreeListing(
+                workspace_id="project-alpha",
+                directory_path=directory_path,
+                children=(),
+            )
+
+        async def get_workspace_tree_listing_async(
+            self,
+            workspace_id: str,
+            *,
+            directory_path: str = ".",
+            mount_name: str | None = None,
+        ) -> WorkspaceTreeListing:
+            return self.get_workspace_tree_listing(
+                workspace_id,
+                directory_path=directory_path,
+                mount_name=mount_name,
+            )
+
+    client, service = _create_test_client(
+        tmp_path,
+        service=TreeWorkspaceService(
+            repository=WorkspaceRepository(tmp_path / "workspaces_router.db")
+        ),
+    )
+    _ = service.create_workspace(
+        workspace_id="project-alpha",
+        root_path=tmp_path,
+    )
+
+    response = client.get("/api/workspaces/project-alpha/tree?path=src&mount=ops")
+
+    assert response.status_code == 200
+    assert response.json()["directory_path"] == "src"
+
+
+def test_workspace_diff_routes_run_service_calls_in_threadpool(
+    tmp_path: Path,
+) -> None:
+    class DiffWorkspaceService(WorkspaceService):
+        def get_workspace_diffs(
+            self,
+            workspace_id: str,
+            *,
+            mount_name: str | None = None,
+        ) -> WorkspaceDiffListing:
+            record = self.get_workspace(workspace_id)
+            _ = mount_name
+            root_path = record.root_path
+            assert root_path is not None
+            return WorkspaceDiffListing(
+                workspace_id=record.workspace_id,
+                root_path=root_path,
+                diff_files=(),
+                is_git_repository=True,
+                git_root_path=root_path,
+                diff_message=None,
+            )
+
+        def get_workspace_diff_file(
+            self,
+            workspace_id: str,
+            *,
+            path: str,
+            mount_name: str | None = None,
+        ) -> WorkspaceDiffFile:
+            _ = (self.get_workspace(workspace_id), mount_name)
+            return WorkspaceDiffFile(
+                path=path,
+                change_type=WorkspaceDiffChangeType.MODIFIED,
+                diff="patched content",
+                is_binary=False,
+            )
+
+        async def get_workspace_diffs_async(
+            self,
+            workspace_id: str,
+            *,
+            mount_name: str | None = None,
+        ) -> WorkspaceDiffListing:
+            return self.get_workspace_diffs(workspace_id, mount_name=mount_name)
+
+        async def get_workspace_diff_file_async(
+            self,
+            workspace_id: str,
+            *,
+            path: str,
+            mount_name: str | None = None,
+        ) -> WorkspaceDiffFile:
+            return self.get_workspace_diff_file(
+                workspace_id, path=path, mount_name=mount_name
+            )
+
+    client, service = _create_test_client(
+        tmp_path,
+        service=DiffWorkspaceService(
+            repository=WorkspaceRepository(tmp_path / "workspaces_router.db")
+        ),
+    )
+    _ = service.create_workspace(
+        workspace_id="project-alpha",
+        root_path=tmp_path,
+    )
+
+    diffs_response = client.get("/api/workspaces/project-alpha/diffs?mount=ops")
+    diff_file_response = client.get(
+        "/api/workspaces/project-alpha/diff?path=src%2Fapp.py&mount=ops"
+    )
+
+    assert diffs_response.status_code == 200
+    assert diff_file_response.status_code == 200
+
+
 def test_get_workspace_preview_file_streams_workspace_image(tmp_path: Path) -> None:
     client, service = _create_test_client(tmp_path)
     root_path = tmp_path / "workspace-root"
@@ -290,6 +915,121 @@ def test_get_workspace_preview_file_rejects_non_image(tmp_path: Path) -> None:
     assert "supported image" in response.json()["detail"]
 
 
+def test_get_workspace_file_content_returns_text_payload(tmp_path: Path) -> None:
+    client, service = _create_test_client(tmp_path)
+    root_path = tmp_path / "workspace-root"
+    file_path = root_path / "docker" / "eval-entrypoint.sh"
+    file_path.parent.mkdir(parents=True)
+    expected_content = '#!/bin/sh\nexec "$@"\n'
+    file_path.write_bytes(expected_content.encode("utf-8"))
+    _ = service.create_workspace(
+        workspace_id="project-alpha",
+        root_path=root_path,
+    )
+
+    response = client.get(
+        "/api/workspaces/project-alpha/file?path=docker%2Feval-entrypoint.sh"
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "workspace_id": "project-alpha",
+        "mount_name": "default",
+        "path": "docker/eval-entrypoint.sh",
+        "content": expected_content,
+        "encoding": "utf-8",
+        "is_binary": False,
+        "truncated": False,
+        "size_bytes": len(expected_content.encode("utf-8")),
+    }
+
+
+def test_get_workspace_file_content_preserves_literal_encoded_path_text(
+    tmp_path: Path,
+) -> None:
+    class CapturingWorkspaceService(WorkspaceService):
+        captured_path: str = ""
+
+        async def get_workspace_file_content_async(
+            self,
+            workspace_id: str,
+            *,
+            path: str,
+            mount_name: str | None = None,
+        ) -> WorkspaceFileContent:
+            _ = (workspace_id, mount_name)
+            self.captured_path = path
+            return WorkspaceFileContent(
+                workspace_id="project-alpha",
+                mount_name="default",
+                path=path,
+                content="literal encoded path",
+                encoding="utf-8",
+                is_binary=False,
+                truncated=False,
+                size_bytes=len("literal encoded path".encode("utf-8")),
+            )
+
+    service = CapturingWorkspaceService(
+        repository=WorkspaceRepository(tmp_path / "workspaces_router.db")
+    )
+    client, _ = _create_test_client(tmp_path, service=service)
+
+    response = client.get("/api/workspaces/project-alpha/file?path=notes%252Ftodo.txt")
+
+    assert response.status_code == 200
+    assert service.captured_path == "notes%2Ftodo.txt"
+    assert response.json()["path"] == "notes%2Ftodo.txt"
+
+
+@pytest.mark.parametrize(
+    ("path", "expected_status", "expected_detail"),
+    (
+        ("missing-workspace.txt", 404, "Workspace not found"),
+        ("missing-file.txt", 404, "Workspace file not found: missing-file.txt"),
+        ("directory", 400, "Workspace path is not a file: directory"),
+    ),
+)
+def test_get_workspace_file_content_maps_service_errors(
+    tmp_path: Path,
+    path: str,
+    expected_status: int,
+    expected_detail: str,
+) -> None:
+    class FileWorkspaceService(WorkspaceService):
+        async def get_workspace_file_content_async(
+            self,
+            workspace_id: str,
+            *,
+            path: str,
+            mount_name: str | None = None,
+        ) -> WorkspaceFileContent:
+            _ = (workspace_id, mount_name)
+            if path == "missing-workspace.txt":
+                raise KeyError(path)
+            if path == "missing-file.txt":
+                raise FileNotFoundError(f"Workspace file not found: {path}")
+            if path == "directory":
+                raise ValueError(f"Workspace path is not a file: {path}")
+            raise AssertionError(f"Unexpected path: {path}")
+
+    client, service = _create_test_client(
+        tmp_path,
+        service=FileWorkspaceService(
+            repository=WorkspaceRepository(tmp_path / "workspaces_router.db")
+        ),
+    )
+    _ = service.create_workspace(
+        workspace_id="project-alpha",
+        root_path=tmp_path,
+    )
+
+    response = client.get(f"/api/workspaces/project-alpha/file?path={path}")
+
+    assert response.status_code == expected_status
+    assert response.json()["detail"] == expected_detail
+
+
 def test_pick_workspace_creates_workspace_for_selected_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -310,6 +1050,26 @@ def test_pick_workspace_creates_workspace_for_selected_directory(
     payload = response.json()
     assert payload["workspace"]["workspace_id"] == "picked-root"
     assert payload["workspace"]["root_path"] == str(root_path.resolve())
+
+
+def test_pick_workspace_runs_picker_and_create_in_thread(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _ = _create_test_client(tmp_path)
+    root_path = tmp_path / "picked-root"
+    root_path.mkdir()
+
+    monkeypatch.setattr(
+        workspaces,
+        "pick_workspace_directory",
+        lambda: root_path,
+    )
+
+    response = client.post("/api/workspaces/pick")
+
+    assert response.status_code == 200
+    assert response.json()["workspace"]["workspace_id"] == "picked-root"
 
 
 def test_pick_workspace_returns_null_when_cancelled(
@@ -377,7 +1137,48 @@ def test_fork_workspace(tmp_path: Path) -> None:
     assert payload["profile"]["file_scope"]["branch_name"] == "fork/alpha-project-fork"
 
 
-def test_delete_workspace_supports_remove_worktree_query(tmp_path: Path) -> None:
+def test_fork_workspace_forwards_start_ref(tmp_path: Path) -> None:
+    class CaptureForkWorkspaceService(WorkspaceService):
+        def __init__(self) -> None:
+            super().__init__(
+                repository=WorkspaceRepository(tmp_path / "workspaces_router.db")
+            )
+            self.calls: list[tuple[str, str, str | None]] = []
+
+        def fork_workspace(
+            self,
+            *,
+            source_workspace_id: str,
+            name: str,
+            start_ref: str | None = None,
+        ):
+            self.calls.append((source_workspace_id, name, start_ref))
+            return WorkspaceRecord(
+                workspace_id="alpha-project-fork",
+                default_mount_name="default",
+                mounts=(
+                    build_local_workspace_mount(
+                        mount_name="default",
+                        root_path=(
+                            tmp_path / "storage" / "alpha-project-fork"
+                        ).resolve(),
+                    ),
+                ),
+            )
+
+    service = CaptureForkWorkspaceService()
+    client, _ = _create_test_client(tmp_path, service=service)
+
+    response = client.post(
+        "/api/workspaces/project-alpha:fork",
+        json={"name": "Alpha Project Fork", "start_ref": "origin/release"},
+    )
+
+    assert response.status_code == 200
+    assert service.calls == [("project-alpha", "Alpha Project Fork", "origin/release")]
+
+
+def test_delete_workspace_requires_force_for_remove_worktree(tmp_path: Path) -> None:
     root_path = tmp_path / "storage" / "alpha-project-fork" / "worktree"
     root_path.mkdir(parents=True)
     git_client = FakeGitWorktreeClient()
@@ -402,9 +1203,110 @@ def test_delete_workspace_supports_remove_worktree_query(tmp_path: Path) -> None
 
     response = client.delete("/api/workspaces/alpha-project-fork?remove_worktree=true")
 
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "Cannot remove workspace directory without force"
+    }
+    assert git_client.remove_calls == []
+
+
+def test_delete_workspace_supports_remove_worktree_query(tmp_path: Path) -> None:
+    root_path = tmp_path / "storage" / "alpha-project-fork" / "worktree"
+    root_path.mkdir(parents=True)
+    git_client = FakeGitWorktreeClient()
+    service = StorageScopedWorkspaceService(
+        repository=WorkspaceRepository(tmp_path / "workspaces_router.db"),
+        storage_root=tmp_path / "storage",
+        git_worktree_client=git_client,
+    )
+    _ = service.create_workspace(
+        workspace_id="alpha-project-fork",
+        root_path=root_path,
+        profile=WorkspaceProfile(
+            file_scope=WorkspaceFileScope(
+                backend=FileScopeBackend.GIT_WORKTREE,
+                branch_name="fork/alpha-project-fork",
+                source_root_path=str((tmp_path / "workspace-root").resolve()),
+                forked_from_workspace_id="project-alpha",
+            )
+        ),
+    )
+    client, _ = _create_test_client(tmp_path, service=service)
+
+    response = client.request(
+        "DELETE",
+        "/api/workspaces/alpha-project-fork?remove_worktree=true",
+        json={"force": True},
+    )
+
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
     assert git_client.remove_calls == [
         ((tmp_path / "workspace-root").resolve(), root_path.resolve())
     ]
     assert service.list_workspaces() == ()
+
+
+def test_delete_workspace_supports_remove_directory_query(tmp_path: Path) -> None:
+    root_path = tmp_path / "workspace-root"
+    root_path.mkdir()
+    service = WorkspaceService(
+        repository=WorkspaceRepository(tmp_path / "workspaces_router.db")
+    )
+    _ = service.create_workspace(
+        workspace_id="project-alpha",
+        root_path=root_path,
+    )
+    client, _ = _create_test_client(tmp_path, service=service)
+
+    response = client.request(
+        "DELETE",
+        "/api/workspaces/project-alpha?remove_directory=true",
+        json={"force": True},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert root_path.exists() is False
+    assert service.list_workspaces() == ()
+
+
+def test_delete_workspace_returns_conflict_when_directory_removal_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root_path = tmp_path / "workspace-root"
+    root_path.mkdir()
+    service = WorkspaceService(
+        repository=WorkspaceRepository(tmp_path / "workspaces_router.db")
+    )
+    _ = service.create_workspace(
+        workspace_id="project-alpha",
+        root_path=root_path,
+    )
+    client, _ = _create_test_client(tmp_path, service=service)
+
+    original_rmtree = shutil.rmtree
+
+    def fail_rmtree(path: Path, ignore_errors: bool = False) -> None:
+        _ = ignore_errors
+        if Path(path) == root_path:
+            raise PermissionError("permission denied")
+        original_rmtree(path)
+
+    monkeypatch.setattr(shutil, "rmtree", fail_rmtree)
+
+    response = client.request(
+        "DELETE",
+        "/api/workspaces/project-alpha?remove_directory=true",
+        json={"force": True},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": f"Failed to remove workspace path: {root_path}"
+    }
+    assert root_path.exists() is True
+    assert [workspace.workspace_id for workspace in service.list_workspaces()] == [
+        "project-alpha"
+    ]

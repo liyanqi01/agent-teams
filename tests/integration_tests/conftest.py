@@ -4,6 +4,7 @@ from collections.abc import Iterator
 import os
 from pathlib import Path
 import sys
+import time
 
 import httpx
 import pytest
@@ -15,7 +16,8 @@ from integration_tests.support.config_builder import (
 from integration_tests.support.environment import IntegrationEnvironment
 from integration_tests.support.process_control import (
     ManagedProcess,
-    find_free_port,
+    find_free_ports,
+    read_log_tail,
     start_process,
     stop_process,
     wait_for_http_ready,
@@ -23,6 +25,9 @@ from integration_tests.support.process_control import (
 
 
 _HOME_ENV_KEYS: tuple[str, ...] = ("HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH")
+_INTEGRATION_TESTS_ROOT = Path(__file__).resolve().parent
+_DEFAULT_INTEGRATION_TEST_TIMEOUT_SECONDS = 240.0
+_INTEGRATION_TEST_TIMEOUT_ENV = "RELAY_TEAMS_INTEGRATION_TEST_TIMEOUT_SECONDS"
 _PROXY_ENV_KEYS: tuple[str, ...] = (
     "HTTP_PROXY",
     "http_proxy",
@@ -34,6 +39,43 @@ _PROXY_ENV_KEYS: tuple[str, ...] = (
     "no_proxy",
     "SSL_VERIFY",
 )
+_PYTHONPATH_SEPARATOR = ";" if os.name == "nt" else ":"
+_API_INTEGRATION_TESTS_ROOT = _INTEGRATION_TESTS_ROOT / "api"
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config,
+    items: list[pytest.Item],
+) -> None:
+    if not config.pluginmanager.hasplugin("timeout"):
+        raise pytest.UsageError(
+            "pytest-timeout is required for integration-test timeout enforcement"
+        )
+    timeout_marker = pytest.mark.timeout(_integration_test_timeout_seconds())
+    for item in items:
+        item_path = Path(str(item.fspath)).resolve()
+        if _INTEGRATION_TESTS_ROOT not in item_path.parents:
+            continue
+        if item.get_closest_marker("timeout") is not None:
+            continue
+        item.add_marker(timeout_marker)
+
+
+def _integration_test_timeout_seconds() -> float:
+    raw_timeout = os.environ.get(_INTEGRATION_TEST_TIMEOUT_ENV)
+    if raw_timeout is None:
+        return _DEFAULT_INTEGRATION_TEST_TIMEOUT_SECONDS
+    try:
+        timeout_seconds = float(raw_timeout)
+    except ValueError as exc:
+        raise pytest.UsageError(
+            f"{_INTEGRATION_TEST_TIMEOUT_ENV} must be a positive number"
+        ) from exc
+    if timeout_seconds <= 0:
+        raise pytest.UsageError(
+            f"{_INTEGRATION_TEST_TIMEOUT_ENV} must be a positive number"
+        )
+    return timeout_seconds
 
 
 def _capture_home_env() -> dict[str, str | None]:
@@ -44,7 +86,8 @@ def _apply_home_env(runtime_root: Path) -> None:
     resolved_runtime_root = runtime_root.resolve()
     os.environ["HOME"] = str(resolved_runtime_root)
     os.environ["USERPROFILE"] = str(resolved_runtime_root)
-    drive, tail = os.path.splitdrive(str(resolved_runtime_root))
+    drive = resolved_runtime_root.drive
+    tail = str(resolved_runtime_root)[len(drive) :] if drive else ""
     if drive:
         os.environ["HOMEDRIVE"] = drive
         os.environ["HOMEPATH"] = tail or "\\"
@@ -72,10 +115,9 @@ def integration_env(
 ) -> Iterator[IntegrationEnvironment]:
     repo_root = Path(__file__).resolve().parent.parent.parent
     runtime_root = tmp_path_factory.mktemp("agent-teams-integration")
-    config_dir = runtime_root / ".agent-teams"
+    config_dir = runtime_root / ".relay-teams"
 
-    fake_llm_port = find_free_port()
-    backend_port = find_free_port()
+    fake_llm_port, backend_port = find_free_ports(2)
 
     fake_llm_admin_url = f"http://127.0.0.1:{fake_llm_port}"
     fake_llm_v1_base_url = f"{fake_llm_admin_url}/v1"
@@ -86,7 +128,6 @@ def integration_env(
         fake_llm_v1_base_url=fake_llm_v1_base_url,
     )
     assert_integration_model_config_uses_fake_llm(config_dir=config_dir)
-
     original_home_env = _capture_home_env()
     _apply_home_env(runtime_root)
 
@@ -96,7 +137,10 @@ def integration_env(
     existing_pythonpath = shared_env.get("PYTHONPATH", "")
     if existing_pythonpath:
         python_paths.append(existing_pythonpath)
-    shared_env["PYTHONPATH"] = os.pathsep.join(python_paths)
+    shared_env["PYTHONPATH"] = _PYTHONPATH_SEPARATOR.join(python_paths)
+    shared_env["AGENT_TEAMS_COMPUTER_RUNTIME"] = "fake"
+    shared_env["RELAY_TEAMS_LLM_HTTP_MAX_CONCURRENCY"] = "4"
+    shared_env["PYTHON_KEYRING_BACKEND"] = "keyring.backends.null.Keyring"
 
     fake_llm_log_file = runtime_root / "fake-llm.log"
     backend_log_file = runtime_root / "backend.log"
@@ -133,7 +177,7 @@ def integration_env(
                 sys.executable,
                 "-m",
                 "uvicorn",
-                "agent_teams.interfaces.server.app:app",
+                "relay_teams.interfaces.server.app:app",
                 "--host",
                 "127.0.0.1",
                 "--port",
@@ -141,13 +185,18 @@ def integration_env(
                 "--log-level",
                 "warning",
             ),
-            cwd=runtime_root,
+            cwd=repo_root,
             env=shared_env,
             log_file=backend_log_file,
         )
         wait_for_http_ready(
             url=f"{api_base_url}/api/system/health",
-            timeout_seconds=30.0,
+            timeout_seconds=90.0,
+            process=backend_process,
+        )
+        _wait_for_backend_hydrated(
+            api_base_url=api_base_url,
+            timeout_seconds=90.0,
             process=backend_process,
         )
 
@@ -174,3 +223,53 @@ def api_client(integration_env: IntegrationEnvironment) -> Iterator[httpx.Client
         trust_env=False,
     ) as client:
         yield client
+
+
+@pytest.fixture(autouse=True)
+def reset_fake_llm_state(request: pytest.FixtureRequest) -> None:
+    item_path = Path(str(request.node.fspath)).resolve()
+    if (
+        item_path != _API_INTEGRATION_TESTS_ROOT
+        and _API_INTEGRATION_TESTS_ROOT not in item_path.parents
+    ):
+        return
+    integration_env = request.getfixturevalue("integration_env")
+    if not isinstance(integration_env, IntegrationEnvironment):
+        raise TypeError("integration_env fixture returned an unexpected value")
+    response = httpx.post(
+        f"{integration_env.fake_llm_admin_url}/admin/reset",
+        timeout=5.0,
+        trust_env=False,
+    )
+    response.raise_for_status()
+
+
+def _wait_for_backend_hydrated(
+    *,
+    api_base_url: str,
+    timeout_seconds: float,
+    process: ManagedProcess,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    health_url = f"{api_base_url}/api/system/health"
+    with httpx.Client(timeout=1.0, trust_env=False) as client:
+        while time.monotonic() < deadline:
+            if process.process.poll() is not None:
+                raise RuntimeError(
+                    "agent-teams-backend exited before runtime hydration.\n"
+                    f"{read_log_tail(process.log_file)}"
+                )
+            try:
+                response = client.get(health_url)
+                if response.status_code == 200:
+                    payload = response.json()
+                    if isinstance(payload, dict) and payload.get("hydrated") is True:
+                        return
+            except (httpx.HTTPError, ValueError):
+                continue
+            time.sleep(0.2)
+
+    raise RuntimeError(
+        "Timed out waiting for agent-teams-backend runtime hydration at "
+        f"{health_url}.\n{read_log_tail(process.log_file)}"
+    )

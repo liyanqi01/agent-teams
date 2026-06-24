@@ -1,0 +1,99 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import json
+from collections.abc import Callable
+
+import typer
+
+type RequestJsonCallable = Callable[
+    [str, str, str, dict[str, object] | None], dict[str, object] | list[object]
+]
+type AutoStartCallable = Callable[[str, bool, bool, bool], None]
+
+
+def build_approvals_app(
+    *,
+    request_json: RequestJsonCallable,
+    auto_start_if_needed: AutoStartCallable,
+    default_base_url: str,
+) -> typer.Typer:
+    approvals_app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
+
+    @approvals_app.command("list")
+    def tool_approvals_list(
+        run_id: str = typer.Option(..., "--run-id"),
+        base_url: str = typer.Option(default_base_url, "--base-url"),
+        autostart: bool = typer.Option(True, "--autostart/--no-autostart"),
+        daemon: bool = typer.Option(
+            False,
+            "--daemon",
+            "-d",
+            help="Run the server as a background process when autostarting.",
+        ),
+        force: bool = typer.Option(
+            False,
+            "--force",
+            help="Force kill any existing server process before autostarting.",
+        ),
+    ) -> None:
+        auto_start_if_needed(base_url, autostart, daemon, force)
+        result = request_json(
+            base_url, "GET", f"/api/runs/{run_id}/tool-approvals", None
+        )
+        approvals = result if isinstance(result, list) else result.get("data", [])
+        typer.echo(json.dumps(approvals, ensure_ascii=False))
+
+    @approvals_app.command("resolve")
+    def tool_approvals_resolve(
+        run_id: str = typer.Option(..., "--run-id"),
+        tool_call_id: str = typer.Option(..., "--tool-call-id"),
+        action: str = typer.Option(
+            ...,
+            "--action",
+            help="approve, approve_once, approve_exact, approve_prefix, or deny",
+        ),
+        feedback: str = typer.Option("", "--feedback"),
+        option_id: str | None = typer.Option(
+            None,
+            "--option-id",
+            help="ACP permission option id to select when resolving external agent approvals.",
+        ),
+        base_url: str = typer.Option(default_base_url, "--base-url"),
+        autostart: bool = typer.Option(True, "--autostart/--no-autostart"),
+        daemon: bool = typer.Option(
+            False,
+            "--daemon",
+            "-d",
+            help="Run the server as a background process when autostarting.",
+        ),
+        force: bool = typer.Option(
+            False,
+            "--force",
+            help="Force kill any existing server process before autostarting.",
+        ),
+    ) -> None:
+        auto_start_if_needed(base_url, autostart, daemon, force)
+        if action not in {
+            "approve",
+            "approve_once",
+            "approve_exact",
+            "approve_prefix",
+            "deny",
+        }:
+            raise typer.BadParameter(
+                "action must be approve, approve_once, approve_exact, "
+                "approve_prefix, or deny"
+            )
+        payload: dict[str, object] = {"action": action, "feedback": feedback}
+        if option_id:
+            payload["option_id"] = option_id
+        result = request_json(
+            base_url,
+            "POST",
+            f"/api/runs/{run_id}/tool-approvals/{tool_call_id}/resolve",
+            payload,
+        )
+        typer.echo(json.dumps(result, ensure_ascii=False))
+
+    return approvals_app

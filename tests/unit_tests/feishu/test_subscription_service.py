@@ -2,26 +2,36 @@
 from __future__ import annotations
 
 import asyncio
-import ssl
+import sys
+from types import ModuleType, SimpleNamespace
 from typing import cast
+import warnings
 
 import httpx
+import pytest
+from websockets.datastructures import Headers
+from websockets.exceptions import ConnectionClosedOK, InvalidStatus
+from websockets.frames import Close
+from websockets.http11 import Response
 
-from agent_teams.env.proxy_env import ProxyEnvConfig
-from agent_teams.gateway.feishu.models import (
+from relay_teams.gateway.feishu.lark_ws_compat import (
+    import_lark_module,
+    import_lark_ws_client_module,
+)
+from relay_teams.gateway.feishu.models import (
     FeishuEnvironment,
     FeishuTriggerRuntimeConfig,
     FeishuTriggerSourceConfig,
     FeishuTriggerTargetConfig,
     TriggerProcessingResult,
 )
-from agent_teams.gateway.feishu.subscription_service import (
+from relay_teams.gateway.feishu.subscription_service import (
     FeishuSubscriptionService,
+    P2ImMessageReceiveV1,
     WsClientLike,
     _FeishuWsController,
     _FeishuWsHub,
-    _build_websocket_ssl_context,
-    _resolve_websocket_proxy_url,
+    _parse_ws_conn_exception,
 )
 
 
@@ -81,6 +91,27 @@ class _FakeHandler:
             trigger_id="trg_test",
             ignored=True,
             reason="test",
+        )
+
+
+class _RecordingHandler:
+    def __init__(self) -> None:
+        self.raw_bodies: list[str] = []
+
+    def handle_sdk_event(
+        self,
+        *,
+        trigger_id: str,
+        event: P2ImMessageReceiveV1,
+        raw_body: str,
+        headers: dict[str, str],
+        remote_addr: str | None,
+    ) -> TriggerProcessingResult:
+        _ = (trigger_id, event, headers, remote_addr)
+        self.raw_bodies.append(raw_body)
+        return TriggerProcessingResult(
+            status="processed",
+            trigger_id="trg_test",
         )
 
 
@@ -230,7 +261,39 @@ def test_subscription_service_stop_shuts_down_shared_runner_factory() -> None:
     assert runner_factory.shutdown_calls == 1
 
 
-def test_feishu_ws_hub_reuses_single_thread_for_multiple_bots() -> None:
+def test_subscription_service_reload_tolerates_runner_start_failure() -> None:
+    runtime = _build_runtime(
+        trigger_id="trg_a",
+        name="bot_a",
+        app_id="cli_a",
+        app_name="bot-a",
+        app_secret="secret-a",
+    )
+
+    class _FailingRunner:
+        def start(self) -> None:
+            raise RuntimeError("sdk unavailable")
+
+        def stop(self) -> None:
+            return None
+
+        def is_alive(self) -> bool:
+            return False
+
+    service = FeishuSubscriptionService(
+        runtime_config_lookup=_FakeRuntimeConfigLookup((runtime,)),
+        event_handler=_FakeHandler(),
+        runner_factory=lambda **_kwargs: _FailingRunner(),
+    )
+
+    service.start()
+
+    assert service._runners == {}
+
+
+def test_feishu_ws_hub_reuses_single_thread_for_multiple_bots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     runtime_a = _build_runtime(
         trigger_id="trg_a",
         name="bot_a",
@@ -257,6 +320,10 @@ def test_feishu_ws_hub_reuses_single_thread_for_multiple_bots() -> None:
         created_controllers[runtime_config.trigger_id] = controller
         return controller
 
+    monkeypatch.setattr(
+        "relay_teams.gateway.feishu.subscription_service.import_lark_ws_client_module",
+        lambda: SimpleNamespace(),
+    )
     hub = _FeishuWsHub(controller_factory=_controller_factory)
 
     hub.start_client(runtime_config=runtime_a, event_handler=_FakeHandler())
@@ -296,7 +363,7 @@ class _FakeEndpointClient:
         self.response = response
         self.requests: list[tuple[str, dict[str, str], dict[str, str]]] = []
 
-    def post(
+    async def post(
         self,
         url: str,
         *,
@@ -305,6 +372,13 @@ class _FakeEndpointClient:
     ) -> httpx.Response:
         self.requests.append((url, headers, json))
         return self.response
+
+    async def __aenter__(self) -> _FakeEndpointClient:
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        _ = (exc_type, exc, tb)
+        return None
 
 
 class _FakeWsClient:
@@ -343,7 +417,10 @@ class _FakeWsClient:
             self.configured_ping_interval = ping_interval
 
 
-def test_feishu_ws_controller_get_conn_url_uses_net_http_client(monkeypatch) -> None:
+@pytest.mark.asyncio
+async def test_feishu_ws_controller_get_conn_url_uses_net_http_client(
+    monkeypatch,
+) -> None:
     controller = _FeishuWsController(
         runtime_config=_build_runtime(
             trigger_id="trg_a",
@@ -375,9 +452,46 @@ def test_feishu_ws_controller_get_conn_url_uses_net_http_client(monkeypatch) -> 
         "_create_feishu_http_client",
         lambda: fake_http_client,
     )
+    const_module = ModuleType("lark_oapi.ws.const")
+    setattr(const_module, "GEN_ENDPOINT_URI", "/callback/ws/endpoint")
+    exception_module = ModuleType("lark_oapi.ws.exception")
+
+    class _FakeClientException(Exception):
+        def __init__(self, code: int, message: str) -> None:
+            super().__init__(message)
+            self.code = code
+            self.message = message
+
+    class _FakeServerException(Exception):
+        def __init__(self, code: int, message: str) -> None:
+            super().__init__(message)
+            self.code = code
+            self.message = message
+
+    setattr(exception_module, "ClientException", _FakeClientException)
+    setattr(exception_module, "ServerException", _FakeServerException)
+    model_module = ModuleType("lark_oapi.ws.model")
+
+    class _FakeEndpointResp:
+        def __init__(self, payload: dict[str, object]) -> None:
+            data = cast(dict[str, object], payload["data"])
+            client_config = cast(dict[str, object], data["ClientConfig"])
+            self.code = payload["code"]
+            self.msg = payload["msg"]
+            self.data = SimpleNamespace(
+                URL=data["URL"],
+                ClientConfig=SimpleNamespace(
+                    PingInterval=client_config["PingInterval"]
+                ),
+            )
+
+    setattr(model_module, "EndpointResp", _FakeEndpointResp)
+    monkeypatch.setitem(sys.modules, "lark_oapi.ws.const", const_module)
+    monkeypatch.setitem(sys.modules, "lark_oapi.ws.exception", exception_module)
+    monkeypatch.setitem(sys.modules, "lark_oapi.ws.model", model_module)
     ws_client = _FakeWsClient()
 
-    conn_url = controller._get_conn_url(cast(WsClientLike, ws_client))
+    conn_url = await controller._get_conn_url(cast(WsClientLike, ws_client))
 
     assert conn_url == "wss://open.feishu.cn/ws?device_id=device-1&service_id=7"
     assert fake_http_client.requests == [
@@ -390,47 +504,274 @@ def test_feishu_ws_controller_get_conn_url_uses_net_http_client(monkeypatch) -> 
     assert ws_client.configured_ping_interval == 45
 
 
-def test_build_websocket_ssl_context_respects_proxy_ssl_setting(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "agent_teams.gateway.feishu.subscription_service.load_proxy_env_config",
-        lambda: ProxyEnvConfig(ssl_verify=False),
-    )
-
-    ssl_context = _build_websocket_ssl_context("wss://open.feishu.cn/ws")
-
-    assert ssl_context is not None
-    assert ssl_context.verify_mode == ssl.CERT_NONE
-    assert ssl_context.check_hostname is False
-
-
-def test_resolve_websocket_proxy_url_uses_https_proxy_for_wss(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "agent_teams.gateway.feishu.subscription_service.load_proxy_env_config",
-        lambda: ProxyEnvConfig(
-            https_proxy="http://proxy.internal:8443",
-            http_proxy="http://proxy.internal:8080",
-            no_proxy="localhost,127.0.0.1",
+@pytest.mark.asyncio
+async def test_feishu_ws_controller_connect_client_sets_connection_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = _FeishuWsController(
+        runtime_config=_build_runtime(
+            trigger_id="trg_a",
+            name="bot_a",
+            app_id="cli_demo",
+            app_name="bot-a",
+            app_secret="secret-demo",
         ),
+        event_handler=_FakeHandler(),
     )
+    connection = _FakeWsConnection()
+    connected_urls: list[str] = []
 
-    proxy_url = _resolve_websocket_proxy_url(
-        "wss://open.feishu.cn/ws?device_id=1&service_id=2"
+    async def _get_conn_url(_client: WsClientLike) -> str:
+        return "wss://open.feishu.cn/ws?device_id=device-1&service_id=7"
+
+    class _FakeWebsockets:
+        async def connect(
+            self,
+            url: str,
+            *,
+            proxy: str | None,
+            ssl: object,
+        ) -> _FakeWsConnection:
+            _ = (proxy, ssl)
+            connected_urls.append(url)
+            return connection
+
+    class _FakeLogger:
+        def info(self, message: str) -> None:
+            assert message == (
+                "connected to wss://open.feishu.cn/ws?device_id=device-1&service_id=7"
+            )
+
+    ws_client_module = SimpleNamespace(
+        websockets=_FakeWebsockets(),
+        logger=_FakeLogger(),
     )
-
-    assert proxy_url == "http://proxy.internal:8443"
-
-
-def test_resolve_websocket_proxy_url_respects_no_proxy(monkeypatch) -> None:
+    monkeypatch.setattr(controller, "_get_conn_url", _get_conn_url)
     monkeypatch.setattr(
-        "agent_teams.gateway.feishu.subscription_service.load_proxy_env_config",
-        lambda: ProxyEnvConfig(
-            https_proxy="http://proxy.internal:8443",
-            no_proxy="open.feishu.cn",
+        "relay_teams.gateway.feishu.subscription_service.import_lark_ws_client_module",
+        lambda: ws_client_module,
+    )
+    ws_client = _FakeWsClient()
+
+    await controller._connect_client(cast(WsClientLike, ws_client))
+
+    assert connected_urls == ["wss://open.feishu.cn/ws?device_id=device-1&service_id=7"]
+    assert ws_client._conn is connection
+    assert ws_client._conn_url == (
+        "wss://open.feishu.cn/ws?device_id=device-1&service_id=7"
+    )
+    assert ws_client._conn_id == "device-1"
+    assert ws_client._service_id == "7"
+
+
+def test_feishu_ws_controller_http_client_uses_runtime_net_proxy_loader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = _FeishuWsController(
+        runtime_config=_build_runtime(
+            trigger_id="trg_a",
+            name="bot_a",
+            app_id="cli_demo",
+            app_name="bot-a",
+            app_secret="secret-demo",
         ),
+        event_handler=_FakeHandler(),
+    )
+    fake_http_client = httpx.AsyncClient(trust_env=False)
+    monkeypatch.setattr(
+        "relay_teams.gateway.feishu.subscription_service.create_runtime_async_http_client",
+        lambda: fake_http_client,
     )
 
-    proxy_url = _resolve_websocket_proxy_url(
-        "wss://open.feishu.cn/ws?device_id=1&service_id=2"
+    try:
+        assert controller._create_feishu_http_client() is fake_http_client
+    finally:
+        asyncio.run(fake_http_client.aclose())
+
+
+@pytest.mark.asyncio
+async def test_feishu_ws_controller_processes_sdk_events_in_receive_order() -> None:
+    handler = _RecordingHandler()
+    controller = _FeishuWsController(
+        runtime_config=_build_runtime(
+            trigger_id="trg_a",
+            name="bot_a",
+            app_id="cli_demo",
+            app_name="bot-a",
+            app_secret="secret-demo",
+        ),
+        event_handler=handler,
     )
 
-    assert proxy_url is None
+    controller._enqueue_sdk_event(
+        event=cast(P2ImMessageReceiveV1, object()),
+        raw_body="first",
+    )
+    controller._enqueue_sdk_event(
+        event=cast(P2ImMessageReceiveV1, object()),
+        raw_body="second",
+    )
+    await controller._handler_queue.join()
+    await controller._stop_handler_worker()
+
+    assert handler.raw_bodies == ["first", "second"]
+
+
+def test_import_lark_ws_client_module_suppresses_known_deprecations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    try:
+        previous_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        previous_loop = None
+
+    loop = asyncio.new_event_loop()
+
+    try:
+        asyncio.set_event_loop(loop)
+
+        def _fake_import(module_name: str) -> ModuleType:
+            warnings.warn_explicit(
+                "datetime.datetime.utcfromtimestamp() is deprecated",
+                DeprecationWarning,
+                filename="well_known_types.py",
+                lineno=1,
+                module="lark_oapi.ws.pb.google.protobuf.internal.well_known_types",
+            )
+            warnings.warn_explicit(
+                "There is no current event loop",
+                DeprecationWarning,
+                filename="client.py",
+                lineno=1,
+                module="lark_oapi.ws.client",
+            )
+            warnings.warn_explicit(
+                "websockets.InvalidStatusCode is deprecated",
+                DeprecationWarning,
+                filename="client.py",
+                lineno=1,
+                module="lark_oapi.ws.client",
+            )
+            warnings.warn_explicit(
+                "websockets.legacy is deprecated",
+                DeprecationWarning,
+                filename="legacy.py",
+                lineno=1,
+                module="websockets.legacy.client",
+            )
+            return ModuleType(module_name)
+
+        monkeypatch.setattr(
+            "relay_teams.gateway.feishu.lark_ws_compat.importlib.import_module",
+            _fake_import,
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("default")
+            module = import_lark_ws_client_module()
+        assert module.__name__ == "lark_oapi.ws.client"
+        assert caught == []
+    finally:
+        loop.close()
+        asyncio.set_event_loop(previous_loop)
+
+
+def test_import_lark_module_suppresses_dispatcher_handler_deprecations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _fake_import(module_name: str) -> ModuleType:
+        warnings.warn_explicit(
+            "datetime.datetime.utcfromtimestamp() is deprecated",
+            DeprecationWarning,
+            filename="well_known_types.py",
+            lineno=1,
+            module="lark_oapi.ws.pb.google.protobuf.internal.well_known_types",
+        )
+        warnings.warn_explicit(
+            "websockets.legacy is deprecated",
+            DeprecationWarning,
+            filename="legacy.py",
+            lineno=1,
+            module="websockets.legacy.client",
+        )
+        return ModuleType(module_name)
+
+    monkeypatch.setattr(
+        "relay_teams.gateway.feishu.lark_ws_compat.importlib.import_module",
+        _fake_import,
+    )
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("default")
+            module = import_lark_module("lark_oapi.event.dispatcher_handler")
+        assert module.__name__ == "lark_oapi.event.dispatcher_handler"
+        assert caught == []
+    finally:
+        pass
+
+
+def test_parse_ws_conn_exception_reads_invalid_status_response_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    headers = Headers()
+    headers["handshake-status"] = "403"
+    headers["handshake-msg"] = "forbidden"
+
+    fake_const = SimpleNamespace(
+        AUTH_FAILED=401,
+        EXCEED_CONN_LIMIT=99991672,
+        FORBIDDEN=403,
+        HEADER_HANDSHAKE_AUTH_ERRCODE="handshake-auth-errcode",
+        HEADER_HANDSHAKE_MSG="handshake-msg",
+        HEADER_HANDSHAKE_STATUS="handshake-status",
+    )
+
+    class _ClientException(Exception):
+        pass
+
+    class _ServerException(Exception):
+        pass
+
+    fake_exception = SimpleNamespace(
+        ClientException=_ClientException,
+        ServerException=_ServerException,
+    )
+
+    original_import = __import__
+
+    def _fake_import(name: str, globals=None, locals=None, fromlist=(), level: int = 0):
+        if name == "lark_oapi.ws.const":
+            return fake_const
+        if name == "lark_oapi.ws.exception":
+            return fake_exception
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr("builtins.__import__", _fake_import)
+
+    with pytest.raises(_ClientException, match="forbidden"):
+        _parse_ws_conn_exception(InvalidStatus(Response(403, "Forbidden", headers)))
+
+
+def test_feishu_ws_controller_receive_loop_ignores_normal_close_after_stop() -> None:
+    controller = _FeishuWsController(
+        runtime_config=_build_runtime(
+            trigger_id="trg_a",
+            name="bot_a",
+            app_id="cli_demo",
+            app_name="bot-a",
+            app_secret="secret-demo",
+        ),
+        event_handler=_FakeHandler(),
+    )
+
+    class _ClosingWsConnection:
+        async def close(self) -> None:
+            return None
+
+        async def recv(self) -> bytes | str:
+            controller._stop_requested = True
+            raise ConnectionClosedOK(Close(1000, "bye"), Close(1000, ""), False)
+
+    ws_client = _FakeWsClient()
+    ws_client._conn = cast(_FakeWsConnection, _ClosingWsConnection())
+
+    asyncio.run(controller._receive_loop(cast(WsClientLike, ws_client)))

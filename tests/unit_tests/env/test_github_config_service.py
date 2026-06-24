@@ -5,18 +5,33 @@ from pathlib import Path
 
 import pytest
 
-from agent_teams.env.github_config_models import GitHubConfig
-from agent_teams.env.github_config_service import GitHubConfigService
-from agent_teams.env.github_secret_store import GitHubSecretStore
+from relay_teams.env.github_config_models import (
+    GitHubConfig,
+    GitHubConfigUpdate,
+    GitHubConfigView,
+)
+from relay_teams.env.github_config_service import GitHubConfigService
+from relay_teams.env.github_secret_store import GitHubSecretStore
 
 
 class _FakeGitHubSecretStore(GitHubSecretStore):
-    def __init__(self, *, can_persist: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        can_persist: bool = True,
+        fail_on_get_token: bool = False,
+    ) -> None:
         self._tokens: dict[str, str] = {}
         self._can_persist = can_persist
+        self._fail_on_get_token = fail_on_get_token
 
     def get_token(self, config_dir: Path) -> str | None:
+        if self._fail_on_get_token:
+            raise AssertionError("token value should not be read")
         return self._tokens.get(str(config_dir.resolve()))
+
+    def has_token_reference(self, config_dir: Path) -> bool:
+        return str(config_dir.resolve()) in self._tokens
 
     def set_token(self, config_dir: Path, token: str | None) -> None:
         normalized_key = str(config_dir.resolve())
@@ -40,7 +55,43 @@ def test_get_github_config_defaults_to_empty_token(tmp_path: Path) -> None:
         secret_store=_FakeGitHubSecretStore(),
     )
 
-    assert service.get_github_config() == GitHubConfig(token=None)
+    assert service.get_github_config() == GitHubConfig(
+        token=None,
+        webhook_base_url=None,
+    )
+    assert service.get_github_config_view() == GitHubConfigView(
+        token_configured=False,
+        webhook_base_url=None,
+    )
+
+
+def test_has_configured_github_token_reference_uses_env_without_secret_read(
+    tmp_path: Path,
+) -> None:
+    config_dir = tmp_path / ".agent-teams"
+    config_dir.mkdir(parents=True)
+    (config_dir / ".env").write_text("GH_TOKEN=ghp_env\n", encoding="utf-8")
+    service = GitHubConfigService(
+        config_dir=config_dir,
+        secret_store=_FakeGitHubSecretStore(fail_on_get_token=True),
+    )
+
+    assert service.has_configured_token_reference() is True
+
+
+def test_has_configured_github_token_reference_uses_saved_reference_only(
+    tmp_path: Path,
+) -> None:
+    config_dir = tmp_path / ".agent-teams"
+    config_dir.mkdir(parents=True)
+    secret_store = _FakeGitHubSecretStore(fail_on_get_token=True)
+    secret_store.set_token(config_dir, "ghp_secret")
+    service = GitHubConfigService(
+        config_dir=config_dir,
+        secret_store=secret_store,
+    )
+
+    assert service.has_configured_token_reference() is True
 
 
 def test_save_github_config_persists_keyring_secret(
@@ -51,7 +102,7 @@ def test_save_github_config_persists_keyring_secret(
     config_dir.mkdir(parents=True)
     secret_store = _FakeGitHubSecretStore()
     monkeypatch.setattr(
-        "agent_teams.env.runtime_env.get_app_config_dir",
+        "relay_teams.env.runtime_env.get_app_config_dir",
         lambda user_home_dir=None: config_dir,
     )
     service = GitHubConfigService(
@@ -59,7 +110,7 @@ def test_save_github_config_persists_keyring_secret(
         secret_store=secret_store,
     )
 
-    service.save_github_config(GitHubConfig(token="ghp_secret"))
+    service.save_github_config(GitHubConfig(token="ghp_secret", webhook_base_url=None))
 
     assert (config_dir / ".env").read_text(encoding="utf-8") == ""
     assert secret_store.get_token(config_dir) == "ghp_secret"
@@ -76,7 +127,7 @@ def test_save_github_config_removes_plaintext_env_tokens(
         encoding="utf-8",
     )
     monkeypatch.setattr(
-        "agent_teams.env.runtime_env.get_app_config_dir",
+        "relay_teams.env.runtime_env.get_app_config_dir",
         lambda user_home_dir=None: config_dir,
     )
     service = GitHubConfigService(
@@ -84,7 +135,7 @@ def test_save_github_config_removes_plaintext_env_tokens(
         secret_store=_FakeGitHubSecretStore(),
     )
 
-    service.save_github_config(GitHubConfig(token=None))
+    service.save_github_config(GitHubConfig(token=None, webhook_base_url=None))
 
     assert (config_dir / ".env").read_text(encoding="utf-8") == (
         "HTTP_PROXY=http://proxy.example:8080\n"
@@ -103,7 +154,7 @@ def test_save_github_config_falls_back_to_env_when_keyring_unavailable(
     )
     secret_store = _FakeGitHubSecretStore(can_persist=False)
     monkeypatch.setattr(
-        "agent_teams.env.runtime_env.get_app_config_dir",
+        "relay_teams.env.runtime_env.get_app_config_dir",
         lambda user_home_dir=None: config_dir,
     )
     service = GitHubConfigService(
@@ -111,10 +162,124 @@ def test_save_github_config_falls_back_to_env_when_keyring_unavailable(
         secret_store=secret_store,
     )
 
-    service.save_github_config(GitHubConfig(token=" ghp_secret "))
+    service.save_github_config(
+        GitHubConfig(token=" ghp_secret ", webhook_base_url=None)
+    )
 
     assert (config_dir / ".env").read_text(encoding="utf-8") == (
         "HTTP_PROXY=http://proxy.example:8080\n"
     )
-    assert service.get_github_config() == GitHubConfig(token="ghp_secret")
-    assert secret_store.get_token(config_dir) == "ghp_secret"
+    assert service.get_github_config() == GitHubConfig(
+        token="ghp_secret",
+        webhook_base_url=None,
+    )
+
+
+def test_save_github_config_persists_public_webhook_base_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_dir = tmp_path / ".agent-teams"
+    config_dir.mkdir(parents=True)
+    monkeypatch.setattr(
+        "relay_teams.env.runtime_env.get_app_config_dir",
+        lambda user_home_dir=None: config_dir,
+    )
+    service = GitHubConfigService(
+        config_dir=config_dir,
+        secret_store=_FakeGitHubSecretStore(),
+    )
+
+    service.save_github_config(
+        GitHubConfig(
+            token=None,
+            webhook_base_url="https://agent-teams.example.com/automation/",
+        )
+    )
+
+    assert (config_dir / ".env").read_text(encoding="utf-8") == (
+        "AGENT_TEAMS_GITHUB_WEBHOOK_BASE_URL=https://agent-teams.example.com/automation\n"
+    )
+    assert service.get_github_config() == GitHubConfig(
+        token=None,
+        webhook_base_url="https://agent-teams.example.com/automation",
+    )
+
+
+def test_save_github_config_rejects_local_webhook_base_url(tmp_path: Path) -> None:
+    config_dir = tmp_path / ".agent-teams"
+    config_dir.mkdir(parents=True)
+    service = GitHubConfigService(
+        config_dir=config_dir,
+        secret_store=_FakeGitHubSecretStore(),
+    )
+
+    with pytest.raises(ValueError, match="publicly reachable"):
+        service.save_github_config(
+            GitHubConfig(
+                token=None,
+                webhook_base_url="http://127.0.0.1:8000",
+            )
+        )
+
+
+def test_get_github_config_drops_invalid_saved_webhook_base_url(tmp_path: Path) -> None:
+    config_dir = tmp_path / ".agent-teams"
+    config_dir.mkdir(parents=True)
+    (config_dir / ".env").write_text(
+        "AGENT_TEAMS_GITHUB_WEBHOOK_BASE_URL=http://127.0.0.1:8000\n",
+        encoding="utf-8",
+    )
+    service = GitHubConfigService(
+        config_dir=config_dir,
+        secret_store=_FakeGitHubSecretStore(),
+    )
+
+    assert service.get_github_config() == GitHubConfig(
+        token=None,
+        webhook_base_url=None,
+    )
+    assert (config_dir / ".env").read_text(encoding="utf-8") == ""
+
+
+def test_update_github_config_keeps_existing_token_when_request_omits_it(
+    tmp_path: Path,
+) -> None:
+    config_dir = tmp_path / ".agent-teams"
+    config_dir.mkdir(parents=True)
+    secret_store = _FakeGitHubSecretStore()
+    secret_store.set_token(config_dir, "ghp_existing")
+    service = GitHubConfigService(
+        config_dir=config_dir,
+        secret_store=secret_store,
+    )
+
+    updated = service.update_github_config(
+        GitHubConfigUpdate(
+            webhook_base_url="https://agent-teams.example.com",
+        )
+    )
+
+    assert updated == GitHubConfig(
+        token="ghp_existing",
+        webhook_base_url="https://agent-teams.example.com",
+    )
+    assert service.get_github_config_view() == GitHubConfigView(
+        token_configured=True,
+        webhook_base_url="https://agent-teams.example.com",
+    )
+
+
+def test_reveal_github_token_returns_saved_secret(tmp_path: Path) -> None:
+    config_dir = tmp_path / ".agent-teams"
+    config_dir.mkdir(parents=True)
+    secret_store = _FakeGitHubSecretStore()
+    secret_store.set_token(config_dir, "ghp_existing")
+    service = GitHubConfigService(
+        config_dir=config_dir,
+        secret_store=secret_store,
+    )
+
+    assert service.reveal_github_token().model_dump(mode="json") == {
+        "token": "ghp_existing"
+    }

@@ -1,0 +1,2713 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+from datetime import datetime, timezone
+from json import dumps
+from pathlib import Path
+from typing import Callable
+
+from pydantic import BaseModel, ConfigDict, Field
+from pydantic_ai.messages import ModelResponse, TextPart
+
+from relay_teams.agent_runtimes.instances.enums import InstanceLifecycle, InstanceStatus
+from relay_teams.agent_runtimes.instances.models import (
+    AgentRuntimeRecord,
+    create_subagent_instance,
+)
+from relay_teams.agents.orchestration.graph_models import (
+    OrchestrationGraph,
+    OrchestrationGraphNode,
+)
+from relay_teams.agents.orchestration.delegation_planning import (
+    AUTO_LANE_NODE_PREFIX,
+    DelegationPlanningService,
+)
+from relay_teams.agents.orchestration.policy_models import OrchestrationPolicy
+from relay_teams.agents.orchestration.role_contracts import (
+    role_contract_precondition_failures,
+    role_contract_verification_checks,
+)
+from relay_teams.agents.orchestration.task_contracts import TaskExecutionResult
+from relay_teams.agents.orchestration.task_execution_service import TaskExecutionService
+from relay_teams.agents.orchestration.verification import (
+    SemanticVerificationEvaluator,
+    verify_task,
+)
+from relay_teams.sessions.runs.event_log import EventLog
+from relay_teams.agents.execution.system_prompts import RuntimePromptBuilder
+from relay_teams.providers.provider_contracts import LLMProvider
+from relay_teams.roles.runtime_role_resolver import RuntimeRoleResolver
+from relay_teams.roles.role_registry import RoleRegistry
+from relay_teams.roles.role_models import RoleDefinition
+from relay_teams.logger import get_logger, log_event
+from relay_teams.agents.orchestration.human_gate import GateManager
+from relay_teams.sessions.runs.run_control_manager import RunControlManager
+from relay_teams.sessions.runs.enums import ExecutionMode, RunEventType
+from relay_teams.sessions.runs.event_stream import RunEventHub
+from relay_teams.sessions.runs.ids import new_trace_id
+from relay_teams.sessions.runs.run_intent_repo import RunIntentRepository
+from relay_teams.sessions.runs.run_models import (
+    IntentInput,
+    RunEvent,
+    RunTopologySnapshot,
+)
+from relay_teams.sessions.runs.assistant_errors import (
+    RunCompletionReason,
+    build_assistant_error_message,
+)
+from relay_teams.agent_runtimes.instances.instance_repository import (
+    AgentInstanceRepository,
+)
+from relay_teams.sessions.session_repository import SessionRepository
+from relay_teams.sessions.runs.run_runtime_repo import (
+    RunRuntimePhase,
+    RunRuntimeRecord,
+    RunRuntimeRepository,
+)
+from relay_teams.persistence.shared_state_repo import SharedStateRepository
+from relay_teams.agents.tasks.task_repository import TaskRepository
+from relay_teams.workspace import WorkspaceManager, build_conversation_id
+from relay_teams.agents.tasks.enums import TaskStatus
+from relay_teams.agents.tasks.events import EventEnvelope, EventType
+from relay_teams.agents.tasks.ids import new_task_id
+from relay_teams.agents.tasks.models import (
+    TaskEnvelope,
+    TaskRecord,
+    VerificationCheckResult,
+    VerificationPlan,
+    VerificationResult,
+)
+from relay_teams.sessions.session_models import SessionMode
+from relay_teams.hooks import (
+    HookDecisionType,
+    HookEventName,
+    HookService,
+    TaskCreatedInput,
+)
+from relay_teams.tools.runtime.guardrails import (
+    generate_runtime_guardrail_report_async,
+    runtime_guardrail_report_from_event_payload,
+)
+from relay_teams.tools.runtime.policy import ToolApprovalPolicy
+
+from relay_teams.roles.tool_diet_validation import (
+    validate_tool_diet as _validate_tool_diet,
+)
+from relay_teams.roles.tool_diet_policy import ToolDietPolicy as _ToolDietPolicy
+
+from relay_teams.agents.tasks.enums import (
+    TaskTimeoutAction,
+    WakeupReason,
+    WakeupStatus,
+)
+from relay_teams.agents.tasks.wakeup_models import AgentWakeupEntry
+from relay_teams.roles.tool_diet_validation import should_reject
+
+LOGGER = get_logger(__name__)
+_AUTO_DELEGATION_TERMINAL_STATUSES = frozenset(
+    {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.TIMEOUT}
+)
+
+_TASK_ID_PREFIX_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:"
+)
+
+
+def _clean_check_display_name(name: str) -> str:
+    return _TASK_ID_PREFIX_RE.sub("", name)
+
+
+def _format_verification_failure(verification: VerificationResult) -> str:
+    report = verification.report
+    if report is None:
+        detail_text = "; ".join(verification.details) if verification.details else ""
+        header = "Verification failed."
+        detail_line = f"\n{detail_text}" if detail_text else ""
+        return (
+            f"{header}{detail_line}\n\n"
+            "Review the task spec and evidence expectations, "
+            "then continue with corrected output."
+        )
+
+    checks = report.checks
+    passed_checks = [c for c in checks if c.passed]
+    failed_checks = [c for c in checks if not c.passed]
+    total = len(checks)
+
+    passed_count = len(passed_checks)
+    failed_count = len(failed_checks)
+    lines: list[str] = [
+        "Verification failed.",
+        f"{total} check(s): {passed_count} passed, {failed_count} failed.",
+    ]
+
+    if failed_checks:
+        lines.append("")
+        lines.append("Failed:")
+        for check in failed_checks:
+            display = _clean_check_display_name(check.name)
+            detail = f" -- {check.details}" if check.details else ""
+            lines.append(f"  [FAIL] {display}{detail}")
+
+    if passed_checks:
+        lines.append("")
+        lines.append("Passed:")
+        for check in passed_checks:
+            display = _clean_check_display_name(check.name)
+            lines.append(f"  [PASS] {display}")
+
+    lines.append("")
+    lines.append(
+        "Review the task spec and evidence expectations, "
+        "then continue with corrected output."
+    )
+    return "\n".join(lines)
+
+
+class CoordinatorRunResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    trace_id: str
+    root_task_id: str
+    output: str
+    completion_reason: RunCompletionReason = RunCompletionReason.ASSISTANT_RESPONSE
+    error_code: str | None = None
+    error_message: str | None = None
+
+
+class _AutoDelegationLaneState(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    has_lanes: bool = False
+    has_nonterminal_lanes: bool = False
+
+
+class DelegatedTaskExecutionDisabledError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        trace_id: str,
+        root_task_id: str,
+        pending_lane_count: int,
+        max_parallel_tasks: int,
+    ) -> None:
+        self.trace_id = trace_id
+        self.root_task_id = root_task_id
+        self.pending_lane_count = pending_lane_count
+        self.max_parallel_tasks = max_parallel_tasks
+        message = (
+            "Delegated task execution is disabled by the orchestration policy "
+            f"while {pending_lane_count} delegated task lane(s) are ready."
+        )
+        super().__init__(message)
+
+
+class CoordinatorGraph(BaseModel):
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    role_registry: RoleRegistry
+    task_repo: TaskRepository
+    shared_store: SharedStateRepository
+    event_bus: EventLog
+    agent_repo: AgentInstanceRepository
+    prompt_builder: RuntimePromptBuilder
+    provider_factory: Callable[[RoleDefinition, str | None], LLMProvider]
+    task_execution_service: TaskExecutionService
+    run_runtime_repo: RunRuntimeRepository
+    run_control_manager: RunControlManager
+    session_repo: SessionRepository | None = None
+    gate_manager: GateManager = Field(default_factory=GateManager)
+    run_event_hub: RunEventHub | None = None
+    hook_service: HookService | None = None
+    semantic_evaluator: SemanticVerificationEvaluator | None = None
+    planning_service: DelegationPlanningService | None = None
+
+    async def run(
+        self,
+        intent: IntentInput,
+        trace_id: str | None = None,
+    ) -> CoordinatorRunResult:
+        trace_id = trace_id or new_trace_id().value
+        session_id = intent.session_id
+        if session_id is None:
+            raise ValueError(
+                "IntentInput.session_id is required before coordinator run"
+            )
+        log_event(
+            LOGGER,
+            logging.INFO,
+            event="coord.run.started",
+            message="Coordinator run started",
+            payload={
+                "execution_mode": intent.execution_mode.value,
+                "session_mode": intent.session_mode.value,
+                "session_id": session_id,
+                "intent_preview": intent.intent[:120],
+            },
+        )
+        root_role_id = self._root_role_id(intent)
+        verification_tool_policy = ToolApprovalPolicy(
+            yolo=intent.yolo,
+            shell_safety_policy_enabled=intent.shell_safety_policy_enabled,
+        )
+
+        root_task = TaskEnvelope(
+            task_id=new_task_id().value,
+            session_id=session_id,
+            parent_task_id=None,
+            trace_id=trace_id,
+            role_id=root_role_id,
+            objective=intent.intent,
+            skills=intent.skills,
+            verification=VerificationPlan(checklist=("non_empty_response",)),
+        )
+        _ = await self.task_repo.create_async(root_task)
+        await self._execute_task_created_hooks(root_task=root_task)
+        await self.event_bus.emit_async(
+            EventEnvelope(
+                event_type=EventType.TASK_CREATED,
+                trace_id=trace_id,
+                session_id=session_id,
+                task_id=root_task.task_id,
+                payload_json="{}",
+            )
+        )
+
+        mode = intent.execution_mode
+        root_instance_id: str | None = None
+        if mode == ExecutionMode.MANUAL:
+            result = TaskExecutionResult(
+                output=await self._initialize_manual_mode(
+                    trace_id=trace_id, root_task=root_task
+                ),
+                completion_reason=RunCompletionReason.ASSISTANT_RESPONSE,
+            )
+        elif mode == ExecutionMode.AI:
+            root_instance_id = await self._ensure_root_instance_async(
+                session_id=session_id,
+                trace_id=trace_id,
+                root_task=root_task,
+                assigned_instance_id=None,
+                reuse_existing_instance=intent.reuse_root_instance,
+            )
+            if intent.session_mode == SessionMode.NORMAL:
+                result = await self._task_executor(
+                    instance_id=root_instance_id,
+                    role_id=root_role_id,
+                    task=root_task,
+                )
+            else:
+                result = self._coerce_task_execution_result(
+                    await self._run_ai_mode(
+                        trace_id=trace_id,
+                        root_task=root_task,
+                        coordinator_instance_id=root_instance_id,
+                        topology=intent.topology,
+                    )
+                )
+        else:
+            raise ValueError(f"Unknown execution mode: {mode}")
+
+        if result.completion_reason == RunCompletionReason.ASSISTANT_ERROR:
+            final_result = CoordinatorRunResult(
+                trace_id=trace_id,
+                root_task_id=root_task.task_id,
+                output=result.output,
+                completion_reason=result.completion_reason,
+                error_code=result.error_code,
+                error_message=result.error_message,
+            )
+        else:
+            allowed_tools, workspace_root = await self._verification_context(
+                task=root_task,
+                instance_id=root_instance_id,
+            )
+            verification = await self._verify_task_async(
+                root_task_id=root_task.task_id,
+                allowed_tools=allowed_tools,
+                tool_approval_policy=verification_tool_policy,
+                workspace_root=workspace_root,
+            )
+            verification_result = await self._terminal_status_from_verification_async(
+                trace_id=trace_id,
+                root_task=root_task,
+                verification=verification,
+                output=result.output,
+                root_instance_id=root_instance_id,
+                root_role_id=root_role_id,
+            )
+            final_result = CoordinatorRunResult(
+                trace_id=trace_id,
+                root_task_id=root_task.task_id,
+                output=verification_result.output,
+                completion_reason=verification_result.completion_reason,
+                error_code=verification_result.error_code,
+                error_message=verification_result.error_message,
+            )
+        log_event(
+            LOGGER,
+            logging.INFO
+            if final_result.completion_reason == RunCompletionReason.ASSISTANT_RESPONSE
+            else logging.WARNING,
+            event="coord.run.completed",
+            message="Coordinator run finished",
+            payload={
+                "execution_mode": mode.value,
+                "completion_reason": final_result.completion_reason.value,
+                "root_task_id": root_task.task_id,
+            },
+        )
+        return final_result
+
+    async def resume(
+        self,
+        *,
+        trace_id: str,
+    ) -> CoordinatorRunResult:
+        root_task_record = await self._get_root_task_by_trace_async(trace_id)
+        root_task = root_task_record.envelope
+        root_instance_id = await self._ensure_root_instance_async(
+            session_id=root_task.session_id,
+            trace_id=trace_id,
+            root_task=root_task,
+            assigned_instance_id=root_task_record.assigned_instance_id,
+        )
+        await self._prepare_recovery_async(
+            trace_id=trace_id,
+            coordinator_instance_id=root_instance_id,
+        )
+        root_role_id = _require_task_role_id(root_task)
+        verification_tool_policy = await self._verification_tool_policy_async(
+            trace_id=trace_id,
+            fallback_session_id=root_task.session_id,
+        )
+        if not self.role_registry.is_coordinator_role(root_role_id):
+            result = await self._task_executor(
+                instance_id=root_instance_id,
+                role_id=root_role_id,
+                task=root_task,
+            )
+            if result.completion_reason == RunCompletionReason.ASSISTANT_ERROR:
+                return CoordinatorRunResult(
+                    trace_id=trace_id,
+                    root_task_id=root_task.task_id,
+                    output=result.output,
+                    completion_reason=result.completion_reason,
+                    error_code=result.error_code,
+                    error_message=result.error_message,
+                )
+            allowed_tools, workspace_root = await self._verification_context(
+                task=root_task,
+                instance_id=root_instance_id,
+            )
+            verification = await self._verify_task_async(
+                root_task_id=root_task.task_id,
+                allowed_tools=allowed_tools,
+                tool_approval_policy=verification_tool_policy,
+                workspace_root=workspace_root,
+            )
+            verification_result = await self._terminal_status_from_verification_async(
+                trace_id=trace_id,
+                root_task=root_task,
+                verification=verification,
+                output=result.output,
+                root_instance_id=root_instance_id,
+                root_role_id=root_role_id,
+            )
+            return CoordinatorRunResult(
+                trace_id=trace_id,
+                root_task_id=root_task.task_id,
+                output=verification_result.output,
+                completion_reason=verification_result.completion_reason,
+                error_code=verification_result.error_code,
+                error_message=verification_result.error_message,
+            )
+        runtime = await self.run_runtime_repo.get_async(trace_id)
+        coordinator_first = not await self._has_resumable_delegated_work_async(
+            trace_id=trace_id,
+            root_task_id=root_task.task_id,
+        )
+        if runtime is not None and runtime.phase in {
+            RunRuntimePhase.SUBAGENT_RUNNING,
+            RunRuntimePhase.AWAITING_SUBAGENT_FOLLOWUP,
+        }:
+            coordinator_first = False
+        result = await self._run_ai_mode(
+            trace_id=trace_id,
+            root_task=root_task,
+            coordinator_instance_id=root_instance_id,
+            coordinator_first=coordinator_first,
+            initial_result=root_task_record.result or "",
+            topology=await self._topology_for_run_async(
+                trace_id=trace_id,
+                fallback_session_id=root_task.session_id,
+            ),
+        )
+        result = self._coerce_task_execution_result(result)
+        if result.completion_reason == RunCompletionReason.ASSISTANT_ERROR:
+            return CoordinatorRunResult(
+                trace_id=trace_id,
+                root_task_id=root_task.task_id,
+                output=result.output,
+                completion_reason=result.completion_reason,
+                error_code=result.error_code,
+                error_message=result.error_message,
+            )
+        allowed_tools, workspace_root = await self._verification_context(
+            task=root_task,
+            instance_id=root_instance_id,
+        )
+        verification = await self._verify_task_async(
+            root_task_id=root_task.task_id,
+            allowed_tools=allowed_tools,
+            tool_approval_policy=verification_tool_policy,
+            workspace_root=workspace_root,
+        )
+        verification_result = await self._terminal_status_from_verification_async(
+            trace_id=trace_id,
+            root_task=root_task,
+            verification=verification,
+            output=result.output,
+            root_instance_id=root_instance_id,
+            root_role_id=root_role_id,
+        )
+        return CoordinatorRunResult(
+            trace_id=trace_id,
+            root_task_id=root_task.task_id,
+            output=verification_result.output,
+            completion_reason=verification_result.completion_reason,
+            error_code=verification_result.error_code,
+            error_message=verification_result.error_message,
+        )
+
+    async def _initialize_manual_mode(
+        self, *, trace_id: str, root_task: TaskEnvelope
+    ) -> str:
+        result = (
+            "Manual orchestration initialized. Use task APIs or task tools to create, update, "
+            "list, and dispatch delegated tasks."
+        )
+        session_id = root_task.session_id
+        await self.task_repo.update_status_async(
+            root_task.task_id, TaskStatus.COMPLETED, result=result
+        )
+        await self.event_bus.emit_async(
+            EventEnvelope(
+                event_type=EventType.TASK_COMPLETED,
+                trace_id=trace_id,
+                session_id=session_id,
+                task_id=root_task.task_id,
+                payload_json="{}",
+            )
+        )
+        await self._publish_run_event_async(
+            session_id=session_id,
+            run_id=trace_id,
+            trace_id=trace_id,
+            task_id=root_task.task_id,
+            instance_id=None,
+            role_id=None,
+            event_type=RunEventType.AWAITING_MANUAL_ACTION,
+            payload={"root_task_id": root_task.task_id},
+        )
+        return result
+
+    async def _execute_task_created_hooks(self, *, root_task: TaskEnvelope) -> None:
+        if self.hook_service is None or root_task.parent_task_id is None:
+            return
+        bundle = await self.hook_service.execute(
+            event_input=TaskCreatedInput(
+                event_name=HookEventName.TASK_CREATED,
+                session_id=root_task.session_id,
+                run_id=root_task.trace_id,
+                trace_id=root_task.trace_id,
+                task_id=root_task.task_id,
+                role_id=root_task.role_id,
+                created_task_id=root_task.task_id,
+                parent_task_id=root_task.parent_task_id,
+                title=root_task.title or "",
+                objective=root_task.objective,
+            ),
+            run_event_hub=self.run_event_hub,
+        )
+        if bundle.decision == HookDecisionType.DENY:
+            raise ValueError(bundle.reason or "Task creation denied by runtime hooks.")
+
+    async def _run_ai_mode(
+        self,
+        *,
+        trace_id: str,
+        root_task: TaskEnvelope,
+        coordinator_instance_id: str,
+        coordinator_first: bool = True,
+        initial_result: str = "",
+        topology: RunTopologySnapshot | None = None,
+    ) -> TaskExecutionResult:
+        policy = _orchestration_policy(topology)
+        coordinator_result = TaskExecutionResult(output=initial_result)
+        coordinator_role_id = _require_task_role_id(root_task)
+        if coordinator_first:
+            auto_lane_state = await self._run_auto_delegation_lane_state_async(
+                trace_id=trace_id
+            )
+            if auto_lane_state.has_nonterminal_lanes:
+                return await self._run_dynamic_delegation_cycles_async(
+                    trace_id=trace_id,
+                    root_task=root_task,
+                    coordinator_instance_id=coordinator_instance_id,
+                    policy=policy,
+                    coordinator_result=coordinator_result,
+                )
+            if not auto_lane_state.has_lanes:
+                if topology is not None and topology.orchestration_graph is not None:
+                    if await self._run_has_fixed_graph_nodes_async(
+                        trace_id=trace_id,
+                        graph=topology.orchestration_graph,
+                    ):
+                        return await self._run_graph_mode(
+                            trace_id=trace_id,
+                            root_task=root_task,
+                            coordinator_instance_id=coordinator_instance_id,
+                            topology=topology,
+                            initial_result=initial_result,
+                        )
+                if await self._run_auto_delegation_planning_async(
+                    root_task=root_task,
+                    topology=topology,
+                    policy=policy,
+                ):
+                    return await self._run_dynamic_delegation_cycles_async(
+                        trace_id=trace_id,
+                        root_task=root_task,
+                        coordinator_instance_id=coordinator_instance_id,
+                        policy=policy,
+                        coordinator_result=coordinator_result,
+                    )
+                if topology is not None and topology.orchestration_graph is not None:
+                    return await self._run_graph_mode(
+                        trace_id=trace_id,
+                        root_task=root_task,
+                        coordinator_instance_id=coordinator_instance_id,
+                        topology=topology,
+                        initial_result=initial_result,
+                    )
+            coordinator_result = await self._task_executor(
+                instance_id=coordinator_instance_id,
+                role_id=coordinator_role_id,
+                task=root_task,
+            )
+            log_event(
+                LOGGER,
+                logging.DEBUG,
+                event="coord.cycle.first_pass.completed",
+                message="Coordinator first pass completed",
+                payload={
+                    "max_orchestration_cycles": policy.max_orchestration_cycles,
+                    "max_parallel_delegated_tasks": (
+                        policy.max_parallel_delegated_tasks
+                    ),
+                },
+            )
+        elif topology is not None and topology.orchestration_graph is not None:
+            auto_lane_state = await self._run_auto_delegation_lane_state_async(
+                trace_id=trace_id
+            )
+            if auto_lane_state.has_nonterminal_lanes:
+                return await self._run_dynamic_delegation_cycles_async(
+                    trace_id=trace_id,
+                    root_task=root_task,
+                    coordinator_instance_id=coordinator_instance_id,
+                    policy=policy,
+                    coordinator_result=coordinator_result,
+                )
+            if not auto_lane_state.has_lanes:
+                return await self._run_graph_mode(
+                    trace_id=trace_id,
+                    root_task=root_task,
+                    coordinator_instance_id=coordinator_instance_id,
+                    topology=topology,
+                    initial_result=initial_result,
+                )
+            coordinator_result = await self._task_executor(
+                instance_id=coordinator_instance_id,
+                role_id=coordinator_role_id,
+                task=root_task,
+            )
+
+        return await self._run_dynamic_delegation_cycles_async(
+            trace_id=trace_id,
+            root_task=root_task,
+            coordinator_instance_id=coordinator_instance_id,
+            policy=policy,
+            coordinator_result=coordinator_result,
+        )
+
+    async def _run_dynamic_delegation_cycles_async(
+        self,
+        *,
+        trace_id: str,
+        root_task: TaskEnvelope,
+        coordinator_instance_id: str,
+        policy: OrchestrationPolicy,
+        coordinator_result: TaskExecutionResult,
+    ) -> TaskExecutionResult:
+        coordinator_role_id = _require_task_role_id(root_task)
+        if policy.max_orchestration_cycles < 1:
+            pending_task_count = await self._pending_delegated_task_count_async(
+                trace_id=trace_id,
+                root_task_id=root_task.task_id,
+            )
+            if pending_task_count:
+                error_message = (
+                    "Orchestration policy allows zero orchestration cycles while "
+                    f"{pending_task_count} delegated task(s) are pending."
+                )
+                assistant_message = build_assistant_error_message(
+                    error_code="orchestration_cycles_exhausted",
+                    error_message=error_message,
+                )
+                log_event(
+                    LOGGER,
+                    logging.WARNING,
+                    event="coord.cycle.blocked",
+                    message="Coordinator cycle blocked by zero-cycle orchestration policy",
+                    payload={
+                        "trace_id": trace_id,
+                        "root_task_id": root_task.task_id,
+                        "pending_task_count": pending_task_count,
+                        "max_orchestration_cycles": policy.max_orchestration_cycles,
+                    },
+                )
+                await self._fail_root_task_async(
+                    trace_id=trace_id,
+                    root_task=root_task,
+                    coordinator_instance_id=coordinator_instance_id,
+                    error_code="orchestration_cycles_exhausted",
+                    error_message=error_message,
+                )
+                return TaskExecutionResult(
+                    output=assistant_message,
+                    completion_reason=RunCompletionReason.ASSISTANT_ERROR,
+                    error_code="orchestration_cycles_exhausted",
+                    error_message=error_message,
+                )
+
+        cycle = 0
+        while cycle < policy.max_orchestration_cycles:
+            cycle += 1
+            log_event(
+                LOGGER,
+                logging.DEBUG,
+                event="coord.cycle.started",
+                message="Coordinator cycle started",
+                payload={"cycle": cycle},
+            )
+            try:
+                ran_any = await self._run_pending_delegated_tasks(
+                    trace_id=trace_id,
+                    root_task_id=root_task.task_id,
+                    max_parallel_tasks=policy.max_parallel_delegated_tasks,
+                )
+            except DelegatedTaskExecutionDisabledError as exc:
+                error_message = str(exc)
+                assistant_message = build_assistant_error_message(
+                    error_code="delegated_task_execution_disabled",
+                    error_message=error_message,
+                )
+                log_event(
+                    LOGGER,
+                    logging.WARNING,
+                    event="coord.cycle.blocked",
+                    message="Coordinator cycle blocked by orchestration policy",
+                    payload={
+                        "cycle": cycle,
+                        "trace_id": trace_id,
+                        "root_task_id": root_task.task_id,
+                        "pending_lane_count": exc.pending_lane_count,
+                        "max_parallel_tasks": exc.max_parallel_tasks,
+                    },
+                )
+                await self._fail_root_task_async(
+                    trace_id=trace_id,
+                    root_task=root_task,
+                    coordinator_instance_id=coordinator_instance_id,
+                    error_code="delegated_task_execution_disabled",
+                    error_message=error_message,
+                )
+                return TaskExecutionResult(
+                    output=assistant_message,
+                    completion_reason=RunCompletionReason.ASSISTANT_ERROR,
+                    error_code="delegated_task_execution_disabled",
+                    error_message=error_message,
+                )
+            if not ran_any:
+                log_event(
+                    LOGGER,
+                    logging.DEBUG,
+                    event="coord.cycle.stopped",
+                    message="Coordinator cycle stopped",
+                    payload={
+                        "cycle": cycle,
+                        "reason": "no_pending_subtasks",
+                    },
+                )
+                break
+            coordinator_result = await self._task_executor(
+                instance_id=coordinator_instance_id,
+                role_id=coordinator_role_id,
+                task=root_task,
+            )
+            log_event(
+                LOGGER,
+                logging.DEBUG,
+                event="coord.cycle.completed",
+                message="Coordinator cycle completed",
+                payload={"cycle": cycle},
+            )
+
+        pending_task_count = await self._pending_delegated_task_count_async(
+            trace_id=trace_id,
+            root_task_id=root_task.task_id,
+        )
+        if pending_task_count:
+            error_message = (
+                "Orchestration policy exhausted "
+                f"{policy.max_orchestration_cycles} cycle(s) while "
+                f"{pending_task_count} delegated task(s) are still pending."
+            )
+            assistant_message = build_assistant_error_message(
+                error_code="orchestration_cycles_exhausted",
+                error_message=error_message,
+            )
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                event="coord.cycle.exhausted",
+                message="Coordinator cycle budget exhausted with pending tasks",
+                payload={
+                    "trace_id": trace_id,
+                    "root_task_id": root_task.task_id,
+                    "pending_task_count": pending_task_count,
+                    "max_orchestration_cycles": policy.max_orchestration_cycles,
+                },
+            )
+            await self._fail_root_task_async(
+                trace_id=trace_id,
+                root_task=root_task,
+                coordinator_instance_id=coordinator_instance_id,
+                error_code="orchestration_cycles_exhausted",
+                error_message=error_message,
+            )
+            return TaskExecutionResult(
+                output=assistant_message,
+                completion_reason=RunCompletionReason.ASSISTANT_ERROR,
+                error_code="orchestration_cycles_exhausted",
+                error_message=error_message,
+            )
+
+        return coordinator_result
+
+    async def _run_auto_delegation_lane_state_async(
+        self, *, trace_id: str
+    ) -> _AutoDelegationLaneState:
+        has_lanes = False
+        has_nonterminal_lanes = False
+        for record in await self.task_repo.list_by_trace_async(trace_id):
+            node_id = record.envelope.orchestration_node_id or ""
+            if node_id.startswith(AUTO_LANE_NODE_PREFIX):
+                has_lanes = True
+                if record.status not in _AUTO_DELEGATION_TERMINAL_STATUSES:
+                    has_nonterminal_lanes = True
+        return _AutoDelegationLaneState(
+            has_lanes=has_lanes,
+            has_nonterminal_lanes=has_nonterminal_lanes,
+        )
+
+    async def _run_has_fixed_graph_nodes_async(
+        self,
+        *,
+        trace_id: str,
+        graph: OrchestrationGraph,
+    ) -> bool:
+        records_by_node = await self._graph_records_by_node_async(
+            trace_id=trace_id,
+            graph=graph,
+        )
+        return bool(records_by_node)
+
+    async def _run_auto_delegation_planning_async(
+        self,
+        *,
+        root_task: TaskEnvelope,
+        topology: RunTopologySnapshot | None,
+        policy: OrchestrationPolicy,
+    ) -> bool:
+        planning_service = self.planning_service
+        if planning_service is None:
+            return False
+        plan = await planning_service.plan_and_create_tasks_async(
+            root_task=root_task,
+            topology=topology,
+            policy=policy,
+        )
+        if plan is None or not plan.should_decompose or not plan.lanes:
+            return False
+        log_event(
+            LOGGER,
+            logging.INFO,
+            event="coord.planning.completed",
+            message="Coordinator accepted DelegationPlanner delegation plan",
+            payload={
+                "trace_id": root_task.trace_id,
+                "root_task_id": root_task.task_id,
+                "lane_count": len(plan.lanes),
+                "planner_role_id": policy.planner_role_id,
+            },
+        )
+        return True
+
+    async def _run_graph_mode(
+        self,
+        *,
+        trace_id: str,
+        root_task: TaskEnvelope,
+        coordinator_instance_id: str,
+        topology: RunTopologySnapshot,
+        initial_result: str = "",
+    ) -> TaskExecutionResult:
+        graph = topology.orchestration_graph
+        if graph is None:
+            return TaskExecutionResult(output=initial_result)
+        policy = _orchestration_policy(topology)
+        max_parallel_tasks = min(
+            graph.max_parallel_tasks,
+            policy.max_parallel_delegated_tasks,
+        )
+
+        log_event(
+            LOGGER,
+            logging.INFO,
+            event="coord.graph.started",
+            message="Coordinator graph execution started",
+            payload={
+                "trace_id": trace_id,
+                "root_task_id": root_task.task_id,
+                "node_count": len(graph.nodes),
+                "graph_max_parallel_tasks": graph.max_parallel_tasks,
+                "policy_max_parallel_delegated_tasks": (
+                    policy.max_parallel_delegated_tasks
+                ),
+                "resolved_max_parallel_tasks": max_parallel_tasks,
+            },
+        )
+        missing_role_ids = self._missing_graph_role_ids(graph)
+        if missing_role_ids:
+            role_list = ", ".join(missing_role_ids)
+            error_message = f"Graph references missing role(s): {role_list}."
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                event="coord.graph.role_missing",
+                message="Coordinator graph references missing roles",
+                payload={
+                    "trace_id": trace_id,
+                    "root_task_id": root_task.task_id,
+                    "missing_role_ids": list(missing_role_ids),
+                },
+            )
+            graph_status = await self._graph_status_async(
+                trace_id=trace_id, graph=graph
+            )
+            await self._fail_root_task_async(
+                trace_id=trace_id,
+                root_task=root_task,
+                coordinator_instance_id=coordinator_instance_id,
+                error_code="graph_role_missing",
+                error_message=error_message,
+            )
+            return TaskExecutionResult(
+                output=(
+                    self._graph_execution_summary(graph_status=graph_status)
+                    + f"\n\nMissing graph node roles: {role_list}"
+                ),
+                completion_reason=RunCompletionReason.ASSISTANT_ERROR,
+                error_code="graph_role_missing",
+                error_message=error_message,
+            )
+
+        while True:
+            created_any = await self._create_ready_graph_tasks_async(
+                graph=graph,
+                root_task=root_task,
+            )
+            try:
+                ran_any = await self._run_pending_delegated_tasks(
+                    trace_id=trace_id,
+                    root_task_id=root_task.task_id,
+                    max_parallel_tasks=max_parallel_tasks,
+                )
+            except DelegatedTaskExecutionDisabledError as exc:
+                graph_status = await self._graph_status_async(
+                    trace_id=trace_id,
+                    graph=graph,
+                )
+                error_message = str(exc)
+                await self._fail_root_task_async(
+                    trace_id=trace_id,
+                    root_task=root_task,
+                    coordinator_instance_id=coordinator_instance_id,
+                    error_code="delegated_task_execution_disabled",
+                    error_message=error_message,
+                )
+                return TaskExecutionResult(
+                    output=(
+                        self._graph_execution_summary(graph_status=graph_status)
+                        + f"\n\n{error_message}"
+                    ),
+                    completion_reason=RunCompletionReason.ASSISTANT_ERROR,
+                    error_code="delegated_task_execution_disabled",
+                    error_message=error_message,
+                )
+            graph_status = await self._graph_status_async(
+                trace_id=trace_id,
+                graph=graph,
+            )
+            if graph_status.failed:
+                break
+            if graph_status.completed:
+                break
+
+            # OP-1: Enqueue dependency-resolved wakes for tasks that are
+            # stuck (TIMEOUT/STOPPED) but whose dependencies are now satisfied.
+            if created_any or ran_any:
+                await self._enqueue_graph_dependency_wakeups_async(
+                    trace_id=trace_id,
+                    root_task_id=root_task.task_id,
+                )
+
+            if not created_any and not ran_any:
+                error_message = "Graph execution made no progress."
+                await self._fail_root_task_async(
+                    trace_id=trace_id,
+                    root_task=root_task,
+                    coordinator_instance_id=coordinator_instance_id,
+                    error_code="graph_execution_blocked",
+                    error_message=error_message,
+                )
+                return TaskExecutionResult(
+                    output=self._graph_execution_summary(graph_status=graph_status),
+                    completion_reason=RunCompletionReason.ASSISTANT_ERROR,
+                    error_code="graph_execution_blocked",
+                    error_message=error_message,
+                )
+
+        graph_status = await self._graph_status_async(trace_id=trace_id, graph=graph)
+        if graph_status.failed:
+            error_message = "One or more graph nodes failed."
+            await self._fail_root_task_async(
+                trace_id=trace_id,
+                root_task=root_task,
+                coordinator_instance_id=coordinator_instance_id,
+                error_code="graph_execution_failed",
+                error_message=error_message,
+            )
+            return TaskExecutionResult(
+                output=self._graph_execution_summary(graph_status=graph_status),
+                completion_reason=RunCompletionReason.ASSISTANT_ERROR,
+                error_code="graph_execution_failed",
+                error_message=error_message,
+            )
+        if not graph_status.completed:
+            error_message = "Graph execution did not complete."
+            await self._fail_root_task_async(
+                trace_id=trace_id,
+                root_task=root_task,
+                coordinator_instance_id=coordinator_instance_id,
+                error_code="graph_execution_incomplete",
+                error_message=error_message,
+            )
+            return TaskExecutionResult(
+                output=self._graph_execution_summary(graph_status=graph_status),
+                completion_reason=RunCompletionReason.ASSISTANT_ERROR,
+                error_code="graph_execution_incomplete",
+                error_message=error_message,
+            )
+
+        final_output = self._graph_final_response(
+            root_task=root_task,
+            graph_status=graph_status,
+        )
+        await self._complete_graph_root_task_async(
+            trace_id=trace_id,
+            root_task=root_task,
+            coordinator_instance_id=coordinator_instance_id,
+            output=final_output,
+        )
+        result = TaskExecutionResult(output=final_output)
+        log_event(
+            LOGGER,
+            logging.INFO,
+            event="coord.graph.completed",
+            message="Coordinator graph execution completed",
+            payload={
+                "trace_id": trace_id,
+                "root_task_id": root_task.task_id,
+                "node_count": len(graph.nodes),
+            },
+        )
+        return result
+
+    async def _complete_graph_root_task_async(
+        self,
+        *,
+        trace_id: str,
+        root_task: TaskEnvelope,
+        coordinator_instance_id: str,
+        output: str,
+    ) -> None:
+        current = await self.task_repo.get_async(root_task.task_id)
+        assigned_instance_id = current.assigned_instance_id or coordinator_instance_id
+        await self.task_repo.update_status_async(
+            root_task.task_id,
+            TaskStatus.COMPLETED,
+            assigned_instance_id=assigned_instance_id,
+            result=output,
+        )
+        await self.event_bus.emit_async(
+            EventEnvelope(
+                event_type=EventType.TASK_COMPLETED,
+                trace_id=trace_id,
+                session_id=root_task.session_id,
+                task_id=root_task.task_id,
+                instance_id=assigned_instance_id,
+                payload_json="{}",
+            )
+        )
+        instance = await self.agent_repo.get_instance_async(assigned_instance_id)
+        role_id = _require_task_role_id(root_task)
+        if isinstance(self.task_execution_service, TaskExecutionService):
+            await self.task_execution_service.message_repo.append_async(
+                session_id=root_task.session_id,
+                workspace_id=instance.workspace_id,
+                conversation_id=instance.conversation_id,
+                agent_role_id=role_id,
+                instance_id=assigned_instance_id,
+                task_id=root_task.task_id,
+                trace_id=trace_id,
+                messages=[ModelResponse(parts=[TextPart(content=output)])],
+            )
+        if self.run_event_hub is not None:
+            await self._publish_run_event_async(
+                session_id=root_task.session_id,
+                run_id=trace_id,
+                trace_id=trace_id,
+                task_id=root_task.task_id,
+                instance_id=assigned_instance_id,
+                role_id=role_id,
+                event_type=RunEventType.TEXT_DELTA,
+                payload={
+                    "text": output,
+                    "role_id": role_id,
+                    "instance_id": assigned_instance_id,
+                },
+            )
+
+    async def _fail_root_task_async(
+        self,
+        *,
+        trace_id: str,
+        root_task: TaskEnvelope,
+        coordinator_instance_id: str,
+        error_code: str,
+        error_message: str,
+    ) -> None:
+        current = await self.task_repo.get_async(root_task.task_id)
+        assigned_instance_id = current.assigned_instance_id or coordinator_instance_id
+        await self.task_repo.update_status_async(
+            root_task.task_id,
+            TaskStatus.FAILED,
+            assigned_instance_id=assigned_instance_id,
+            error_message=error_message,
+        )
+        await self.event_bus.emit_async(
+            EventEnvelope(
+                event_type=EventType.TASK_FAILED,
+                trace_id=trace_id,
+                session_id=root_task.session_id,
+                task_id=root_task.task_id,
+                instance_id=assigned_instance_id,
+                payload_json=dumps(
+                    {
+                        "reason": error_code,
+                        "error_message": error_message,
+                    }
+                ),
+            )
+        )
+
+    async def _create_ready_graph_tasks_async(
+        self,
+        *,
+        graph: OrchestrationGraph,
+        root_task: TaskEnvelope,
+    ) -> bool:
+        records_by_node = await self._graph_records_by_node_async(
+            trace_id=root_task.trace_id,
+            graph=graph,
+        )
+        created_any = False
+        for node_id in graph.topological_node_ids():
+            if node_id in records_by_node:
+                continue
+            upstream_node_ids = graph.upstream_node_ids(node_id)
+            if any(
+                upstream_node_id not in records_by_node
+                for upstream_node_id in upstream_node_ids
+            ):
+                continue
+            upstream_records = tuple(
+                records_by_node[upstream_node_id]
+                for upstream_node_id in upstream_node_ids
+            )
+            timed_out_upstream = [
+                record
+                for record in upstream_records
+                if record.status == TaskStatus.TIMEOUT
+            ]
+            for timed_out_record in timed_out_upstream:
+                try:
+                    await self._handle_timeout_policy_async(timed_out_record)
+                except (RuntimeError, ValueError, KeyError):
+                    log_event(
+                        LOGGER,
+                        logging.WARNING,
+                        event="coord.graph.timeout_policy_handler_failed",
+                        message="Timeout policy handler failed for upstream dependency",
+                        payload={"task_id": timed_out_record.envelope.task_id},
+                    )
+            if any(
+                record.status in {TaskStatus.FAILED, TaskStatus.TIMEOUT}
+                for record in upstream_records
+            ):
+                continue
+            if any(
+                record.status != TaskStatus.COMPLETED for record in upstream_records
+            ):
+                continue
+            await self._create_graph_node_task_async(
+                graph=graph,
+                node=graph.node_by_id(node_id),
+                root_task=root_task,
+                upstream_records=upstream_records,
+            )
+            created_any = True
+        return created_any
+
+    async def _create_graph_node_task_async(
+        self,
+        *,
+        graph: OrchestrationGraph,
+        node: OrchestrationGraphNode,
+        root_task: TaskEnvelope,
+        upstream_records: tuple[TaskRecord, ...],
+    ) -> None:
+        envelope = TaskEnvelope(
+            task_id=new_task_id().value,
+            session_id=root_task.session_id,
+            parent_task_id=root_task.task_id,
+            trace_id=root_task.trace_id,
+            role_id=node.role_id,
+            title=node.title or node.node_id,
+            objective=self._graph_node_objective(
+                node=node,
+                root_task=root_task,
+                upstream_records=upstream_records,
+            ),
+            skills=root_task.skills,
+            verification=node.verification,
+            orchestration_node_id=node.node_id,
+            depends_on_task_ids=tuple(
+                record.envelope.task_id for record in upstream_records
+            ),
+        )
+        await self._execute_task_created_hooks(root_task=envelope)
+        _ = await self.task_repo.create_async(envelope)
+        await self.event_bus.emit_async(
+            EventEnvelope(
+                event_type=EventType.TASK_CREATED,
+                trace_id=envelope.trace_id,
+                session_id=envelope.session_id,
+                task_id=envelope.task_id,
+                payload_json=dumps(
+                    {
+                        "orchestration_node_id": envelope.orchestration_node_id or "",
+                        "depends_on_task_ids": list(envelope.depends_on_task_ids),
+                    }
+                ),
+            )
+        )
+        instance_id = await self._create_graph_node_instance_async(
+            session_id=envelope.session_id,
+            trace_id=envelope.trace_id,
+            role_id=node.role_id,
+        )
+        await self.task_repo.update_status_async(
+            envelope.task_id,
+            TaskStatus.ASSIGNED,
+            assigned_instance_id=instance_id,
+        )
+        await self.event_bus.emit_async(
+            EventEnvelope(
+                event_type=EventType.TASK_ASSIGNED,
+                trace_id=envelope.trace_id,
+                session_id=envelope.session_id,
+                task_id=envelope.task_id,
+                instance_id=instance_id,
+                payload_json=dumps(
+                    {"orchestration_node_id": envelope.orchestration_node_id or ""}
+                ),
+            )
+        )
+        log_event(
+            LOGGER,
+            logging.DEBUG,
+            event="coord.graph.node.created",
+            message="Coordinator graph node task created",
+            payload={
+                "trace_id": envelope.trace_id,
+                "task_id": envelope.task_id,
+                "node_id": node.node_id,
+                "role_id": node.role_id,
+                "upstream_task_ids": list(envelope.depends_on_task_ids),
+                "graph_max_parallel_tasks": graph.max_parallel_tasks,
+            },
+        )
+
+    async def _create_graph_node_instance_async(
+        self,
+        *,
+        session_id: str,
+        trace_id: str,
+        role_id: str,
+    ) -> str:
+        _ = self.role_registry.get(role_id)
+        session = (
+            await self.session_repo.get_async(session_id) if self.session_repo else None
+        )
+        if session is None:
+            raise RuntimeError(
+                "CoordinatorGraph requires session_repo to resolve graph node workspace"
+            )
+        instance = create_subagent_instance(
+            role_id,
+            workspace_id=session.workspace_id,
+            session_id=session_id,
+        )
+        await self.agent_repo.upsert_instance_async(
+            run_id=trace_id,
+            trace_id=trace_id,
+            session_id=session_id,
+            instance_id=instance.instance_id,
+            role_id=role_id,
+            workspace_id=instance.workspace_id,
+            conversation_id=instance.conversation_id,
+            status=InstanceStatus.IDLE,
+            lifecycle=InstanceLifecycle.EPHEMERAL,
+        )
+        await self.event_bus.emit_async(
+            EventEnvelope(
+                event_type=EventType.INSTANCE_CREATED,
+                trace_id=trace_id,
+                session_id=session_id,
+                task_id=None,
+                instance_id=instance.instance_id,
+                payload_json=dumps({"role_id": role_id}),
+            )
+        )
+        return instance.instance_id
+
+    async def _graph_records_by_node_async(
+        self,
+        *,
+        trace_id: str,
+        graph: OrchestrationGraph,
+    ) -> dict[str, TaskRecord]:
+        graph_node_ids = {node.node_id for node in graph.nodes}
+        records_by_node: dict[str, TaskRecord] = {}
+        for record in await self.task_repo.list_by_trace_async(trace_id):
+            node_id = record.envelope.orchestration_node_id
+            if node_id is None or node_id not in graph_node_ids:
+                continue
+            records_by_node[node_id] = record
+        return records_by_node
+
+    async def _graph_status_async(
+        self,
+        *,
+        trace_id: str,
+        graph: OrchestrationGraph,
+    ) -> "_GraphStatus":
+        records_by_node = await self._graph_records_by_node_async(
+            trace_id=trace_id,
+            graph=graph,
+        )
+        return _GraphStatus(graph=graph, records_by_node=records_by_node)
+
+    async def _enqueue_graph_dependency_wakeups_async(
+        self,
+        *,
+        trace_id: str,
+        root_task_id: str,
+    ) -> int:
+        """OP-1: Scan tasks in this trace that are stuck (TIMEOUT/STOPPED)
+        but whose dependencies are now satisfied, and enqueue
+        ``DEPENDENCY_RESOLVED`` wakes so the WakeupDispatcher can
+        re-dispatch them."""
+        wakeup_repo = getattr(self, "wakeup_repo", None)
+        if wakeup_repo is None:
+            return 0
+        records = await self.task_repo.list_by_trace_async(trace_id)
+        records_by_task_id = {r.envelope.task_id: r for r in records}
+        enqueued = 0
+        now = datetime.now(tz=timezone.utc)
+        for record in records:
+            if record.envelope.task_id == root_task_id:
+                continue
+            if record.status in {TaskStatus.ASSIGNED, TaskStatus.CREATED}:
+                continue
+            if record.status not in {TaskStatus.TIMEOUT, TaskStatus.STOPPED}:
+                continue
+            if not _dependencies_completed(
+                record=record, records_by_task_id=records_by_task_id
+            ):
+                continue
+            task_id = record.envelope.task_id
+            coalesce_key = f"{task_id}:dep_resolved"
+            entry = AgentWakeupEntry(
+                wakeup_id=f"wk_graph_{task_id}_{int(now.timestamp())}",
+                task_id=task_id,
+                trace_id=trace_id,
+                session_id=record.envelope.session_id or "",
+                coalesce_key=coalesce_key,
+                timeout_action=TaskTimeoutAction.RETRY,
+                timeout_seconds=0.0,
+                attempt=1,
+                max_attempts=3,
+                status=WakeupStatus.PENDING,
+                enqueued_at=now,
+                wake_reason=WakeupReason.DEPENDENCY_RESOLVED,
+                target_role=record.envelope.role_id or "",
+                source_event_type="dependency_resolved",
+                source_trigger_id="",
+            )
+            try:
+                inserted = await wakeup_repo.coalesce_and_enqueue_async(entry)
+                if inserted:
+                    enqueued += 1
+                    log_event(
+                        LOGGER,
+                        logging.INFO,
+                        event="coord.graph.dependency_wake_enqueued",
+                        message="Dependency-resolved wake enqueued for stuck graph task",
+                        payload={
+                            "task_id": task_id,
+                            "trace_id": trace_id,
+                        },
+                    )
+            except (OSError, ValueError, RuntimeError):
+                log_event(
+                    LOGGER,
+                    logging.WARNING,
+                    event="coord.graph.dependency_wake_failed",
+                    message="Failed to enqueue dependency wakeup",
+                    payload={"task_id": task_id},
+                )
+        return enqueued
+
+    def _missing_graph_role_ids(self, graph: OrchestrationGraph) -> tuple[str, ...]:
+        missing_role_ids: list[str] = []
+        for role_id in sorted({node.role_id for node in graph.nodes}):
+            try:
+                _ = self.role_registry.get(role_id)
+            except KeyError:
+                missing_role_ids.append(role_id)
+        return tuple(missing_role_ids)
+
+    @staticmethod
+    def _graph_node_objective(
+        *,
+        node: OrchestrationGraphNode,
+        root_task: TaskEnvelope,
+        upstream_records: tuple[TaskRecord, ...],
+    ) -> str:
+        sections = [
+            f"Graph node: {node.node_id}",
+            f"Original user objective:\n{root_task.objective}",
+            f"Node objective:\n{node.objective}",
+        ]
+        if upstream_records:
+            sections.append(
+                "Upstream results:\n" + _format_task_results(upstream_records)
+            )
+        return "\n\n".join(sections)
+
+    @staticmethod
+    def _graph_final_response(
+        *,
+        root_task: TaskEnvelope,
+        graph_status: "_GraphStatus",
+    ) -> str:
+        final_node_id = (
+            graph_status.graph.final_response_node_id
+            or graph_status.graph.topological_node_ids()[-1]
+        )
+        final_record = graph_status.records_by_node.get(final_node_id)
+        sections = [
+            "Graph-based orchestration completed.",
+            f"Original user objective:\n{root_task.objective}",
+            CoordinatorGraph._graph_execution_summary(graph_status=graph_status),
+        ]
+        if final_record is not None and final_record.result:
+            sections.append(
+                f"Final response from graph node {final_node_id}:\n{final_record.result}"
+            )
+        return "\n\n".join(sections)
+
+    @staticmethod
+    def _graph_execution_summary(*, graph_status: "_GraphStatus") -> str:
+        lines = ["Graph execution summary:"]
+        for node_id in graph_status.graph.topological_node_ids():
+            node = graph_status.graph.node_by_id(node_id)
+            record = graph_status.records_by_node.get(node_id)
+            if record is None:
+                lines.append(f"- {node_id} role={node.role_id} status=not_created")
+                continue
+            lines.append(
+                f"- {node_id} role={node.role_id} task={record.envelope.task_id} status={record.status.value}"
+            )
+            if record.result:
+                lines.append(f"  result={record.result}")
+            if record.error_message:
+                lines.append(f"  error={record.error_message}")
+        return "\n".join(lines)
+
+    async def _run_pending_delegated_tasks(
+        self,
+        *,
+        trace_id: str,
+        root_task_id: str,
+        max_parallel_tasks: int | None = None,
+    ) -> bool:
+        records = await self.task_repo.list_by_trace_async(trace_id)
+        runtime = await self.run_runtime_repo.get_async(trace_id)
+        records_by_task_id = {record.envelope.task_id: record for record in records}
+        lanes: dict[str, list[TaskRecord]] = {}
+        instances: dict[str, AgentRuntimeRecord] = {}
+        for record in records:
+            task = record.envelope
+            if task.task_id == root_task_id:
+                continue
+            if record.status not in (TaskStatus.ASSIGNED, TaskStatus.CREATED):
+                continue
+            if await self._fail_task_if_dependency_failed_async(
+                record=record,
+                records_by_task_id=records_by_task_id,
+            ):
+                continue
+            if not _dependencies_completed(
+                record=record,
+                records_by_task_id=records_by_task_id,
+            ):
+                continue
+            if self._is_paused_pending_delegated_task(
+                runtime=runtime,
+                record=record,
+            ):
+                continue
+            if record.assigned_instance_id is None:
+                continue
+            if await self._fail_task_if_role_contract_preconditions_async(
+                record=record,
+                records_by_task_id=records_by_task_id,
+            ):
+                continue
+            try:
+                instance = await self.agent_repo.get_instance_async(
+                    record.assigned_instance_id
+                )
+            except KeyError:
+                msg = f"Assigned instance not found: {record.assigned_instance_id}"
+                await self.task_repo.update_status_async(
+                    task.task_id, TaskStatus.FAILED, error_message=msg
+                )
+                log_event(
+                    LOGGER,
+                    logging.ERROR,
+                    event="coord.task.failed",
+                    message="Assigned instance missing for delegated task",
+                    payload={
+                        "task_id": task.task_id,
+                        "assigned_instance_id": record.assigned_instance_id,
+                    },
+                )
+                await self.event_bus.emit_async(
+                    EventEnvelope(
+                        event_type=EventType.TASK_FAILED,
+                        trace_id=task.trace_id,
+                        session_id=task.session_id,
+                        task_id=task.task_id,
+                        instance_id=record.assigned_instance_id,
+                        payload_json="{}",
+                    )
+                )
+                continue
+            lanes.setdefault(instance.instance_id, []).append(record)
+            instances[instance.instance_id] = instance
+        if not lanes:
+            return False
+
+        resolved_max_parallel_tasks = (
+            OrchestrationPolicy().max_parallel_delegated_tasks
+            if max_parallel_tasks is None
+            else max_parallel_tasks
+        )
+        if resolved_max_parallel_tasks < 1:
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                event="coord.delegated_tasks.blocked",
+                message="Delegated task execution blocked by orchestration policy",
+                payload={
+                    "trace_id": trace_id,
+                    "root_task_id": root_task_id,
+                    "pending_lane_count": len(lanes),
+                    "max_parallel_tasks": resolved_max_parallel_tasks,
+                },
+            )
+            raise DelegatedTaskExecutionDisabledError(
+                trace_id=trace_id,
+                root_task_id=root_task_id,
+                pending_lane_count=len(lanes),
+                max_parallel_tasks=resolved_max_parallel_tasks,
+            )
+
+        semaphore = asyncio.Semaphore(resolved_max_parallel_tasks)
+
+        async def run_lane(instance_id: str, lane_records: list[TaskRecord]) -> bool:
+            lane_instance = instances[instance_id]
+            ran_lane = False
+            async with semaphore:
+                for lane_record in lane_records:
+                    try:
+                        _ = await self._task_executor(
+                            instance_id=lane_instance.instance_id,
+                            role_id=lane_instance.role_id,
+                            task=lane_record.envelope,
+                        )
+                    except asyncio.CancelledError:
+                        if self.run_control_manager.is_subagent_stop_requested(
+                            run_id=trace_id,
+                            instance_id=lane_instance.instance_id,
+                        ):
+                            return ran_lane
+                        raise
+                    ran_lane = True
+            return ran_lane
+
+        lane_results = await asyncio.gather(
+            *(
+                run_lane(instance_id, lane_records)
+                for instance_id, lane_records in lanes.items()
+            )
+        )
+        return any(lane_results)
+
+    async def _pending_delegated_task_count_async(
+        self,
+        *,
+        trace_id: str,
+        root_task_id: str,
+    ) -> int:
+        records = await self.task_repo.list_by_trace_async(trace_id)
+        records_by_task_id = {record.envelope.task_id: record for record in records}
+        runtime = await self.run_runtime_repo.get_async(trace_id)
+        pending_statuses = {TaskStatus.ASSIGNED, TaskStatus.CREATED}
+        return sum(
+            1
+            for record in records
+            if record.envelope.task_id != root_task_id
+            and record.status in pending_statuses
+            and _dependencies_completed(
+                record=record,
+                records_by_task_id=records_by_task_id,
+            )
+            and not self._is_paused_pending_delegated_task(
+                runtime=runtime,
+                record=record,
+            )
+        )
+
+    def _is_paused_pending_delegated_task(
+        self,
+        *,
+        runtime: RunRuntimeRecord | None,
+        record: TaskRecord,
+    ) -> bool:
+        task = record.envelope
+        assigned_instance_id = record.assigned_instance_id
+        if self._is_paused_subagent_task(
+            runtime=runtime,
+            task_id=task.task_id,
+            assigned_instance_id=assigned_instance_id,
+        ):
+            return True
+        if assigned_instance_id is None:
+            return False
+        return self.run_control_manager.is_subagent_paused(
+            session_id=task.session_id,
+            instance_id=assigned_instance_id,
+        )
+
+    async def _fail_task_if_dependency_failed_async(
+        self,
+        *,
+        record: TaskRecord,
+        records_by_task_id: dict[str, TaskRecord],
+    ) -> bool:
+        failed_dependencies = tuple(
+            dependency_task_id
+            for dependency_task_id in record.envelope.depends_on_task_ids
+            if dependency_task_id not in records_by_task_id
+            or records_by_task_id[dependency_task_id].status
+            in {TaskStatus.FAILED, TaskStatus.TIMEOUT}
+        )
+        if not failed_dependencies:
+            return False
+        error_message = "Task dependency failed or is missing: " + ", ".join(
+            failed_dependencies
+        )
+        await self.task_repo.update_status_async(
+            record.envelope.task_id,
+            TaskStatus.FAILED,
+            assigned_instance_id=record.assigned_instance_id,
+            error_message=error_message,
+        )
+        await self.event_bus.emit_async(
+            EventEnvelope(
+                event_type=EventType.TASK_FAILED,
+                trace_id=record.envelope.trace_id,
+                session_id=record.envelope.session_id,
+                task_id=record.envelope.task_id,
+                instance_id=record.assigned_instance_id,
+                payload_json=dumps(
+                    {
+                        "reason": "dependency_failed",
+                        "failed_dependencies": list(failed_dependencies),
+                    }
+                ),
+            )
+        )
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            event="coord.task.dependency_failed",
+            message="Delegated task failed because a dependency failed or is missing",
+            payload={
+                "task_id": record.envelope.task_id,
+                "failed_dependencies": list(failed_dependencies),
+            },
+        )
+        return True
+
+    async def _fail_task_if_role_contract_preconditions_async(
+        self,
+        *,
+        record: TaskRecord,
+        records_by_task_id: dict[str, TaskRecord],
+    ) -> bool:
+        try:
+            role = await self._resolve_task_role_definition_async(record.envelope)
+        except Exception as exc:
+            await self._fail_delegated_task_async(
+                record=record,
+                reason="role_resolution_failed",
+                error_message=f"Task role could not be resolved: {exc}",
+                payload={"error": str(exc)},
+            )
+            return True
+        # OP-7: Validate tool diet for delegated task roles.
+        try:
+            diet_report = _validate_tool_diet(
+                policy=_ToolDietPolicy(),
+                tool_count=len(role.tools),
+                objective=role.system_prompt or "",
+                role_id=record.envelope.role_id or "",
+            )
+            if should_reject(diet_report):
+                diet_messages = "; ".join(
+                    f.message
+                    for f in diet_report.findings
+                    if f.severity.value == "error"
+                )
+                await self._fail_delegated_task_async(
+                    record=record,
+                    reason="tool_diet_exceeded",
+                    error_message=f"Role exceeds tool diet limits: {diet_messages}",
+                    payload={
+                        "diet_findings": [f.message for f in diet_report.findings]
+                    },
+                )
+                return True
+        except (ValueError, KeyError, AttributeError):
+            log_event(
+                LOGGER,
+                logging.DEBUG,
+                event="coord.tool_diet_check_failed",
+                message="Tool diet validation check failed; continuing",
+                payload={"task_id": record.envelope.task_id},
+            )
+        failures = role_contract_precondition_failures(
+            role=role,
+            task=record.envelope,
+            records_by_id=records_by_task_id,
+        )
+        if not failures:
+            return False
+        await self._fail_delegated_task_async(
+            record=record,
+            reason="role_contract_preconditions_failed",
+            error_message="Role contract preconditions failed: " + "; ".join(failures),
+            payload={"failures": list(failures)},
+        )
+        return True
+
+    async def _fail_delegated_task_async(
+        self,
+        *,
+        record: TaskRecord,
+        reason: str,
+        error_message: str,
+        payload: dict[str, object],
+    ) -> None:
+        await self.task_repo.update_status_async(
+            record.envelope.task_id,
+            TaskStatus.FAILED,
+            assigned_instance_id=record.assigned_instance_id,
+            error_message=error_message,
+        )
+        await self.event_bus.emit_async(
+            EventEnvelope(
+                event_type=EventType.TASK_FAILED,
+                trace_id=record.envelope.trace_id,
+                session_id=record.envelope.session_id,
+                task_id=record.envelope.task_id,
+                instance_id=record.assigned_instance_id,
+                payload_json=dumps({"reason": reason, **payload}),
+            )
+        )
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            event="coord.task.role_contract_failed",
+            message="Delegated task failed role contract checks",
+            payload={
+                "trace_id": record.envelope.trace_id,
+                "task_id": record.envelope.task_id,
+                "role_id": record.envelope.role_id,
+                "reason": reason,
+                "error": error_message,
+            },
+        )
+
+    async def _resolve_task_role_definition_async(
+        self,
+        task: TaskEnvelope,
+    ) -> RoleDefinition:
+        role_id = _require_task_role_id(task)
+        runtime_role_resolver = getattr(
+            self.task_execution_service,
+            "runtime_role_resolver",
+            None,
+        )
+        if isinstance(runtime_role_resolver, RuntimeRoleResolver):
+            return await runtime_role_resolver.get_effective_role_async(
+                run_id=task.trace_id,
+                role_id=role_id,
+            )
+        return self.role_registry.get(role_id)
+
+    async def _handle_timeout_policy_async(
+        self,
+        task_record: TaskRecord,
+    ) -> None:
+        """Handle timeout according to task lifecycle policy.
+
+        Reads ``on_timeout`` from the task envelope lifecycle config and:
+        - RETRY: enqueue a wakeup entry if attempts remain.
+        - HUMAN_GATE: emit an event requesting manual gate activation.
+        - FAIL: do nothing (callers should handle FAIL like normal failure).
+        """
+        lifecycle = task_record.envelope.lifecycle
+        on_timeout = lifecycle.on_timeout
+
+        if on_timeout == TaskTimeoutAction.RETRY:
+            next_attempt = task_record.envelope.retry_attempt + 1
+            if next_attempt <= lifecycle.max_retry_attempts:
+                wakeup_repo = getattr(self, "wakeup_repo", None)
+                if wakeup_repo is not None:
+                    entry = AgentWakeupEntry(
+                        wakeup_id=f"wk_coord_{task_record.envelope.task_id}_{next_attempt}",
+                        task_id=task_record.envelope.task_id,
+                        trace_id=task_record.envelope.trace_id,
+                        session_id=task_record.envelope.session_id,
+                        coalesce_key=f"{task_record.envelope.task_id}:coord_retry",
+                        timeout_action=TaskTimeoutAction.RETRY,
+                        timeout_seconds=lifecycle.timeout_seconds or 0.0,
+                        attempt=next_attempt,
+                        max_attempts=lifecycle.max_retry_attempts,
+                        status=WakeupStatus.PENDING,
+                        enqueued_at=datetime.now(tz=timezone.utc),
+                        wake_reason=WakeupReason.TIMEOUT_RETRY,
+                        target_role=task_record.envelope.role_id or "",
+                    )
+                    await wakeup_repo.enqueue_async(entry)
+                    log_event(
+                        LOGGER,
+                        logging.INFO,
+                        event="coord.task.timeout_retry_enqueued",
+                        message="Timeout retry wakeup enqueued by coordinator",
+                        payload={
+                            "task_id": task_record.envelope.task_id,
+                            "attempt": next_attempt,
+                            "max_attempts": lifecycle.max_retry_attempts,
+                        },
+                    )
+                else:
+                    log_event(
+                        LOGGER,
+                        logging.WARNING,
+                        event="coord.task.timeout_retry_no_wakeup_repo",
+                        message="Timeout retry requested but no wakeup repo available",
+                        payload={
+                            "task_id": task_record.envelope.task_id,
+                        },
+                    )
+            else:
+                log_event(
+                    LOGGER,
+                    logging.WARNING,
+                    event="coord.task.timeout_retry_exhausted",
+                    message="Timeout retry exhausted, falling through to FAIL",
+                    payload={
+                        "task_id": task_record.envelope.task_id,
+                        "attempt": next_attempt,
+                        "max_attempts": lifecycle.max_retry_attempts,
+                    },
+                )
+
+        elif on_timeout == TaskTimeoutAction.HUMAN_GATE:
+            await self.event_bus.emit_async(
+                EventEnvelope(
+                    event_type=EventType.TASK_TIMEOUT,
+                    trace_id=task_record.envelope.trace_id,
+                    session_id=task_record.envelope.session_id,
+                    task_id=task_record.envelope.task_id,
+                    instance_id=task_record.assigned_instance_id,
+                    payload_json=dumps(
+                        {
+                            "action": "human_gate_requested",
+                            "timeout_seconds": lifecycle.timeout_seconds,
+                        }
+                    ),
+                )
+            )
+            log_event(
+                LOGGER,
+                logging.INFO,
+                event="coord.task.timeout_human_gate",
+                message="Timeout triggered human gate activation",
+                payload={
+                    "task_id": task_record.envelope.task_id,
+                },
+            )
+
+    async def _get_root_task_by_trace_async(self, trace_id: str) -> TaskRecord:
+        for record in await self.task_repo.list_by_trace_async(trace_id):
+            if record.envelope.parent_task_id is None:
+                return record
+        raise KeyError(f"No root task found for run_id={trace_id}")
+
+    async def _prepare_recovery_async(
+        self, *, trace_id: str, coordinator_instance_id: str
+    ) -> None:
+        runtime = await self.run_runtime_repo.get_async(trace_id)
+        records = await self.task_repo.list_by_trace_async(trace_id)
+        incomplete_task_ids = {
+            record.envelope.task_id
+            for record in records
+            if record.status
+            not in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.TIMEOUT}
+        }
+        for record in records:
+            if record.status == TaskStatus.RUNNING or (
+                record.status == TaskStatus.STOPPED
+                and not self._is_paused_subagent_task(
+                    runtime=runtime,
+                    task_id=record.envelope.task_id,
+                    assigned_instance_id=record.assigned_instance_id,
+                )
+            ):
+                next_status = (
+                    TaskStatus.ASSIGNED
+                    if record.assigned_instance_id
+                    else TaskStatus.CREATED
+                )
+                await self.task_repo.update_status_async(
+                    record.envelope.task_id,
+                    next_status,
+                    assigned_instance_id=record.assigned_instance_id,
+                )
+
+        for instance in await self.agent_repo.list_by_run_async(trace_id):
+            should_reset = (
+                instance.instance_id == coordinator_instance_id
+                or instance.status == InstanceStatus.RUNNING
+                or any(
+                    record.assigned_instance_id == instance.instance_id
+                    and record.envelope.task_id in incomplete_task_ids
+                    for record in records
+                )
+            )
+            if (
+                runtime is not None
+                and _is_paused_subagent_phase(runtime.phase)
+                and runtime.active_subagent_instance_id == instance.instance_id
+            ):
+                should_reset = False
+            if not should_reset:
+                continue
+            await self.agent_repo.mark_status_async(
+                instance.instance_id, InstanceStatus.IDLE
+            )
+
+    async def _has_resumable_delegated_work_async(
+        self, *, trace_id: str, root_task_id: str
+    ) -> bool:
+        runtime = await self.run_runtime_repo.get_async(trace_id)
+        for record in await self.task_repo.list_by_trace_async(trace_id):
+            task = record.envelope
+            if task.task_id == root_task_id:
+                continue
+            if record.status not in {
+                TaskStatus.CREATED,
+                TaskStatus.ASSIGNED,
+                TaskStatus.RUNNING,
+                TaskStatus.STOPPED,
+            }:
+                continue
+            if record.assigned_instance_id is None:
+                continue
+            if self._is_paused_subagent_task(
+                runtime=runtime,
+                task_id=task.task_id,
+                assigned_instance_id=record.assigned_instance_id,
+            ):
+                continue
+            if self.run_control_manager.is_subagent_paused(
+                session_id=task.session_id,
+                instance_id=record.assigned_instance_id,
+            ):
+                continue
+            return True
+        return False
+
+    async def _verification_context(
+        self,
+        *,
+        task: TaskEnvelope,
+        instance_id: str | None,
+    ) -> tuple[tuple[str, ...], Path | None]:
+        role_id = _require_task_role_id(task)
+        allowed_tools = await self._verification_allowed_tools(
+            task=task,
+            role_id=role_id,
+        )
+        if instance_id is None:
+            return allowed_tools, None
+        workspace_manager = getattr(
+            self.task_execution_service, "workspace_manager", None
+        )
+        if not isinstance(workspace_manager, WorkspaceManager):
+            return allowed_tools, None
+        try:
+            instance = await self.agent_repo.get_instance_async(instance_id)
+            workspace = await workspace_manager.resolve_async(
+                session_id=task.session_id,
+                role_id=role_id,
+                instance_id=instance_id,
+                workspace_id=instance.workspace_id,
+                conversation_id=instance.conversation_id,
+            )
+        except Exception as exc:
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                event="coord.verification.workspace_lookup_failed",
+                message=(
+                    "Verification workspace lookup failed; file checks will use raw paths"
+                ),
+                payload={
+                    "trace_id": task.trace_id,
+                    "task_id": task.task_id,
+                    "role_id": role_id,
+                    "instance_id": instance_id,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+            return allowed_tools, None
+        return allowed_tools, workspace.resolve_workdir()
+
+    async def _verification_allowed_tools(
+        self,
+        *,
+        task: TaskEnvelope,
+        role_id: str,
+    ) -> tuple[str, ...]:
+        runtime_role_resolver = getattr(
+            self.task_execution_service,
+            "runtime_role_resolver",
+            None,
+        )
+        try:
+            if isinstance(runtime_role_resolver, RuntimeRoleResolver):
+                role = await runtime_role_resolver.get_effective_role_async(
+                    run_id=task.trace_id,
+                    role_id=role_id,
+                )
+            else:
+                role = self.role_registry.get(role_id)
+        except Exception as exc:
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                event="coord.verification.role_lookup_failed",
+                message=(
+                    "Verification role lookup failed; command checks will be denied"
+                ),
+                payload={
+                    "trace_id": task.trace_id,
+                    "task_id": task.task_id,
+                    "role_id": role_id,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+            return ()
+        return tuple(role.tools)
+
+    def _is_paused_subagent_task(
+        self,
+        *,
+        runtime: RunRuntimeRecord | None,
+        task_id: str,
+        assigned_instance_id: str | None,
+    ) -> bool:
+        if runtime is None or not _is_paused_subagent_phase(runtime.phase):
+            return False
+        if runtime.active_task_id and runtime.active_task_id == task_id:
+            return True
+        if (
+            assigned_instance_id is not None
+            and runtime.active_subagent_instance_id == assigned_instance_id
+        ):
+            return True
+        return False
+
+    async def _ensure_root_instance_async(
+        self,
+        *,
+        session_id: str,
+        trace_id: str,
+        root_task: TaskEnvelope,
+        assigned_instance_id: str | None = None,
+        reuse_existing_instance: bool = True,
+    ) -> str:
+        root_role_id = _require_task_role_id(root_task)
+        _ = self.role_registry.get(root_role_id)
+        existing = None
+        if assigned_instance_id is not None:
+            try:
+                existing = await self.agent_repo.get_instance_async(
+                    assigned_instance_id
+                )
+            except KeyError:
+                existing = None
+        if existing is None and reuse_existing_instance:
+            existing = await self.agent_repo.get_session_role_instance_async(
+                session_id, root_role_id
+            )
+        if existing is not None:
+            coordinator_instance_id = existing.instance_id
+            await self.agent_repo.mark_status_async(
+                coordinator_instance_id, InstanceStatus.IDLE
+            )
+            await self.agent_repo.upsert_instance_async(
+                run_id=trace_id,
+                trace_id=trace_id,
+                session_id=session_id,
+                instance_id=coordinator_instance_id,
+                role_id=root_role_id,
+                workspace_id=existing.workspace_id,
+                conversation_id=existing.conversation_id,
+                status=InstanceStatus.IDLE,
+            )
+            await self.task_repo.update_status_async(
+                task_id=root_task.task_id,
+                status=TaskStatus.ASSIGNED,
+                assigned_instance_id=coordinator_instance_id,
+            )
+            await self.event_bus.emit_async(
+                EventEnvelope(
+                    event_type=EventType.TASK_ASSIGNED,
+                    trace_id=trace_id,
+                    session_id=session_id,
+                    task_id=root_task.task_id,
+                    instance_id=coordinator_instance_id,
+                    payload_json="{}",
+                )
+            )
+            return coordinator_instance_id
+
+        session = (
+            await self.session_repo.get_async(session_id) if self.session_repo else None
+        )
+        if session is None:
+            raise RuntimeError(
+                "CoordinatorGraph requires session_repo to resolve workspace"
+            )
+        workspace_id = session.workspace_id
+        instance = create_subagent_instance(
+            root_role_id,
+            workspace_id=workspace_id,
+            session_id=(None if reuse_existing_instance else session_id),
+            conversation_id=(
+                build_conversation_id(session_id, root_role_id)
+                if reuse_existing_instance
+                else None
+            ),
+        )
+        await self.task_repo.update_status_async(
+            task_id=root_task.task_id,
+            status=TaskStatus.ASSIGNED,
+            assigned_instance_id=instance.instance_id,
+        )
+        await self.agent_repo.upsert_instance_async(
+            run_id=trace_id,
+            trace_id=trace_id,
+            session_id=session_id,
+            instance_id=instance.instance_id,
+            role_id=root_role_id,
+            workspace_id=instance.workspace_id,
+            conversation_id=instance.conversation_id,
+            status=InstanceStatus.IDLE,
+        )
+        await self.event_bus.emit_async(
+            EventEnvelope(
+                event_type=EventType.INSTANCE_CREATED,
+                trace_id=trace_id,
+                session_id=session_id,
+                task_id=root_task.task_id,
+                instance_id=instance.instance_id,
+                payload_json="{}",
+            )
+        )
+        await self.event_bus.emit_async(
+            EventEnvelope(
+                event_type=EventType.TASK_ASSIGNED,
+                trace_id=trace_id,
+                session_id=session_id,
+                task_id=root_task.task_id,
+                instance_id=instance.instance_id,
+                payload_json="{}",
+            )
+        )
+        return instance.instance_id
+
+    def _root_role_id(self, intent: IntentInput) -> str:
+        if intent.target_role_id:
+            return intent.target_role_id
+        topology = intent.topology
+        if topology is None:
+            return self.role_registry.get_coordinator_role_id()
+        if topology.session_mode == SessionMode.NORMAL:
+            return topology.normal_root_role_id
+        return topology.coordinator_role_id
+
+    async def _publish_run_event_async(
+        self,
+        session_id: str,
+        run_id: str,
+        trace_id: str,
+        task_id: str | None,
+        instance_id: str | None,
+        role_id: str | None,
+        event_type: RunEventType,
+        payload: dict[str, str],
+    ) -> None:
+        if self.run_event_hub is None:
+            return
+        await self.run_event_hub.publish_async(
+            RunEvent(
+                session_id=session_id,
+                run_id=run_id,
+                trace_id=trace_id,
+                task_id=task_id,
+                instance_id=instance_id,
+                role_id=role_id,
+                event_type=event_type,
+                payload_json=dumps(payload),
+            )
+        )
+
+    async def _verify_task_async(
+        self,
+        *,
+        root_task_id: str,
+        allowed_tools: tuple[str, ...],
+        tool_approval_policy: ToolApprovalPolicy,
+        workspace_root: Path | None,
+    ) -> VerificationResult:
+        role: RoleDefinition | None = None
+        root_record: TaskRecord | None = None
+        try:
+            root_record = await self.task_repo.get_async(root_task_id)
+            role = await self._resolve_task_role_definition_async(root_record.envelope)
+        except Exception as exc:
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                event="coord.verification.role_contract_lookup_failed",
+                message="Role contract lookup failed; continuing verification without role contract checks",
+                payload={
+                    "task_id": root_task_id,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+        if root_record is not None:
+            await self._ensure_runtime_guardrail_report_async(root_record=root_record)
+        verification = await asyncio.to_thread(
+            verify_task,
+            self.task_repo,
+            self.event_bus,
+            root_task_id,
+            allowed_tools=allowed_tools,
+            tool_approval_policy=tool_approval_policy,
+            workspace_root=workspace_root,
+            semantic_evaluator=self.semantic_evaluator,
+            role=role,
+            require_guardrail_report=True,
+        )
+        if root_record is None:
+            return verification
+        delegated_contract_checks = (
+            await self._delegated_role_contract_verification_checks_async(
+                root_record=root_record,
+            )
+        )
+        return _verification_with_additional_checks(
+            verification=verification,
+            checks=delegated_contract_checks,
+        )
+
+    async def _ensure_runtime_guardrail_report_async(
+        self,
+        *,
+        root_record: TaskRecord,
+    ) -> None:
+        task = root_record.envelope
+        report_events = [
+            event
+            for event in await self.event_bus.list_by_trace_async(task.trace_id)
+            if str(event.get("task_id") or "") == task.task_id
+            and str(event.get("event_type") or "")
+            == RunEventType.RUNTIME_GUARDRAIL_REPORT.value
+        ]
+        for event in report_events:
+            if (
+                runtime_guardrail_report_from_event_payload(event.get("payload_json"))
+                is not None
+            ):
+                return
+        if report_events:
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                event="coord.verification.guardrail_report_corrupted",
+                message="Existing runtime guardrail report event has unparseable payload; regenerating",
+                payload={
+                    "task_id": task.task_id,
+                    "trace_id": task.trace_id,
+                },
+            )
+        role_id = task.role_id or ""
+        try:
+            report = await generate_runtime_guardrail_report_async(
+                shared_store=self.shared_store,
+                task_id=task.task_id,
+                run_id=task.trace_id,
+                session_id=task.session_id,
+                role_id=role_id,
+            )
+            event = RunEvent(
+                session_id=task.session_id,
+                run_id=task.trace_id,
+                trace_id=task.trace_id,
+                task_id=task.task_id,
+                instance_id=root_record.assigned_instance_id,
+                role_id=task.role_id,
+                event_type=RunEventType.RUNTIME_GUARDRAIL_REPORT,
+                payload_json=report.model_dump_json(),
+            )
+            if self.run_event_hub is not None:
+                _ = await self.run_event_hub.publish_async(event)
+            else:
+                _ = await self.event_bus.emit_run_event_async(event)
+        except Exception as exc:
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                event="coord.verification.guardrail_report_failed",
+                message="Runtime guardrail report could not be generated before verification",
+                payload={
+                    "task_id": task.task_id,
+                    "trace_id": task.trace_id,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+
+    async def _delegated_role_contract_verification_checks_async(
+        self,
+        *,
+        root_record: TaskRecord,
+    ) -> tuple[VerificationCheckResult, ...]:
+        checks: list[VerificationCheckResult] = []
+        records = await self.task_repo.list_by_trace_async(
+            root_record.envelope.trace_id
+        )
+        for record in records:
+            if record.envelope.task_id == root_record.envelope.task_id:
+                continue
+            if record.status != TaskStatus.COMPLETED or record.result is None:
+                continue
+            try:
+                role = await self._resolve_task_role_definition_async(record.envelope)
+            except Exception as exc:
+                log_event(
+                    LOGGER,
+                    logging.WARNING,
+                    event="coord.verification.delegated_role_contract_lookup_failed",
+                    message="Delegated role contract lookup failed; continuing verification without role contract checks for task",
+                    payload={
+                        "task_id": record.envelope.task_id,
+                        "role_id": record.envelope.role_id,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    },
+                )
+                continue
+            checks.extend(
+                _delegated_contract_checks(
+                    record=record,
+                    checks=role_contract_verification_checks(
+                        role=role,
+                        task=record,
+                        result=record.result,
+                    ),
+                )
+            )
+        return tuple(checks)
+
+    async def _verification_tool_policy_async(
+        self,
+        *,
+        trace_id: str,
+        fallback_session_id: str,
+    ) -> ToolApprovalPolicy:
+        run_intent_repo = getattr(self.task_execution_service, "run_intent_repo", None)
+        if not isinstance(run_intent_repo, RunIntentRepository):
+            return ToolApprovalPolicy()
+        try:
+            intent = await run_intent_repo.get_async(
+                trace_id,
+                fallback_session_id=fallback_session_id,
+            )
+        except Exception as exc:
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                event="coord.verification.intent_lookup_failed",
+                message="Verification policy lookup failed; using default approval policy",
+                payload={
+                    "trace_id": trace_id,
+                    "session_id": fallback_session_id,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+            return ToolApprovalPolicy()
+        return ToolApprovalPolicy(
+            yolo=intent.yolo,
+            shell_safety_policy_enabled=intent.shell_safety_policy_enabled,
+        )
+
+    async def _topology_for_run_async(
+        self,
+        *,
+        trace_id: str,
+        fallback_session_id: str,
+    ) -> RunTopologySnapshot | None:
+        run_intent_repo = getattr(self.task_execution_service, "run_intent_repo", None)
+        if not isinstance(run_intent_repo, RunIntentRepository):
+            return None
+        try:
+            intent = await run_intent_repo.get_async(
+                trace_id,
+                fallback_session_id=fallback_session_id,
+            )
+        except Exception as exc:
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                event="coord.topology.lookup_failed",
+                message="Run topology lookup failed; using legacy orchestration loop",
+                payload={
+                    "trace_id": trace_id,
+                    "session_id": fallback_session_id,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+            return None
+        return intent.topology
+
+    async def _terminal_status_from_verification_async(
+        self,
+        *,
+        trace_id: str,
+        root_task: TaskEnvelope,
+        verification: VerificationResult,
+        output: str,
+        root_instance_id: str | None,
+        root_role_id: str,
+    ) -> TaskExecutionResult:
+        passed = bool(getattr(verification, "passed", False))
+        if passed:
+            return TaskExecutionResult(output=output)
+
+        failure_message = _format_verification_failure(verification)
+        current = await self.task_repo.get_async(root_task.task_id)
+        assistant_message = build_assistant_error_message(
+            error_code="verification_failed",
+            error_message=failure_message,
+        )
+        await self.task_repo.update_status_async(
+            root_task.task_id,
+            TaskStatus.COMPLETED,
+            assigned_instance_id=current.assigned_instance_id,
+            result=assistant_message,
+            error_message=failure_message,
+        )
+        if root_instance_id is not None:
+            instance = await self.agent_repo.get_instance_async(root_instance_id)
+            await self.task_execution_service.message_repo.prune_conversation_history_to_safe_boundary_async(
+                instance.conversation_id
+            )
+            await self.task_execution_service.message_repo.append_async(
+                session_id=root_task.session_id,
+                workspace_id=instance.workspace_id,
+                conversation_id=instance.conversation_id,
+                agent_role_id=root_role_id,
+                instance_id=root_instance_id,
+                task_id=root_task.task_id,
+                trace_id=trace_id,
+                messages=[ModelResponse(parts=[TextPart(content=assistant_message)])],
+            )
+            if self.run_event_hub is not None:
+                await self._publish_run_event_async(
+                    session_id=root_task.session_id,
+                    run_id=trace_id,
+                    trace_id=trace_id,
+                    task_id=root_task.task_id,
+                    instance_id=root_instance_id,
+                    role_id=root_role_id,
+                    event_type=RunEventType.TEXT_DELTA,
+                    payload={
+                        "text": assistant_message,
+                        "role_id": root_role_id,
+                        "instance_id": root_instance_id,
+                    },
+                )
+        return TaskExecutionResult(
+            output=assistant_message,
+            completion_reason=RunCompletionReason.ASSISTANT_RESPONSE,
+            error_code="verification_failed",
+            error_message=failure_message,
+        )
+
+    async def _task_executor(
+        self, *, instance_id: str, role_id: str, task: TaskEnvelope
+    ) -> TaskExecutionResult:
+        result = await self.task_execution_service.execute(
+            instance_id=instance_id, role_id=role_id, task=task
+        )
+        return self._coerce_task_execution_result(result)
+
+    def _coerce_task_execution_result(
+        self, result: TaskExecutionResult | str
+    ) -> TaskExecutionResult:
+        if isinstance(result, TaskExecutionResult):
+            return result
+        return TaskExecutionResult(output=result)
+
+
+class _GraphStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    graph: OrchestrationGraph
+    records_by_node: dict[str, TaskRecord]
+
+    @property
+    def completed(self) -> bool:
+        return all(
+            (record := self.records_by_node.get(node.node_id)) is not None
+            and record.status == TaskStatus.COMPLETED
+            for node in self.graph.nodes
+        )
+
+    @property
+    def failed(self) -> bool:
+        return any(
+            record.status in {TaskStatus.FAILED, TaskStatus.TIMEOUT}
+            for record in self.records_by_node.values()
+        )
+
+
+def _format_task_results(records: tuple[TaskRecord, ...]) -> str:
+    lines: list[str] = []
+    for record in records:
+        title = record.envelope.title or record.envelope.task_id
+        node_id = record.envelope.orchestration_node_id or ""
+        node_prefix = f"{node_id} " if node_id else ""
+        lines.append(
+            f"- {node_prefix}{title} ({record.envelope.task_id}) status={record.status.value}"
+        )
+        if record.result:
+            lines.append(f"  result={record.result}")
+        if record.error_message:
+            lines.append(f"  error={record.error_message}")
+    return "\n".join(lines)
+
+
+def _orchestration_policy(
+    topology: RunTopologySnapshot | None,
+) -> OrchestrationPolicy:
+    if topology is None:
+        return OrchestrationPolicy()
+    return topology.orchestration_policy
+
+
+def _delegated_contract_checks(
+    *,
+    record: TaskRecord,
+    checks: tuple[VerificationCheckResult, ...],
+) -> tuple[VerificationCheckResult, ...]:
+    task_id = record.envelope.task_id
+    role_id = record.envelope.role_id or "unbound"
+    return tuple(
+        check.model_copy(
+            update={
+                "name": f"{task_id}:{check.name}",
+                "details": f"{task_id} role={role_id}: {check.details}",
+            }
+        )
+        for check in checks
+    )
+
+
+def _verification_with_additional_checks(
+    *,
+    verification: VerificationResult,
+    checks: tuple[VerificationCheckResult, ...],
+) -> VerificationResult:
+    if not checks:
+        return verification
+    report = verification.report
+    if report is None:
+        failed = tuple(
+            check.name for check in checks if not check.passed and check.name
+        )
+        passed = verification.passed and not failed
+        details = verification.details if passed else verification.details + failed
+        return verification.model_copy(
+            update={
+                "passed": passed,
+                "details": details,
+            }
+        )
+
+    all_checks = report.checks + checks
+    unmet_items = tuple(
+        check.name for check in all_checks if not check.passed and check.name
+    )
+    passed = len(unmet_items) == 0
+    details = ("Verification report passed",) if passed else unmet_items
+    return verification.model_copy(
+        update={
+            "passed": passed,
+            "details": details,
+            "report": report.model_copy(
+                update={
+                    "passed": passed,
+                    "checks": all_checks,
+                    "unmet_items": () if passed else details,
+                }
+            ),
+        }
+    )
+
+
+def _dependencies_completed(
+    *,
+    record: TaskRecord,
+    records_by_task_id: dict[str, TaskRecord],
+) -> bool:
+    for dependency_task_id in record.envelope.depends_on_task_ids:
+        dependency = records_by_task_id.get(dependency_task_id)
+        if dependency is None or dependency.status != TaskStatus.COMPLETED:
+            return False
+    for blocker_id in record.envelope.blocked_by_task_ids:
+        blocker = records_by_task_id.get(blocker_id)
+        if blocker is None or blocker.status != TaskStatus.COMPLETED:
+            return False
+    return True
+
+
+def _require_task_role_id(task: TaskEnvelope) -> str:
+    role_id = task.role_id
+    if role_id is None:
+        raise ValueError(f"Task {task.task_id} is not bound to a role")
+    return role_id
+
+
+def _is_paused_subagent_phase(phase: RunRuntimePhase) -> bool:
+    return phase in {
+        RunRuntimePhase.AWAITING_SUBAGENT_FOLLOWUP,
+        RunRuntimePhase.AWAITING_MANUAL_ACTION,
+        RunRuntimePhase.AWAITING_RECOVERY,
+    }

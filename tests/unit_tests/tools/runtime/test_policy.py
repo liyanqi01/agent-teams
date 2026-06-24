@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from agent_teams.tools.runtime import ToolApprovalPolicy
+from relay_teams.tools.runtime.policy import ToolApprovalPolicy
 
 
 def test_default_policy_requires_high_risk_tools() -> None:
@@ -22,4 +22,4 @@ def test_yolo_policy_disables_approval_for_all_tools() -> None:
     assert not policy.requires_approval("edit")
     assert not policy.requires_approval("write")
     assert not policy.requires_approval("write_tmp")
-    assert not policy.requires_approval("create_tasks")
+    assert not policy.requires_approval("orch_create_tasks")

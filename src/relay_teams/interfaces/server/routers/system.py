@@ -1,0 +1,2048 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+import shutil
+from typing import Annotated, NoReturn
+
+import httpx
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, ConfigDict, JsonValue
+
+from relay_teams.interfaces.server.async_call import (
+    call_maybe_async_in_isolated_thread,
+    call_maybe_async_in_network_probe_thread,
+)
+from relay_teams.env.clawhub_config_models import ClawHubConfig
+from relay_teams.env.clawhub_config_service import ClawHubConfigService
+from relay_teams.net.clawhub_connectivity import (
+    ClawHubConnectivityProbeRequest,
+    ClawHubConnectivityProbeResult,
+    ClawHubConnectivityProbeService,
+)
+from relay_teams.env.environment_variable_models import (
+    EnvironmentVariableCatalog,
+    EnvironmentVariableRecord,
+    EnvironmentVariableSaveRequest,
+    EnvironmentVariableScope,
+)
+from relay_teams.env.environment_variable_service import EnvironmentVariableService
+from relay_teams.env.github_config_models import (
+    GitHubConfigUpdate,
+    GitHubConfigView,
+    GitHubTokenRevealView,
+)
+from relay_teams.env.github_config_service import GitHubConfigService
+from relay_teams.net.github_connectivity import (
+    GitHubConnectivityProbeRequest,
+    GitHubConnectivityProbeResult,
+    GitHubConnectivityProbeService,
+    GitHubWebhookConnectivityProbeRequest,
+    GitHubWebhookConnectivityProbeResult,
+    GitHubWebhookConnectivityProbeService,
+)
+from relay_teams.env.localhost_run_tunnel_service import (
+    LocalhostRunTunnelStartRequest,
+    LocalhostRunTunnelStatus,
+    LocalhostRunTunnelStopRequest,
+    LocalhostRunTunnelService,
+)
+from relay_teams.agent_runtimes import (
+    AcpRegistryCatalogResponse,
+    AcpRegistryError,
+    AcpRegistryInstallRequest,
+    AcpRegistryInstallResult,
+    AcpRegistryService,
+    AgentRuntimeTestJob,
+    ExternalAgentConfig,
+    ExternalAgentConfigService,
+    ExternalAgentSummary,
+    ExternalAgentTestResult,
+    registry_default_agent_id,
+)
+from relay_teams.agent_runtimes.test_job_service import AgentRuntimeTestJobService
+from relay_teams.env.proxy_config_service import ProxyConfigService
+from relay_teams.env.proxy_env import ProxyEnvInput
+from relay_teams.env.web_config_models import WebConfig
+from relay_teams.env.web_config_service import WebConfigService
+from relay_teams.general import GeneralConfig, GeneralConfigService, GeneralConfigUpdate
+from relay_teams.net.web_connectivity import (
+    WebConnectivityProbeRequest,
+    WebConnectivityProbeResult,
+    WebConnectivityProbeService,
+)
+from relay_teams.interfaces.server.deps import (
+    get_acp_registry_service,
+    get_container,
+    get_clawhub_connectivity_probe_service,
+    get_clawhub_config_service,
+    get_clawhub_skill_market_service,
+    get_clawhub_skill_service,
+    get_config_status_service,
+    get_environment_variable_service,
+    get_agent_runtime_test_job_service,
+    get_external_agent_config_service,
+    get_general_config_service,
+    get_github_connectivity_probe_service,
+    get_github_config_service,
+    get_github_webhook_connectivity_probe_service,
+    get_localhost_run_tunnel_service,
+    get_github_trigger_service,
+    get_mcp_config_reload_service,
+    get_model_config_service,
+    get_notification_settings_service,
+    get_orchestration_settings_service,
+    get_proxy_config_service,
+    get_ssh_profile_service,
+    get_skills_config_reload_service,
+    get_ui_language_settings_service,
+    get_web_config_service,
+    get_web_connectivity_probe_service,
+    get_hook_service,
+    get_plugin_registry,
+    get_skill_registry,
+)
+from relay_teams.interfaces.server.container import ServerContainer
+from relay_teams.interfaces.server.control_plane import (
+    ControlPlaneDiscoveryPayload,
+    ControlPlaneLivePayload,
+    build_local_live_payload,
+    control_plane_discovery_from_env,
+)
+from relay_teams.interfaces.server.ui_language_models import UiLanguageSettings
+from relay_teams.interfaces.server.ui_language_service import UiLanguageSettingsService
+from relay_teams.agents.orchestration.settings_models import OrchestrationSettings
+from relay_teams.agents.orchestration.settings_service import (
+    OrchestrationSettingsService,
+)
+from relay_teams.interfaces.server.config_status_service import ConfigStatusService
+from relay_teams.interfaces.server.runtime_identity import (
+    ServerHealthPayload,
+    build_server_health_payload,
+)
+from relay_teams.mcp.config_reload_service import McpConfigReloadService
+from relay_teams.notifications.models import NotificationConfig
+from relay_teams.notifications.notification_settings_service import (
+    NotificationSettingsService,
+)
+from relay_teams.providers.model_config import (
+    CodeAgentAuthConfig,
+    DEFAULT_ANTHROPIC_BASE_URL,
+    DEFAULT_CODEAGENT_BASE_URL,
+    DEFAULT_CODEAGENT_CLIENT_ID,
+    DEFAULT_CODEAGENT_SCOPE,
+    DEFAULT_CODEAGENT_SCOPE_RESOURCE,
+    DEFAULT_MAAS_BASE_URL,
+    ModelConfigPayload,
+    ModelFallbackConfig,
+    ModelProfileConfigPayload,
+    ProviderType,
+)
+from relay_teams.providers.model_catalog import ModelCatalogResult
+from relay_teams.providers.codeagent_auth import (
+    CodeAgentOAuthError,
+    build_codeagent_authorization_url,
+    create_codeagent_oauth_session,
+    get_codeagent_oauth_tokens,
+    get_codeagent_oauth_session,
+    get_codeagent_token_service,
+    save_codeagent_oauth_tokens_for_session,
+)
+from relay_teams.providers.model_config_service import ModelConfigService
+from relay_teams.providers.model_connectivity import (
+    CodeAgentAuthVerifyResult,
+    ModelDiscoveryRequest,
+    ModelDiscoveryResult,
+    ModelConnectivityProbeRequest,
+    ModelConnectivityProbeResult,
+)
+from relay_teams.skills.config_reload_service import SkillsConfigReloadService
+from relay_teams.skills.clawhub_models import (
+    ClawHubSkillDetail,
+    ClawHubSkillSummary,
+    ClawHubSkillWriteRequest,
+)
+from relay_teams.skills.clawhub_skill_service import ClawHubSkillService
+from relay_teams.skills.skill_market_models import (
+    ClawHubSkillMarketDetailResponse,
+    ClawHubSkillMarketInstallRequest,
+    ClawHubSkillMarketInstallResponse,
+    ClawHubSkillMarketSearchResponse,
+    ClawHubSkillMarketUninstallResponse,
+)
+from relay_teams.skills.skill_market_service import ClawHubSkillMarketService
+from relay_teams.skills.skill_models import (
+    Skill,
+    SkillDetailEntry,
+    SkillSource,
+    SkillUninstallResponse,
+)
+from relay_teams.skills.skill_registry import SkillRegistry
+from relay_teams.triggers import GitHubTriggerService
+from relay_teams.hooks import HookRuntimeView, HookService, HooksConfig
+from relay_teams.plugins import PluginInstallSourceKind, PluginRegistry, PluginScope
+from relay_teams.plugins.marketplace_models import (
+    PluginMarketplaceIndex,
+    PluginMarketplaceProviderKind,
+    PluginMarketplaceSource,
+)
+from relay_teams.plugins.marketplace_policy import (
+    PluginMarketplaceInstallPolicy,
+    load_plugin_marketplace_install_policy,
+)
+from relay_teams.plugins.marketplace_service import PluginMarketplaceService
+from relay_teams.plugins.views import build_public_plugin_registry
+from relay_teams.validation import RequiredIdentifierStr
+from relay_teams.workspace import (
+    SshProfileConfig,
+    SshProfileConnectivityProbeRequest,
+    SshProfileConnectivityProbeResult,
+    SshProfilePasswordRevealView,
+    SshProfileRecord,
+    SshProfileService,
+)
+
+router = APIRouter(prefix="/system", tags=["System"])
+
+
+class PluginInstallRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: str
+    scope: PluginScope = PluginScope.USER
+    enabled: bool = True
+    source_kind: PluginInstallSourceKind | None = None
+    source_ref: str = ""
+    marketplace: str | None = None
+    marketplace_provider: PluginMarketplaceProviderKind = (
+        PluginMarketplaceProviderKind.LOCAL_JSON
+    )
+    marketplace_source: str = ""
+    marketplace_ref: str = ""
+    version: str | None = None
+    allow_community_plugins: bool = False
+    allow_executes_code: bool = False
+    allow_missing_digest: bool = False
+    allow_unclean_scan: bool = False
+
+
+class PluginValidateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+
+
+class PluginMarketplaceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    marketplace: str
+    marketplace_provider: PluginMarketplaceProviderKind = (
+        PluginMarketplaceProviderKind.LOCAL_JSON
+    )
+    marketplace_source: str = ""
+    marketplace_ref: str = ""
+    refresh: bool = False
+    limit: int = 100
+    cursor: str = ""
+    include_details: bool = False
+    fetch_all: bool = True
+    allow_community_plugins: bool = False
+    allow_executes_code: bool = False
+    allow_missing_digest: bool = False
+    allow_unclean_scan: bool = False
+
+
+class PluginMarketplaceSearchRequest(PluginMarketplaceRequest):
+    query: str = ""
+
+
+class PluginMarketplaceInspectRequest(PluginMarketplaceRequest):
+    name: str
+    scope: PluginScope = PluginScope.USER
+    version: str | None = None
+
+
+class PluginScopeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope: PluginScope = PluginScope.USER
+
+
+class PluginUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope: PluginScope = PluginScope.USER
+    version: str | None = None
+    allow_community_plugins: bool = False
+    allow_executes_code: bool = False
+    allow_missing_digest: bool = False
+    allow_unclean_scan: bool = False
+
+
+class PluginConfigureRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope: PluginScope = PluginScope.USER
+    user_config: dict[str, JsonValue]
+
+
+class NotificationConfigRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    config: NotificationConfig
+
+
+class GeneralConfigRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    config: GeneralConfigUpdate
+
+
+class ModelConfigRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    config: ModelConfigPayload
+
+
+class ModelFallbackConfigRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    config: ModelFallbackConfig
+
+
+class OrchestrationConfigRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    config: OrchestrationSettings
+
+
+class SshProfileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    config: SshProfileConfig
+
+
+def _raise_system_http_error(
+    exc: Exception,
+    *,
+    key_error_status: int | None = None,
+    key_error_detail: str | None = None,
+    permission_error_status: int | None = None,
+    value_error_status: int | None = None,
+    runtime_error_status: int | None = None,
+    os_error_status: int | None = None,
+) -> NoReturn:
+    if permission_error_status is not None and isinstance(exc, PermissionError):
+        raise HTTPException(
+            status_code=permission_error_status, detail=str(exc)
+        ) from exc
+    if key_error_status is not None and isinstance(exc, KeyError):
+        detail = key_error_detail if key_error_detail is not None else str(exc)
+        raise HTTPException(status_code=key_error_status, detail=detail) from exc
+    if value_error_status is not None and isinstance(exc, ValueError):
+        raise HTTPException(status_code=value_error_status, detail=str(exc)) from exc
+    if runtime_error_status is not None and isinstance(exc, RuntimeError):
+        raise HTTPException(status_code=runtime_error_status, detail=str(exc)) from exc
+    if os_error_status is not None and isinstance(exc, OSError):
+        raise HTTPException(status_code=os_error_status, detail=str(exc)) from exc
+    raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/health")
+async def health_check(request: Request) -> ServerHealthPayload:
+    container = getattr(request.app.state, "container", None)
+    if container is None:
+        return await call_maybe_async_in_isolated_thread(build_server_health_payload)
+    return await call_maybe_async_in_isolated_thread(
+        build_server_health_payload,
+        config_dir=container.config_dir,
+        role_registry=container.role_registry,
+        skill_registry=container.skill_registry,
+        tool_registry=container.tool_registry,
+    )
+
+
+@router.get("/live")
+async def live_check() -> ControlPlaneLivePayload:
+    return build_local_live_payload()
+
+
+@router.get("/control-plane")
+async def get_control_plane() -> ControlPlaneDiscoveryPayload:
+    return control_plane_discovery_from_env()
+
+
+@router.get("/configs")
+async def get_config_status(
+    service: ConfigStatusService = Depends(get_config_status_service),
+) -> dict[str, JsonValue]:
+    return await asyncio.to_thread(service.get_config_status)
+
+
+@router.get("/configs/plugins/runtime")
+async def get_plugins_runtime_view(
+    plugin_registry: PluginRegistry = Depends(get_plugin_registry),
+) -> PluginRegistry:
+    return build_public_plugin_registry(plugin_registry)
+
+
+@router.get("/configs/plugins")
+async def get_plugins_config(
+    container: ServerContainer = Depends(get_container),
+) -> PluginRegistry:
+    registry = await asyncio.to_thread(container.plugin_config_manager.load_registry)
+    return build_public_plugin_registry(registry)
+
+
+@router.post("/configs/plugins:validate")
+async def validate_plugin_config(
+    req: PluginValidateRequest,
+    container: ServerContainer = Depends(get_container),
+) -> PluginRegistry:
+    record, diagnostics = await asyncio.to_thread(
+        container.plugin_config_manager.validate_plugin,
+        plugin_root=Path(req.path),
+        require_manifest=True,
+        strict_explicit_paths=True,
+    )
+    records = () if record is None else (record,)
+    return build_public_plugin_registry(
+        PluginRegistry(plugins=records, diagnostics=diagnostics)
+    )
+
+
+@router.post("/configs/plugins/marketplace")
+async def load_plugin_marketplace(
+    req: PluginMarketplaceRequest,
+    container: ServerContainer = Depends(get_container),
+) -> PluginMarketplaceIndex:
+    try:
+        return await asyncio.to_thread(
+            PluginMarketplaceService().load_provider_index,
+            source=_plugin_marketplace_source(req),
+            app_config_dir=container.config_dir,
+            limit=req.limit,
+            cursor=req.cursor,
+            include_details=req.include_details,
+            fetch_all=req.fetch_all,
+            install_policy=_plugin_marketplace_install_policy(
+                req,
+                app_config_dir=container.config_dir,
+            ),
+        )
+    except Exception as exc:
+        _raise_system_http_error(exc, value_error_status=400, os_error_status=400)
+
+
+@router.post("/configs/plugins/marketplace:search")
+async def search_plugin_marketplace(
+    req: PluginMarketplaceSearchRequest,
+    container: ServerContainer = Depends(get_container),
+) -> PluginMarketplaceIndex:
+    try:
+        return await asyncio.to_thread(
+            PluginMarketplaceService().search_provider_index,
+            source=_plugin_marketplace_source(req),
+            query=req.query,
+            app_config_dir=container.config_dir,
+            include_details=req.include_details,
+            install_policy=_plugin_marketplace_install_policy(
+                req,
+                app_config_dir=container.config_dir,
+            ),
+        )
+    except Exception as exc:
+        _raise_system_http_error(exc, value_error_status=400, os_error_status=400)
+
+
+@router.post("/configs/plugins/marketplace:inspect")
+async def inspect_plugin_marketplace(
+    req: PluginMarketplaceInspectRequest,
+    container: ServerContainer = Depends(get_container),
+) -> PluginRegistry:
+    try:
+        registry = await asyncio.to_thread(
+            container.plugin_config_manager.inspect_marketplace_plugin,
+            name=req.name,
+            marketplace=Path(req.marketplace),
+            scope=req.scope,
+            version=req.version,
+            marketplace_provider=req.marketplace_provider,
+            marketplace_source=req.marketplace_source,
+            marketplace_ref=req.marketplace_ref,
+            install_policy=_plugin_marketplace_install_policy(
+                req,
+                app_config_dir=container.config_dir,
+            ),
+        )
+        return build_public_plugin_registry(registry)
+    except Exception as exc:
+        _raise_system_http_error(
+            exc,
+            key_error_status=404,
+            value_error_status=400,
+            os_error_status=400,
+        )
+
+
+@router.post("/configs/plugins:install")
+async def install_plugin_config(
+    req: PluginInstallRequest,
+    container: ServerContainer = Depends(get_container),
+) -> PluginRegistry:
+    try:
+        if req.marketplace is None:
+            source_kind = req.source_kind or _infer_plugin_install_source_kind(
+                req.source
+            )
+            if source_kind == PluginInstallSourceKind.GIT:
+                await asyncio.to_thread(
+                    container.plugin_config_manager.install_git_plugin,
+                    source=req.source,
+                    scope=req.scope,
+                    ref=req.source_ref,
+                    enabled=req.enabled,
+                )
+            elif source_kind == PluginInstallSourceKind.LOCAL:
+                await asyncio.to_thread(
+                    container.plugin_config_manager.install_plugin,
+                    source=Path(req.source),
+                    scope=req.scope,
+                    enabled=req.enabled,
+                )
+            else:
+                raise ValueError("Marketplace plugin installs require marketplace")
+        else:
+            await asyncio.to_thread(
+                container.plugin_config_manager.install_marketplace_plugin,
+                name=req.source,
+                marketplace=Path(req.marketplace),
+                scope=req.scope,
+                version=req.version,
+                enabled=req.enabled,
+                marketplace_provider=req.marketplace_provider,
+                marketplace_source=req.marketplace_source,
+                marketplace_ref=req.marketplace_ref,
+                install_policy=_plugin_marketplace_install_policy(
+                    req,
+                    app_config_dir=container.config_dir,
+                ),
+            )
+    except Exception as exc:
+        _raise_system_http_error(
+            exc,
+            key_error_status=404,
+            value_error_status=400,
+            os_error_status=400,
+        )
+    await asyncio.to_thread(container.reload_plugin_runtime)
+    return build_public_plugin_registry(container.plugin_registry)
+
+
+def _infer_plugin_install_source_kind(source: str) -> PluginInstallSourceKind:
+    normalized = source.strip().lower()
+    if normalized.startswith(("http://", "https://", "ssh://", "git@")):
+        return PluginInstallSourceKind.GIT
+    if normalized.endswith(".git"):
+        return PluginInstallSourceKind.GIT
+    return PluginInstallSourceKind.LOCAL
+
+
+def _plugin_marketplace_source(
+    req: PluginMarketplaceRequest,
+) -> PluginMarketplaceSource:
+    if req.marketplace_provider == PluginMarketplaceProviderKind.LOCAL_JSON:
+        return PluginMarketplaceSource(
+            provider=req.marketplace_provider,
+            name=Path(req.marketplace).stem,
+            value=req.marketplace,
+        )
+    return PluginMarketplaceSource(
+        provider=req.marketplace_provider,
+        name=req.marketplace,
+        value=_plugin_marketplace_source_value(req),
+        ref=req.marketplace_ref,
+        refresh=req.refresh,
+    )
+
+
+def _plugin_marketplace_source_value(req: PluginMarketplaceRequest) -> str:
+    if req.marketplace_provider != PluginMarketplaceProviderKind.CLAUDE:
+        return req.marketplace_source
+    normalized = req.marketplace_source.strip()
+    if not normalized:
+        return ""
+    local_path = Path(normalized).expanduser()
+    if local_path.exists():
+        return str(local_path.resolve())
+    return normalized
+
+
+def _plugin_marketplace_install_policy(
+    req: PluginMarketplaceRequest | PluginInstallRequest,
+    *,
+    app_config_dir: Path,
+) -> PluginMarketplaceInstallPolicy | None:
+    if req.marketplace_provider != PluginMarketplaceProviderKind.CLAWHUB:
+        return None
+    return load_plugin_marketplace_install_policy(app_config_dir).with_overrides(
+        allow_community_plugins=req.allow_community_plugins,
+        allow_executes_code=req.allow_executes_code,
+        allow_missing_digest=req.allow_missing_digest,
+        allow_unclean_scan=req.allow_unclean_scan,
+    )
+
+
+def _plugin_update_install_policy(
+    req: PluginUpdateRequest,
+    *,
+    app_config_dir: Path,
+) -> PluginMarketplaceInstallPolicy | None:
+    if not (
+        req.allow_community_plugins
+        or req.allow_executes_code
+        or req.allow_missing_digest
+        or req.allow_unclean_scan
+    ):
+        return None
+    return load_plugin_marketplace_install_policy(app_config_dir).with_overrides(
+        allow_community_plugins=req.allow_community_plugins,
+        allow_executes_code=req.allow_executes_code,
+        allow_missing_digest=req.allow_missing_digest,
+        allow_unclean_scan=req.allow_unclean_scan,
+    )
+
+
+@router.post("/configs/plugins/{name}:enable")
+async def enable_plugin_config(
+    name: RequiredIdentifierStr,
+    req: PluginScopeRequest,
+    container: ServerContainer = Depends(get_container),
+) -> PluginRegistry:
+    try:
+        await asyncio.to_thread(
+            container.plugin_config_manager.set_plugin_enabled,
+            name=name,
+            scope=req.scope,
+            enabled=True,
+        )
+    except Exception as exc:
+        _raise_system_http_error(exc, key_error_status=404, value_error_status=400)
+    await asyncio.to_thread(container.reload_plugin_runtime)
+    return build_public_plugin_registry(container.plugin_registry)
+
+
+@router.post("/configs/plugins/{name}:disable")
+async def disable_plugin_config(
+    name: RequiredIdentifierStr,
+    req: PluginScopeRequest,
+    container: ServerContainer = Depends(get_container),
+) -> PluginRegistry:
+    try:
+        await asyncio.to_thread(
+            container.plugin_config_manager.set_plugin_enabled,
+            name=name,
+            scope=req.scope,
+            enabled=False,
+        )
+    except Exception as exc:
+        _raise_system_http_error(exc, key_error_status=404, value_error_status=400)
+    await asyncio.to_thread(container.reload_plugin_runtime)
+    return build_public_plugin_registry(container.plugin_registry)
+
+
+@router.post("/configs/plugins/{name}:update")
+async def update_plugin_config(
+    name: RequiredIdentifierStr,
+    req: PluginUpdateRequest,
+    container: ServerContainer = Depends(get_container),
+) -> PluginRegistry:
+    try:
+        await asyncio.to_thread(
+            container.plugin_config_manager.update_plugin,
+            name=name,
+            scope=req.scope,
+            version=req.version,
+            install_policy=_plugin_update_install_policy(
+                req,
+                app_config_dir=container.config_dir,
+            ),
+        )
+    except Exception as exc:
+        _raise_system_http_error(exc, key_error_status=404, value_error_status=400)
+    await asyncio.to_thread(container.reload_plugin_runtime)
+    return build_public_plugin_registry(container.plugin_registry)
+
+
+@router.post("/configs/plugins/{name}:configure")
+async def configure_plugin_config(
+    name: RequiredIdentifierStr,
+    req: PluginConfigureRequest,
+    container: ServerContainer = Depends(get_container),
+) -> PluginRegistry:
+    try:
+        await asyncio.to_thread(
+            container.plugin_config_manager.set_plugin_user_config,
+            name=name,
+            scope=req.scope,
+            user_config=req.user_config,
+        )
+    except Exception as exc:
+        _raise_system_http_error(exc, key_error_status=404, value_error_status=400)
+    await asyncio.to_thread(container.reload_plugin_runtime)
+    return build_public_plugin_registry(container.plugin_registry)
+
+
+@router.delete("/configs/plugins/{name}")
+async def delete_plugin_config(
+    name: RequiredIdentifierStr,
+    scope: PluginScope = Query(PluginScope.USER),
+    prune: bool = Query(False),
+    container: ServerContainer = Depends(get_container),
+) -> PluginRegistry:
+    try:
+        await asyncio.to_thread(
+            container.plugin_config_manager.uninstall_plugin,
+            name=name,
+            scope=scope,
+            prune=prune,
+        )
+    except Exception as exc:
+        _raise_system_http_error(exc, key_error_status=404, value_error_status=400)
+    await asyncio.to_thread(container.reload_plugin_runtime)
+    return build_public_plugin_registry(container.plugin_registry)
+
+
+@router.get("/configs/workspace/ssh-profiles")
+async def list_ssh_profiles(
+    service: SshProfileService = Depends(get_ssh_profile_service),
+) -> list[SshProfileRecord]:
+    return list(await asyncio.to_thread(service.list_profiles))
+
+
+@router.get("/configs/workspace/ssh-profiles/{ssh_profile_id}")
+async def get_ssh_profile(
+    ssh_profile_id: RequiredIdentifierStr,
+    service: SshProfileService = Depends(get_ssh_profile_service),
+) -> SshProfileRecord:
+    try:
+        return await asyncio.to_thread(service.get_profile, ssh_profile_id)
+    except Exception as exc:
+        _raise_system_http_error(
+            exc,
+            key_error_status=404,
+            key_error_detail="SSH profile not found",
+            value_error_status=400,
+        )
+
+
+@router.post("/configs/workspace/ssh-profiles/{ssh_profile_id}:reveal-password")
+async def reveal_ssh_profile_password(
+    ssh_profile_id: RequiredIdentifierStr,
+    service: SshProfileService = Depends(get_ssh_profile_service),
+) -> SshProfilePasswordRevealView:
+    try:
+        return await asyncio.to_thread(service.reveal_password, ssh_profile_id)
+    except Exception as exc:
+        _raise_system_http_error(
+            exc,
+            key_error_status=404,
+            key_error_detail="SSH profile not found",
+            value_error_status=400,
+        )
+
+
+@router.post("/configs/workspace/ssh-profiles:probe")
+async def probe_ssh_profile_connectivity(
+    req: SshProfileConnectivityProbeRequest,
+    service: SshProfileService = Depends(get_ssh_profile_service),
+) -> SshProfileConnectivityProbeResult:
+    try:
+        return await call_maybe_async_in_network_probe_thread(
+            "ssh.probe_connectivity",
+            service.probe_connectivity,
+            req,
+        )
+    except Exception as exc:
+        _raise_system_http_error(
+            exc,
+            key_error_status=404,
+            key_error_detail="SSH profile not found",
+            value_error_status=400,
+        )
+
+
+@router.put("/configs/workspace/ssh-profiles/{ssh_profile_id}")
+async def save_ssh_profile(
+    ssh_profile_id: RequiredIdentifierStr,
+    req: SshProfileRequest,
+    service: SshProfileService = Depends(get_ssh_profile_service),
+) -> SshProfileRecord:
+    try:
+        return await asyncio.to_thread(
+            service.save_profile,
+            ssh_profile_id=ssh_profile_id,
+            config=req.config,
+        )
+    except Exception as exc:
+        _raise_system_http_error(
+            exc,
+            value_error_status=400,
+        )
+
+
+@router.delete("/configs/workspace/ssh-profiles/{ssh_profile_id}")
+async def delete_ssh_profile(
+    ssh_profile_id: RequiredIdentifierStr,
+    service: SshProfileService = Depends(get_ssh_profile_service),
+) -> dict[str, str]:
+    try:
+        await asyncio.to_thread(service.delete_profile, ssh_profile_id)
+        return {"status": "ok"}
+    except Exception as exc:
+        _raise_system_http_error(
+            exc,
+            key_error_status=404,
+            key_error_detail="SSH profile not found",
+            value_error_status=400,
+        )
+
+
+@router.get("/configs/ui-language")
+async def get_ui_language_settings(
+    service: UiLanguageSettingsService = Depends(get_ui_language_settings_service),
+) -> UiLanguageSettings:
+    return await asyncio.to_thread(service.get_ui_language_settings)
+
+
+@router.put("/configs/ui-language")
+async def save_ui_language_settings(
+    req: UiLanguageSettings,
+    service: UiLanguageSettingsService = Depends(get_ui_language_settings_service),
+) -> dict[str, str]:
+    try:
+        await asyncio.to_thread(service.save_ui_language_settings, req)
+        return {"status": "ok"}
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/configs/model")
+async def get_model_config(
+    service: ModelConfigService = Depends(get_model_config_service),
+) -> dict[str, JsonValue]:
+    return await asyncio.to_thread(service.get_model_config)
+
+
+@router.get("/configs/model/profiles")
+async def get_model_profiles(
+    service: ModelConfigService = Depends(get_model_config_service),
+) -> dict[str, dict[str, JsonValue]]:
+    return await asyncio.to_thread(service.get_model_profiles)
+
+
+@router.get("/configs/model-fallback")
+async def get_model_fallback_config(
+    service: ModelConfigService = Depends(get_model_config_service),
+) -> ModelFallbackConfig:
+    return await asyncio.to_thread(service.get_model_fallback_config)
+
+
+@router.get("/configs/model/catalog")
+async def get_model_catalog(
+    refresh: bool = Query(default=False),
+    service: ModelConfigService = Depends(get_model_config_service),
+) -> ModelCatalogResult:
+    return await service.get_model_catalog_async(refresh=refresh)
+
+
+@router.post("/configs/model/catalog:refresh")
+async def refresh_model_catalog(
+    service: ModelConfigService = Depends(get_model_config_service),
+) -> ModelCatalogResult:
+    return await service.get_model_catalog_async(refresh=True)
+
+
+class ModelProfileRequest(ModelProfileConfigPayload):
+    model_config = ConfigDict(extra="forbid")
+
+    source_name: str | None = None
+
+
+class CodeAgentOAuthStartRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class CodeAgentOAuthStartResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    auth_session_id: str
+    authorization_url: str
+    callback_url: str
+    codeagent_auth: CodeAgentAuthConfig
+
+
+class CodeAgentOAuthSessionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    auth_session_id: str
+    completed: bool
+    error_message: str | None = None
+    codeagent_auth: CodeAgentAuthConfig | None = None
+
+
+class CodeAgentAuthVerifyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    profile_name: str
+
+
+class CodeAgentAuthVerifyResponse(CodeAgentAuthVerifyResult):
+    model_config = ConfigDict(extra="forbid")
+
+
+@router.put("/configs/model/profiles/{name}")
+async def save_model_profile(
+    name: str,
+    req: ModelProfileRequest,
+    service: ModelConfigService = Depends(get_model_config_service),
+) -> dict[str, str]:
+    try:
+        profile: dict[str, JsonValue] = {
+            "model": req.model,
+            "provider": req.provider.value,
+            "base_url": (
+                DEFAULT_MAAS_BASE_URL
+                if req.provider == ProviderType.MAAS
+                else DEFAULT_CODEAGENT_BASE_URL
+                if req.provider == ProviderType.CODEAGENT
+                else DEFAULT_ANTHROPIC_BASE_URL
+                if req.provider == ProviderType.ANTHROPIC
+                and (req.base_url is None or not req.base_url.strip())
+                else req.base_url or ""
+            ),
+            "temperature": req.temperature,
+            "top_p": req.top_p,
+            "context_window": req.context_window,
+            "connect_timeout_seconds": req.connect_timeout_seconds,
+        }
+        if "fallback_policy_id" in req.model_fields_set:
+            profile["fallback_policy_id"] = req.fallback_policy_id
+        if "fallback_priority" in req.model_fields_set:
+            profile["fallback_priority"] = req.fallback_priority
+        if "catalog_provider_id" in req.model_fields_set:
+            profile["catalog_provider_id"] = req.catalog_provider_id
+        if "catalog_provider_name" in req.model_fields_set:
+            profile["catalog_provider_name"] = req.catalog_provider_name
+        if "catalog_model_name" in req.model_fields_set:
+            profile["catalog_model_name"] = req.catalog_model_name
+        if "max_tokens" in req.model_fields_set:
+            profile["max_tokens"] = req.max_tokens
+        if req.is_default is not None:
+            profile["is_default"] = req.is_default
+        if req.ssl_verify is not None:
+            profile["ssl_verify"] = req.ssl_verify
+        if req.capabilities is not None:
+            profile["capabilities"] = req.capabilities.model_dump(mode="json")
+        if req.speech_realtime is not None:
+            profile["speech_realtime"] = req.speech_realtime.model_dump(
+                mode="json",
+                exclude_none=True,
+            )
+        if req.api_key is not None and req.api_key.strip():
+            profile["api_key"] = req.api_key
+        if req.headers is not None:
+            profile["headers"] = [
+                header.model_dump(mode="json") for header in req.headers
+            ]
+        if req.maas_auth is not None:
+            profile["maas_auth"] = req.maas_auth.model_dump(mode="json")
+        if req.codeagent_auth is not None:
+            profile["codeagent_auth"] = req.codeagent_auth.model_dump(mode="json")
+        await asyncio.to_thread(
+            service.save_model_profile,
+            name,
+            profile,
+            source_name=req.source_name,
+        )
+        return {"status": "ok"}
+    except Exception as exc:
+        _raise_system_http_error(
+            exc,
+            key_error_status=404,
+            value_error_status=400,
+        )
+
+
+@router.post("/configs/model/codeagent/oauth:start")
+def start_codeagent_oauth(
+    _req: CodeAgentOAuthStartRequest,
+) -> CodeAgentOAuthStartResponse:
+    session = create_codeagent_oauth_session(
+        base_url=DEFAULT_CODEAGENT_BASE_URL,
+        client_id=DEFAULT_CODEAGENT_CLIENT_ID,
+        scope=DEFAULT_CODEAGENT_SCOPE,
+        scope_resource=DEFAULT_CODEAGENT_SCOPE_RESOURCE,
+    )
+    authorization_url = build_codeagent_authorization_url(
+        base_url=DEFAULT_CODEAGENT_BASE_URL,
+        client_id=session.client_id,
+        scope=session.scope,
+        scope_resource=session.scope_resource,
+        redirect_url=session.callback_url,
+    )
+    return CodeAgentOAuthStartResponse(
+        auth_session_id=session.auth_session_id,
+        authorization_url=authorization_url,
+        callback_url=session.callback_url,
+        codeagent_auth=CodeAgentAuthConfig(
+            client_id=session.client_id,
+            scope=session.scope,
+            scope_resource=session.scope_resource,
+            oauth_session_id=session.auth_session_id,
+        ),
+    )
+
+
+@router.get("/configs/model/codeagent/oauth/{auth_session_id}")
+async def get_codeagent_oauth_session_status(
+    auth_session_id: str,
+) -> CodeAgentOAuthSessionResponse:
+    session = get_codeagent_oauth_session(auth_session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="CodeAgent OAuth session not found")
+    if not session.completed:
+        try:
+            token_result = await get_codeagent_token_service().poll_token(
+                session=session,
+                ssl_verify=None,
+                connect_timeout_seconds=15.0,
+            )
+            if token_result is not None:
+                session = save_codeagent_oauth_tokens_for_session(
+                    auth_session_id=auth_session_id,
+                    token_result=token_result,
+                )
+        except CodeAgentOAuthError as exc:
+            raise HTTPException(
+                status_code=exc.status_code or 400,
+                detail=str(exc) or "CodeAgent OAuth token polling failed.",
+            ) from exc
+        except httpx.TimeoutException as exc:
+            raise HTTPException(
+                status_code=504,
+                detail=str(exc) or "CodeAgent OAuth token polling timed out.",
+            ) from exc
+        except httpx.RequestError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=str(exc) or "CodeAgent OAuth token polling request failed.",
+            ) from exc
+    session_tokens_available = (
+        get_codeagent_oauth_tokens(auth_session_id) is not None
+        if session.completed
+        else False
+    )
+    codeagent_auth = (
+        CodeAgentAuthConfig(
+            client_id=session.client_id,
+            scope=session.scope,
+            scope_resource=session.scope_resource,
+            oauth_session_id=session.auth_session_id,
+            has_access_token=True,
+            has_refresh_token=True,
+        )
+        if session.completed and session_tokens_available
+        else None
+    )
+    return CodeAgentOAuthSessionResponse(
+        auth_session_id=session.auth_session_id,
+        completed=session.completed and session_tokens_available,
+        error_message=session.error_message,
+        codeagent_auth=codeagent_auth,
+    )
+
+
+@router.post("/configs/model/codeagent/auth:verify")
+async def verify_codeagent_auth(
+    req: CodeAgentAuthVerifyRequest,
+    service: ModelConfigService = Depends(get_model_config_service),
+) -> CodeAgentAuthVerifyResponse:
+    try:
+        result = await service.verify_codeagent_auth_async(
+            profile_name=req.profile_name
+        )
+        return CodeAgentAuthVerifyResponse.model_validate(
+            result.model_dump(mode="json")
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/configs/model/providers/models")
+async def get_provider_models(
+    provider: ProviderType | None = Query(default=None),
+    service: ModelConfigService = Depends(get_model_config_service),
+) -> list[dict[str, JsonValue]]:
+    return [
+        model.model_dump(mode="json")
+        for model in await asyncio.to_thread(
+            service.get_provider_models,
+            provider=provider,
+        )
+    ]
+
+
+@router.delete("/configs/model/profiles/{name}")
+async def delete_model_profile(
+    name: str,
+    service: ModelConfigService = Depends(get_model_config_service),
+) -> dict[str, str]:
+    try:
+        await asyncio.to_thread(service.delete_model_profile, name)
+        return {"status": "ok"}
+    except Exception as exc:
+        _raise_system_http_error(
+            exc,
+            key_error_status=404,
+            value_error_status=400,
+        )
+
+
+@router.put("/configs/model")
+async def save_model_config(
+    req: ModelConfigPayload | ModelConfigRequest,
+    service: ModelConfigService = Depends(get_model_config_service),
+) -> dict[str, str]:
+    try:
+        config = req.config if isinstance(req, ModelConfigRequest) else req
+        await asyncio.to_thread(service.save_model_config, config)
+        return {"status": "ok"}
+    except Exception as exc:
+        _raise_system_http_error(exc, value_error_status=400)
+
+
+@router.put("/configs/model-fallback")
+async def save_model_fallback_config(
+    req: ModelFallbackConfig | ModelFallbackConfigRequest,
+    service: ModelConfigService = Depends(get_model_config_service),
+) -> dict[str, str]:
+    try:
+        config = req.config if isinstance(req, ModelFallbackConfigRequest) else req
+        await asyncio.to_thread(service.save_model_fallback_config, config)
+        return {"status": "ok"}
+    except Exception as exc:
+        _raise_system_http_error(exc, value_error_status=400)
+
+
+@router.post("/configs/model:probe")
+async def probe_model_connectivity(
+    req: ModelConnectivityProbeRequest,
+    service: ModelConfigService = Depends(get_model_config_service),
+) -> ModelConnectivityProbeResult:
+    try:
+        return await call_maybe_async_in_network_probe_thread(
+            "model.probe_connectivity",
+            service.probe_connectivity_async,
+            req,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/configs/model:discover")
+async def discover_model_catalog(
+    req: ModelDiscoveryRequest,
+    service: ModelConfigService = Depends(get_model_config_service),
+) -> ModelDiscoveryResult:
+    try:
+        return await call_maybe_async_in_network_probe_thread(
+            "model.discover_models",
+            service.discover_models_async,
+            req,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/configs/notifications")
+async def get_notification_config(
+    service: NotificationSettingsService = Depends(get_notification_settings_service),
+) -> NotificationConfig:
+    return await asyncio.to_thread(service.get_notification_config)
+
+
+@router.get("/configs/general")
+async def get_general_config(
+    service: GeneralConfigService = Depends(get_general_config_service),
+) -> GeneralConfig:
+    return await asyncio.to_thread(service.get_config)
+
+
+@router.put("/configs/general")
+async def save_general_config(
+    req: GeneralConfigUpdate | GeneralConfigRequest,
+    service: GeneralConfigService = Depends(get_general_config_service),
+) -> dict[str, str]:
+    try:
+        config = req.config if isinstance(req, GeneralConfigRequest) else req
+        await asyncio.to_thread(service.save_config, config)
+        return {"status": "ok"}
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/configs/environment-variables")
+async def get_environment_variables(
+    service: EnvironmentVariableService = Depends(get_environment_variable_service),
+) -> EnvironmentVariableCatalog:
+    try:
+        return await asyncio.to_thread(service.list_environment_variables)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.put("/configs/environment-variables/{scope}/{key}")
+async def save_environment_variable(
+    scope: EnvironmentVariableScope,
+    key: str,
+    req: EnvironmentVariableSaveRequest,
+    service: EnvironmentVariableService = Depends(get_environment_variable_service),
+) -> EnvironmentVariableRecord:
+    try:
+        return await asyncio.to_thread(
+            service.save_environment_variable,
+            scope=scope,
+            key=key,
+            request=req,
+        )
+    except Exception as exc:
+        _raise_system_http_error(
+            exc,
+            permission_error_status=403,
+            value_error_status=400,
+            runtime_error_status=400,
+        )
+
+
+@router.delete("/configs/environment-variables/{scope}/{key}")
+async def delete_environment_variable(
+    scope: EnvironmentVariableScope,
+    key: str,
+    service: EnvironmentVariableService = Depends(get_environment_variable_service),
+) -> dict[str, str]:
+    try:
+        await asyncio.to_thread(
+            service.delete_environment_variable,
+            scope=scope,
+            key=key,
+        )
+        return {"status": "ok"}
+    except Exception as exc:
+        _raise_system_http_error(
+            exc,
+            permission_error_status=403,
+            value_error_status=400,
+            runtime_error_status=400,
+        )
+
+
+@router.get("/configs/proxy")
+async def get_proxy_config(
+    service: ProxyConfigService = Depends(get_proxy_config_service),
+) -> ProxyEnvInput:
+    return await asyncio.to_thread(service.get_saved_proxy_config)
+
+
+@router.put("/configs/proxy")
+async def save_proxy_config(
+    req: ProxyEnvInput,
+    service: ProxyConfigService = Depends(get_proxy_config_service),
+) -> dict[str, str]:
+    try:
+        await asyncio.to_thread(service.save_proxy_config, req)
+        return {"status": "ok"}
+    except Exception as exc:
+        _raise_system_http_error(
+            exc,
+            value_error_status=400,
+            runtime_error_status=400,
+        )
+
+
+@router.get("/configs/web")
+async def get_web_config(
+    service: WebConfigService = Depends(get_web_config_service),
+) -> WebConfig:
+    return await asyncio.to_thread(service.get_web_config)
+
+
+@router.put("/configs/web")
+async def save_web_config(
+    req: WebConfig,
+    service: WebConfigService = Depends(get_web_config_service),
+) -> dict[str, str]:
+    try:
+        await asyncio.to_thread(service.save_web_config, req)
+        return {"status": "ok"}
+    except Exception as exc:
+        _raise_system_http_error(
+            exc,
+            value_error_status=400,
+            runtime_error_status=400,
+        )
+
+
+@router.get("/configs/agent-runtimes", response_model=list[ExternalAgentSummary])
+async def list_agent_runtimes(
+    service: ExternalAgentConfigService = Depends(get_external_agent_config_service),
+) -> tuple[ExternalAgentSummary, ...]:
+    return await asyncio.to_thread(service.list_agents)
+
+
+@router.get(
+    "/configs/agent-runtime-registry",
+    response_model=AcpRegistryCatalogResponse,
+)
+async def list_agent_runtime_registry(
+    refresh: bool = Query(False),
+    registry_service: AcpRegistryService = Depends(get_acp_registry_service),
+    agent_service: ExternalAgentConfigService = Depends(
+        get_external_agent_config_service
+    ),
+) -> AcpRegistryCatalogResponse:
+    try:
+        installed_agents = await asyncio.to_thread(agent_service.list_agent_configs)
+        return await registry_service.get_catalog(
+            installed_agents=installed_agents,
+            refresh=refresh,
+        )
+    except (AcpRegistryError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post(
+    "/configs/agent-runtime-registry:refresh",
+    response_model=AcpRegistryCatalogResponse,
+)
+async def refresh_agent_runtime_registry(
+    registry_service: AcpRegistryService = Depends(get_acp_registry_service),
+    agent_service: ExternalAgentConfigService = Depends(
+        get_external_agent_config_service
+    ),
+) -> AcpRegistryCatalogResponse:
+    try:
+        installed_agents = await asyncio.to_thread(agent_service.list_agent_configs)
+        return await registry_service.refresh_catalog(installed_agents=installed_agents)
+    except (AcpRegistryError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post(
+    "/configs/agent-runtime-registry/{registry_id:path}:install",
+    response_model=AcpRegistryInstallResult,
+)
+async def install_agent_runtime_from_registry(
+    registry_id: str,
+    req: AcpRegistryInstallRequest = Body(default_factory=AcpRegistryInstallRequest),
+    registry_service: AcpRegistryService = Depends(get_acp_registry_service),
+    agent_service: ExternalAgentConfigService = Depends(
+        get_external_agent_config_service
+    ),
+) -> AcpRegistryInstallResult:
+    try:
+        current_agent: ExternalAgentConfig | None = None
+        if req.env is None:
+            current_agent_id = req.agent_id or registry_default_agent_id(registry_id)
+            try:
+                current_agent = await asyncio.to_thread(
+                    agent_service.get_agent,
+                    current_agent_id,
+                )
+            except KeyError:
+                current_agent = None
+        result = await registry_service.build_install_config(
+            registry_id=registry_id,
+            request=req,
+            current_agent=current_agent,
+        )
+        saved = await asyncio.to_thread(
+            agent_service.save_agent,
+            result.agent.agent_id,
+            result.agent,
+        )
+        return result.model_copy(update={"agent": saved})
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (
+        AcpRegistryError,
+        RuntimeError,
+        ValueError,
+    ) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/configs/agent-runtimes/{agent_id}", response_model=ExternalAgentConfig)
+async def get_agent_runtime(
+    agent_id: RequiredIdentifierStr,
+    service: ExternalAgentConfigService = Depends(get_external_agent_config_service),
+) -> ExternalAgentConfig:
+    try:
+        return await asyncio.to_thread(service.get_agent, agent_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.put("/configs/agent-runtimes/{agent_id}", response_model=ExternalAgentConfig)
+async def save_agent_runtime(
+    agent_id: RequiredIdentifierStr,
+    req: ExternalAgentConfig,
+    service: ExternalAgentConfigService = Depends(get_external_agent_config_service),
+) -> ExternalAgentConfig:
+    try:
+        return await asyncio.to_thread(service.save_agent, agent_id, req)
+    except (KeyError, ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/configs/agent-runtimes/{agent_id}")
+async def delete_agent_runtime(
+    agent_id: RequiredIdentifierStr,
+    service: ExternalAgentConfigService = Depends(get_external_agent_config_service),
+) -> dict[str, str]:
+    try:
+        await asyncio.to_thread(service.delete_agent, agent_id)
+        return {"status": "ok"}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post(
+    "/configs/agent-runtimes/{agent_id}:test",
+    response_model=ExternalAgentTestResult,
+)
+async def test_agent_runtime(
+    agent_id: RequiredIdentifierStr,
+    service: AgentRuntimeTestJobService = Depends(get_agent_runtime_test_job_service),
+) -> ExternalAgentTestResult:
+    try:
+        result = await service.run_test(agent_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (AcpRegistryError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if result.ok:
+        return result
+    raise HTTPException(status_code=400, detail=result.message)
+
+
+@router.post(
+    "/configs/agent-runtimes/{agent_id}:test-job",
+    response_model=AgentRuntimeTestJob,
+)
+async def start_agent_runtime_test_job(
+    agent_id: RequiredIdentifierStr,
+    service: AgentRuntimeTestJobService = Depends(get_agent_runtime_test_job_service),
+) -> AgentRuntimeTestJob:
+    try:
+        return await service.start_job(agent_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (AcpRegistryError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get(
+    "/configs/agent-runtime-test-jobs/{job_id}",
+    response_model=AgentRuntimeTestJob,
+)
+async def get_agent_runtime_test_job(
+    job_id: RequiredIdentifierStr,
+    service: AgentRuntimeTestJobService = Depends(get_agent_runtime_test_job_service),
+) -> AgentRuntimeTestJob:
+    try:
+        return await service.get_job(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/configs/github")
+async def get_github_config(
+    service: GitHubConfigService = Depends(get_github_config_service),
+) -> GitHubConfigView:
+    return await asyncio.to_thread(service.get_github_config_view)
+
+
+@router.post("/configs/github:reveal")
+async def reveal_github_token(
+    service: GitHubConfigService = Depends(get_github_config_service),
+) -> GitHubTokenRevealView:
+    return await asyncio.to_thread(service.reveal_github_token)
+
+
+@router.put("/configs/github")
+async def save_github_config(
+    req: GitHubConfigUpdate,
+    service: GitHubConfigService = Depends(get_github_config_service),
+    trigger_service: GitHubTriggerService = Depends(get_github_trigger_service),
+) -> dict[str, str]:
+    try:
+
+        def _save_github_config() -> None:
+            previous_config = service.get_github_config()
+            service.update_github_config(req)
+            trigger_service.refresh_repo_callback_urls_from_system_config(
+                previous_webhook_base_url=previous_config.webhook_base_url
+            )
+
+        await asyncio.to_thread(_save_github_config)
+        return {"status": "ok"}
+    except Exception as exc:
+        _raise_system_http_error(
+            exc,
+            value_error_status=400,
+            runtime_error_status=400,
+        )
+
+
+@router.get("/configs/clawhub")
+async def get_clawhub_config(
+    service: ClawHubConfigService = Depends(get_clawhub_config_service),
+) -> ClawHubConfig:
+    return await asyncio.to_thread(service.get_clawhub_config)
+
+
+@router.put("/configs/clawhub")
+async def save_clawhub_config(
+    req: ClawHubConfig,
+    service: ClawHubConfigService = Depends(get_clawhub_config_service),
+) -> dict[str, str]:
+    try:
+        await asyncio.to_thread(service.save_clawhub_config, req)
+        return {"status": "ok"}
+    except Exception as exc:
+        _raise_system_http_error(
+            exc,
+            value_error_status=400,
+            runtime_error_status=400,
+        )
+
+
+@router.post("/configs/clawhub:probe")
+async def probe_clawhub_connectivity(
+    req: ClawHubConnectivityProbeRequest,
+    service: ClawHubConnectivityProbeService = Depends(
+        get_clawhub_connectivity_probe_service
+    ),
+) -> ClawHubConnectivityProbeResult:
+    try:
+        return await asyncio.to_thread(service.probe, req)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get(
+    "/skills/market/clawhub",
+    response_model=ClawHubSkillMarketSearchResponse,
+)
+async def browse_clawhub_skill_market(
+    limit: Annotated[int, Query(ge=1, le=200)] = 24,
+    cursor: str = "",
+    sort: str = "popular",
+    service: ClawHubSkillMarketService = Depends(get_clawhub_skill_market_service),
+) -> ClawHubSkillMarketSearchResponse:
+    return await asyncio.to_thread(
+        service.browse_clawhub_skills,
+        limit=limit,
+        cursor=cursor,
+        sort=sort,
+    )
+
+
+@router.get(
+    "/skills/market/clawhub/search",
+    response_model=ClawHubSkillMarketSearchResponse,
+)
+async def search_clawhub_skill_market(
+    query: str = "",
+    limit: Annotated[int, Query(ge=1, le=500)] = 24,
+    service: ClawHubSkillMarketService = Depends(get_clawhub_skill_market_service),
+) -> ClawHubSkillMarketSearchResponse:
+    return await asyncio.to_thread(
+        service.search_clawhub_skills,
+        query=query,
+        limit=limit,
+    )
+
+
+@router.post(
+    "/skills/market/clawhub/install",
+    response_model=ClawHubSkillMarketInstallResponse,
+)
+async def install_clawhub_skill_from_market(
+    req: ClawHubSkillMarketInstallRequest,
+    service: ClawHubSkillMarketService = Depends(get_clawhub_skill_market_service),
+) -> ClawHubSkillMarketInstallResponse:
+    try:
+        return await asyncio.to_thread(service.install_clawhub_skill, req)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get(
+    "/skills/market/clawhub/{slug}",
+    response_model=ClawHubSkillMarketDetailResponse,
+)
+async def get_clawhub_skill_market_detail(
+    slug: RequiredIdentifierStr,
+    version: str | None = None,
+    service: ClawHubSkillMarketService = Depends(get_clawhub_skill_market_service),
+) -> ClawHubSkillMarketDetailResponse:
+    try:
+        return await asyncio.to_thread(
+            service.get_clawhub_skill_market_detail,
+            slug=slug,
+            version=version,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete(
+    "/skills/market/clawhub/{slug}",
+    response_model=ClawHubSkillMarketUninstallResponse,
+)
+async def uninstall_clawhub_skill_from_market(
+    slug: RequiredIdentifierStr,
+    service: ClawHubSkillMarketService = Depends(get_clawhub_skill_market_service),
+) -> ClawHubSkillMarketUninstallResponse:
+    try:
+        return await asyncio.to_thread(
+            service.uninstall_clawhub_skill,
+            slug=slug,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get(
+    "/skills/{skill_ref:path}",
+    response_model=SkillDetailEntry,
+)
+async def get_runtime_skill_detail(
+    skill_ref: RequiredIdentifierStr,
+    skill_registry: SkillRegistry = Depends(get_skill_registry),
+) -> SkillDetailEntry:
+    try:
+        skill = await asyncio.to_thread(skill_registry.get_skill_definition, skill_ref)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if skill is None:
+        raise HTTPException(status_code=404, detail=f"Unknown skill: {skill_ref}")
+
+    manifest_path = skill.directory / "SKILL.md"
+    try:
+        manifest_content = await asyncio.to_thread(
+            manifest_path.read_text,
+            encoding="utf-8",
+        )
+    except (OSError, UnicodeError):
+        manifest_content = None
+    return SkillDetailEntry(
+        ref=skill.ref,
+        name=skill.metadata.name,
+        description=skill.metadata.description.strip(),
+        source=skill.source,
+        directory=str(skill.directory),
+        manifest_path=str(manifest_path),
+        instructions=skill.metadata.instructions,
+        manifest_content=manifest_content,
+    )
+
+
+@router.delete(
+    "/skills/{skill_ref:path}",
+    response_model=SkillUninstallResponse,
+)
+async def uninstall_runtime_skill(
+    skill_ref: RequiredIdentifierStr,
+    skill_registry: SkillRegistry = Depends(get_skill_registry),
+    reload_service: SkillsConfigReloadService = Depends(
+        get_skills_config_reload_service
+    ),
+) -> SkillUninstallResponse:
+    try:
+        skill = await asyncio.to_thread(skill_registry.get_skill_definition, skill_ref)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if skill is None:
+        raise HTTPException(status_code=404, detail=f"Unknown skill: {skill_ref}")
+
+    if not _runtime_skill_source_is_user_removable(skill.source):
+        return SkillUninstallResponse(
+            ok=False,
+            ref=skill.ref,
+            error_code="skill_not_removable",
+            error_message=f"Skill source is not removable: {skill.source.value}",
+        )
+
+    try:
+        await asyncio.to_thread(_delete_runtime_skill_directory, skill)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return SkillUninstallResponse(
+            ok=False,
+            ref=skill.ref,
+            error_code="uninstall_failed",
+            error_message=str(exc),
+        )
+
+    try:
+        await asyncio.to_thread(reload_service.reload_skills_config)
+    except (RuntimeError, ValueError) as exc:
+        return SkillUninstallResponse(
+            ok=True,
+            ref=skill.ref,
+            skills_reloaded=False,
+            error_code="skills_reload_failed",
+            error_message=str(exc),
+        )
+
+    return SkillUninstallResponse(
+        ok=True,
+        ref=skill.ref,
+        skills_reloaded=True,
+    )
+
+
+def _runtime_skill_source_is_user_removable(source: SkillSource) -> bool:
+    return source in {
+        SkillSource.USER_RELAY_TEAMS,
+        SkillSource.USER_AGENTS,
+        SkillSource.USER_CLAUDE,
+        SkillSource.USER_CODEX,
+        SkillSource.USER_OPENCODE,
+    }
+
+
+def _delete_runtime_skill_directory(skill: Skill) -> None:
+    skill_dir = skill.directory.resolve()
+    manifest_path = (skill_dir / "SKILL.md").resolve()
+    if not skill_dir.is_dir():
+        raise ValueError(f"Skill directory does not exist: {skill_dir}")
+    if not manifest_path.is_file():
+        raise ValueError(f"Skill directory is missing SKILL.md: {skill_dir}")
+    try:
+        manifest_path.relative_to(skill_dir)
+    except ValueError as exc:
+        raise ValueError(f"Skill manifest escapes its directory: {skill.ref}") from exc
+    if _runtime_skill_directory_is_container(skill_dir):
+        manifest_path.unlink()
+        return
+    shutil.rmtree(skill_dir)
+
+
+def _runtime_skill_directory_is_container(skill_dir: Path) -> bool:
+    if skill_dir.name.casefold() == "skills":
+        return True
+    return any(
+        child.is_dir() and (child / "SKILL.md").is_file()
+        for child in skill_dir.iterdir()
+    )
+
+
+@router.get(
+    "/configs/clawhub/skills",
+    response_model=list[ClawHubSkillSummary],
+)
+async def list_clawhub_skills(
+    service: ClawHubSkillService = Depends(get_clawhub_skill_service),
+) -> tuple[ClawHubSkillSummary, ...]:
+    return await asyncio.to_thread(service.list_skills)
+
+
+@router.get(
+    "/configs/clawhub/skills/{skill_id}",
+    response_model=ClawHubSkillDetail,
+)
+async def get_clawhub_skill(
+    skill_id: RequiredIdentifierStr,
+    service: ClawHubSkillService = Depends(get_clawhub_skill_service),
+) -> ClawHubSkillDetail:
+    try:
+        return await asyncio.to_thread(service.get_skill, skill_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.put(
+    "/configs/clawhub/skills/{skill_id}",
+    response_model=ClawHubSkillDetail,
+)
+async def save_clawhub_skill(
+    skill_id: RequiredIdentifierStr,
+    req: ClawHubSkillWriteRequest,
+    service: ClawHubSkillService = Depends(get_clawhub_skill_service),
+) -> ClawHubSkillDetail:
+    try:
+        return await asyncio.to_thread(service.save_skill, skill_id, req)
+    except (KeyError, ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/configs/clawhub/skills/{skill_id}")
+async def delete_clawhub_skill(
+    skill_id: RequiredIdentifierStr,
+    service: ClawHubSkillService = Depends(get_clawhub_skill_service),
+) -> dict[str, str]:
+    try:
+        await asyncio.to_thread(service.delete_skill, skill_id)
+        return {"status": "ok"}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.put("/configs/notifications")
+async def save_notification_config(
+    req: NotificationConfig | NotificationConfigRequest,
+    service: NotificationSettingsService = Depends(get_notification_settings_service),
+) -> dict[str, str]:
+    try:
+        config = req.config if isinstance(req, NotificationConfigRequest) else req
+        await asyncio.to_thread(service.save_notification_config, config)
+        return {"status": "ok"}
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/configs/orchestration")
+async def get_orchestration_config(
+    service: OrchestrationSettingsService = Depends(get_orchestration_settings_service),
+) -> OrchestrationSettings:
+    return await asyncio.to_thread(service.get_orchestration_config)
+
+
+@router.put("/configs/orchestration")
+async def save_orchestration_config(
+    req: OrchestrationSettings | OrchestrationConfigRequest,
+    service: OrchestrationSettingsService = Depends(get_orchestration_settings_service),
+) -> dict[str, str]:
+    try:
+        config = req.config if isinstance(req, OrchestrationConfigRequest) else req
+        await asyncio.to_thread(service.save_orchestration_config, config)
+        return {"status": "ok"}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/configs/model:reload")
+async def reload_model_config(
+    service: ModelConfigService = Depends(get_model_config_service),
+) -> dict[str, str]:
+    try:
+        await asyncio.to_thread(service.reload_model_config)
+        return {"status": "ok"}
+    except Exception as exc:
+        _raise_system_http_error(
+            exc,
+            value_error_status=400,
+            runtime_error_status=400,
+        )
+
+
+@router.post("/configs/proxy:reload")
+async def reload_proxy_config(
+    service: ProxyConfigService = Depends(get_proxy_config_service),
+) -> dict[str, str]:
+    try:
+        await asyncio.to_thread(service.reload_proxy_config)
+        return {"status": "ok"}
+    except Exception as exc:
+        _raise_system_http_error(
+            exc,
+            value_error_status=400,
+            runtime_error_status=400,
+        )
+
+
+@router.post("/configs/web:probe")
+async def probe_web_connectivity(
+    req: WebConnectivityProbeRequest,
+    service: WebConnectivityProbeService = Depends(get_web_connectivity_probe_service),
+) -> WebConnectivityProbeResult:
+    try:
+        return await service.probe(req)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/configs/github:probe")
+async def probe_github_connectivity(
+    req: GitHubConnectivityProbeRequest,
+    service: GitHubConnectivityProbeService = Depends(
+        get_github_connectivity_probe_service
+    ),
+) -> GitHubConnectivityProbeResult:
+    try:
+        return await service.probe_async(req)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/configs/github/webhook:probe")
+async def probe_github_webhook_connectivity(
+    req: GitHubWebhookConnectivityProbeRequest,
+    service: GitHubWebhookConnectivityProbeService = Depends(
+        get_github_webhook_connectivity_probe_service
+    ),
+) -> GitHubWebhookConnectivityProbeResult:
+    try:
+        return await asyncio.to_thread(service.probe, req)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/configs/github/webhook/tunnel")
+async def get_github_webhook_tunnel_status(
+    service: LocalhostRunTunnelService = Depends(get_localhost_run_tunnel_service),
+) -> LocalhostRunTunnelStatus:
+    return await asyncio.to_thread(service.get_status)
+
+
+@router.post("/configs/github/webhook/tunnel:start")
+async def start_github_webhook_tunnel(
+    req: LocalhostRunTunnelStartRequest,
+    request: Request,
+    tunnel_service: LocalhostRunTunnelService = Depends(
+        get_localhost_run_tunnel_service
+    ),
+    github_config_service: GitHubConfigService = Depends(get_github_config_service),
+    trigger_service: GitHubTriggerService = Depends(get_github_trigger_service),
+) -> LocalhostRunTunnelStatus:
+    try:
+        effective_request = req.model_copy(
+            update={
+                "local_port": req.local_port or request.url.port or 8000,
+            }
+        )
+
+        def _start_tunnel() -> LocalhostRunTunnelStatus:
+            status = tunnel_service.start(effective_request)
+            if effective_request.auto_save_webhook_base_url and status.public_url:
+                previous_config = github_config_service.get_github_config()
+                github_config_service.update_github_config(
+                    GitHubConfigUpdate(webhook_base_url=status.public_url)
+                )
+                trigger_service.refresh_repo_callback_urls_from_system_config(
+                    previous_webhook_base_url=previous_config.webhook_base_url
+                )
+            return status
+
+        return await asyncio.to_thread(_start_tunnel)
+    except Exception as exc:
+        _raise_system_http_error(
+            exc,
+            value_error_status=400,
+            runtime_error_status=400,
+            os_error_status=500,
+        )
+
+
+@router.post("/configs/github/webhook/tunnel:stop")
+async def stop_github_webhook_tunnel(
+    req: LocalhostRunTunnelStopRequest,
+    tunnel_service: LocalhostRunTunnelService = Depends(
+        get_localhost_run_tunnel_service
+    ),
+    github_config_service: GitHubConfigService = Depends(get_github_config_service),
+    trigger_service: GitHubTriggerService = Depends(get_github_trigger_service),
+) -> LocalhostRunTunnelStatus:
+    try:
+
+        def _stop_tunnel() -> LocalhostRunTunnelStatus:
+            status = tunnel_service.stop()
+            if req.clear_webhook_base_url_if_matching and status.public_url:
+                existing_config = github_config_service.get_github_config()
+                if existing_config.webhook_base_url == status.public_url:
+                    github_config_service.update_github_config(
+                        GitHubConfigUpdate(webhook_base_url=None)
+                    )
+                    trigger_service.refresh_repo_callback_urls_from_system_config(
+                        previous_webhook_base_url=existing_config.webhook_base_url
+                    )
+            return status
+
+        return await asyncio.to_thread(_stop_tunnel)
+    except Exception as exc:
+        _raise_system_http_error(
+            exc,
+            runtime_error_status=400,
+            os_error_status=500,
+        )
+
+
+@router.post("/configs/mcp:reload")
+async def reload_mcp_config(
+    service: McpConfigReloadService = Depends(get_mcp_config_reload_service),
+) -> dict[str, str]:
+    try:
+        await asyncio.to_thread(service.reload_mcp_config)
+        return {"status": "ok"}
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/configs/skills:reload")
+async def reload_skills_config(
+    service: SkillsConfigReloadService = Depends(get_skills_config_reload_service),
+) -> dict[str, str]:
+    try:
+        await asyncio.to_thread(service.reload_skills_config)
+        return {"status": "ok"}
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/configs/hooks")
+async def get_hooks_config(
+    service: HookService = Depends(get_hook_service),
+) -> HooksConfig:
+    return await asyncio.to_thread(service.get_user_config)
+
+
+@router.get("/configs/hooks/runtime")
+async def get_hooks_runtime_view(
+    service: HookService = Depends(get_hook_service),
+) -> HookRuntimeView:
+    return await asyncio.to_thread(service.get_runtime_view)
+
+
+@router.put("/configs/hooks")
+async def save_hooks_config(
+    req: object = Body(...),
+    service: HookService = Depends(get_hook_service),
+) -> HooksConfig:
+    try:
+        return await asyncio.to_thread(service.save_user_config, req)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/configs/hooks:validate")
+async def validate_hooks_config(
+    req: object = Body(...),
+    service: HookService = Depends(get_hook_service),
+) -> dict[str, str]:
+    try:
+        _ = await asyncio.to_thread(service.validate_config, req)
+        return {"status": "ok"}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

@@ -1,0 +1,1116 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import json
+import logging
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import NamedTuple
+
+import aiosqlite
+from pydantic import JsonValue, ValidationError
+
+from relay_teams.logger import get_logger, log_event
+from relay_teams.persistence.db import run_sqlite_write_with_retry
+from relay_teams.persistence.sqlite_repository import (
+    SharedSqliteRepository,
+    async_fetchall,
+    async_fetchone,
+)
+from relay_teams.validation import (
+    parse_persisted_datetime_or_none,
+    require_persisted_identifier,
+)
+from relay_teams.workspace.workspace_models import (
+    WorkspaceMountCapabilities,
+    WorkspaceMountProvider,
+    WorkspaceMountRecord,
+    WorkspacePageSort,
+    WorkspaceLocalMountConfig,
+    WorkspaceRecord,
+    WorkspaceSshMountConfig,
+    WorkspaceProfile,
+    default_mount_capabilities,
+    default_workspace_profile,
+    legacy_workspace_mount_from_profile,
+)
+
+LOGGER = get_logger(__name__)
+
+
+class WorkspacePageRecord(NamedTuple):
+    record: WorkspaceRecord
+    activity_at: str
+
+
+def _workspace_activity_order_expression(prefix: str) -> str:
+    return f"COALESCE(NULLIF({prefix}.updated_at, ''), NULLIF({prefix}.created_at, ''), '')"
+
+
+def _workspace_created_order_expression(prefix: str) -> str:
+    return f"COALESCE(NULLIF({prefix}.created_at, ''), NULLIF({prefix}.updated_at, ''), '')"
+
+
+def _sqlite_datetime_sort_expression(column: str) -> str:
+    return f"CASE WHEN {column} GLOB '????-??-??T??:*' THEN {column} ELSE NULL END"
+
+
+def _workspace_session_activity_expression() -> str:
+    return (
+        "COALESCE("
+        f"{_sqlite_datetime_sort_expression('s.updated_at')}, "
+        f"{_sqlite_datetime_sort_expression('s.created_at')}"
+        ")"
+    )
+
+
+async def _fetch_workspace_activity_rows_async(
+    *,
+    conn: aiosqlite.Connection,
+    limit: int,
+    cursor_activity_at: str | None,
+    cursor_workspace_id: str | None,
+    include_sessions: bool,
+    sort: WorkspacePageSort,
+) -> tuple[sqlite3.Row, ...]:
+    if sort == WorkspacePageSort.ACTIVITY and include_sessions:
+        workspace_activity = _workspace_activity_order_expression("w")
+        session_activity = _workspace_session_activity_expression()
+        base_query = f"""
+            WITH workspace_activity AS (
+                SELECT w.*,
+                    COALESCE(
+                        NULLIF((
+                            SELECT {session_activity}
+                            FROM sessions s
+                            WHERE s.workspace_id = w.workspace_id
+                            ORDER BY {session_activity} DESC, s.session_id DESC
+                            LIMIT 1
+                        ), ''),
+                        {workspace_activity}
+                    )
+                        AS activity_at
+                FROM workspaces w
+            )
+            SELECT * FROM workspace_activity
+            """
+    else:
+        workspace_activity = (
+            _workspace_created_order_expression("workspaces")
+            if sort == WorkspacePageSort.CREATED
+            else _workspace_activity_order_expression("workspaces")
+        )
+        base_query = f"""
+            WITH workspace_activity AS (
+                SELECT *,
+                    {workspace_activity} AS activity_at
+                FROM workspaces
+            )
+            SELECT * FROM workspace_activity
+            """
+    if cursor_activity_at is None or cursor_workspace_id is None:
+        rows = await async_fetchall(
+            conn,
+            f"""
+            {base_query}
+            ORDER BY activity_at DESC, workspace_id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return tuple(rows)
+    rows = await async_fetchall(
+        conn,
+        f"""
+        {base_query}
+        WHERE activity_at < ?
+           OR (activity_at = ? AND workspace_id < ?)
+        ORDER BY activity_at DESC, workspace_id DESC
+        LIMIT ?
+        """,
+        (
+            cursor_activity_at,
+            cursor_activity_at,
+            cursor_workspace_id,
+            limit,
+        ),
+    )
+    return tuple(rows)
+
+
+def _workspace_page_activity_sort_value(row: sqlite3.Row) -> str:
+    return str(row["activity_at"] or "")
+
+
+class WorkspaceRepository(SharedSqliteRepository):
+    def __init__(self, db_path: Path) -> None:
+        super().__init__(db_path)
+        self._init_tables()
+
+    def _init_tables(self) -> None:
+        def operation() -> None:
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS workspaces (
+                    workspace_id TEXT PRIMARY KEY,
+                    root_path TEXT NOT NULL,
+                    backend TEXT NOT NULL,
+                    profile_json TEXT NOT NULL DEFAULT '{}',
+                    default_mount_name TEXT NOT NULL DEFAULT 'default',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            columns = [
+                str(row["name"])
+                for row in self._conn.execute(
+                    "PRAGMA table_info(workspaces)"
+                ).fetchall()
+            ]
+            if "profile_json" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE workspaces ADD COLUMN profile_json TEXT NOT NULL DEFAULT '{}'"
+                )
+            if "default_mount_name" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE workspaces ADD COLUMN default_mount_name TEXT NOT NULL DEFAULT 'default'"
+                )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS workspace_mounts (
+                    workspace_id TEXT NOT NULL,
+                    mount_name TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    provider_config_json TEXT NOT NULL,
+                    working_directory TEXT NOT NULL,
+                    readable_paths_json TEXT NOT NULL,
+                    writable_paths_json TEXT NOT NULL,
+                    capabilities_json TEXT NOT NULL,
+                    branch_name TEXT,
+                    source_root_path TEXT,
+                    forked_from_workspace_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (workspace_id, mount_name)
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_workspace_mounts_workspace
+                ON workspace_mounts(workspace_id)
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_workspaces_created_id
+                ON workspaces(created_at DESC, workspace_id DESC)
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_workspaces_updated_id
+                ON workspaces(updated_at DESC, workspace_id DESC)
+                """
+            )
+            self._migrate_legacy_workspace_rows()
+
+        run_sqlite_write_with_retry(
+            conn=self._conn,
+            db_path=self._db_path,
+            operation=operation,
+            lock=self._lock,
+            repository_name="WorkspaceRepository",
+            operation_name="init_tables",
+        )
+
+    def create(
+        self,
+        *,
+        workspace_id: str,
+        mounts: tuple[WorkspaceMountRecord, ...] | None = None,
+        default_mount_name: str = "default",
+        root_path: Path | None = None,
+        profile: WorkspaceProfile | None = None,
+    ) -> WorkspaceRecord:
+        resolved_mounts = mounts
+        if resolved_mounts is None:
+            if root_path is None:
+                raise ValueError(
+                    "Workspace repository create requires root_path or mounts"
+                )
+            resolved_mounts = (
+                legacy_workspace_mount_from_profile(
+                    root_path=root_path.resolve(),
+                    profile=profile or default_workspace_profile(),
+                    mount_name=default_mount_name,
+                ),
+            )
+        now = datetime.now(tz=timezone.utc).isoformat()
+        record = WorkspaceRecord(
+            workspace_id=workspace_id,
+            default_mount_name=default_mount_name,
+            mounts=resolved_mounts,
+            created_at=datetime.fromisoformat(now),
+            updated_at=datetime.fromisoformat(now),
+        )
+
+        def operation() -> None:
+            self._conn.execute(
+                """
+                INSERT INTO workspaces(
+                    workspace_id,
+                    root_path,
+                    backend,
+                    profile_json,
+                    default_mount_name,
+                    created_at,
+                    updated_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.workspace_id,
+                    record.default_mount.root_reference,
+                    "filesystem",
+                    "{}",
+                    record.default_mount_name,
+                    now,
+                    now,
+                ),
+            )
+            for mount in record.mounts:
+                self._insert_mount_row(
+                    workspace_id=record.workspace_id,
+                    mount=mount,
+                    created_at=now,
+                    updated_at=now,
+                )
+
+        run_sqlite_write_with_retry(
+            conn=self._conn,
+            db_path=self._db_path,
+            operation=operation,
+            lock=self._lock,
+            repository_name="WorkspaceRepository",
+            operation_name="create",
+        )
+        return record
+
+    async def create_async(
+        self,
+        *,
+        workspace_id: str,
+        mounts: tuple[WorkspaceMountRecord, ...] | None = None,
+        default_mount_name: str = "default",
+        root_path: Path | None = None,
+        profile: WorkspaceProfile | None = None,
+    ) -> WorkspaceRecord:
+        resolved_mounts = mounts
+        if resolved_mounts is None:
+            if root_path is None:
+                raise ValueError(
+                    "Workspace repository create requires root_path or mounts"
+                )
+            resolved_mounts = (
+                legacy_workspace_mount_from_profile(
+                    root_path=root_path.resolve(),
+                    profile=profile or default_workspace_profile(),
+                    mount_name=default_mount_name,
+                ),
+            )
+        now = datetime.now(tz=timezone.utc).isoformat()
+        record = WorkspaceRecord(
+            workspace_id=workspace_id,
+            default_mount_name=default_mount_name,
+            mounts=resolved_mounts,
+            created_at=datetime.fromisoformat(now),
+            updated_at=datetime.fromisoformat(now),
+        )
+
+        async def operation(conn: aiosqlite.Connection) -> None:
+            cursor = await conn.execute(
+                """
+                INSERT INTO workspaces(
+                    workspace_id,
+                    root_path,
+                    backend,
+                    profile_json,
+                    default_mount_name,
+                    created_at,
+                    updated_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.workspace_id,
+                    record.default_mount.root_reference,
+                    "filesystem",
+                    "{}",
+                    record.default_mount_name,
+                    now,
+                    now,
+                ),
+            )
+            await cursor.close()
+            for mount in record.mounts:
+                await self._insert_mount_row_async(
+                    conn=conn,
+                    workspace_id=record.workspace_id,
+                    mount=mount,
+                    created_at=now,
+                    updated_at=now,
+                )
+
+        await self._run_async_write(
+            operation_name="create_async",
+            operation=operation,
+        )
+        return record
+
+    def get(self, workspace_id: str) -> WorkspaceRecord:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM workspaces WHERE workspace_id=?",
+                (workspace_id,),
+            ).fetchone()
+            mount_rows = self._conn.execute(
+                """
+                SELECT * FROM workspace_mounts
+                WHERE workspace_id=?
+                ORDER BY
+                    CASE provider
+                        WHEN 'local' THEN 0
+                        WHEN 'ssh' THEN 1
+                        ELSE 2
+                    END ASC,
+                    mount_name ASC
+                """,
+                (workspace_id,),
+            ).fetchall()
+        if row is None:
+            raise KeyError(f"Unknown workspace_id: {workspace_id}")
+        try:
+            return self._to_record(row=row, mount_rows=mount_rows)
+        except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+            _log_invalid_workspace_row(row=row, error=exc)
+            raise KeyError(f"Unknown workspace_id: {workspace_id}") from exc
+
+    async def get_async(self, workspace_id: str) -> WorkspaceRecord:
+        async def operation(conn: aiosqlite.Connection) -> WorkspaceRecord:
+            row = await async_fetchone(
+                conn,
+                "SELECT * FROM workspaces WHERE workspace_id=?",
+                (workspace_id,),
+            )
+            mount_rows = await async_fetchall(
+                conn,
+                """
+                SELECT * FROM workspace_mounts
+                WHERE workspace_id=?
+                ORDER BY
+                    CASE provider
+                        WHEN 'local' THEN 0
+                        WHEN 'ssh' THEN 1
+                        ELSE 2
+                    END ASC,
+                    mount_name ASC
+                """,
+                (workspace_id,),
+            )
+            if row is None:
+                raise KeyError(f"Unknown workspace_id: {workspace_id}")
+            try:
+                return self._to_record(row=row, mount_rows=mount_rows)
+            except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+                _log_invalid_workspace_row(row=row, error=exc)
+                raise KeyError(f"Unknown workspace_id: {workspace_id}") from exc
+
+        return await self._run_async_read(operation)
+
+    def update(
+        self,
+        *,
+        workspace_id: str,
+        mounts: tuple[WorkspaceMountRecord, ...],
+        default_mount_name: str,
+    ) -> WorkspaceRecord:
+        existing = self.get(workspace_id)
+        now = datetime.now(tz=timezone.utc).isoformat()
+        record = WorkspaceRecord(
+            workspace_id=workspace_id,
+            default_mount_name=default_mount_name,
+            mounts=mounts,
+            created_at=existing.created_at,
+            updated_at=datetime.fromisoformat(now),
+        )
+
+        def operation() -> None:
+            updated = self._conn.execute(
+                """
+                UPDATE workspaces
+                SET root_path=?,
+                    backend=?,
+                    profile_json=?,
+                    default_mount_name=?,
+                    updated_at=?
+                WHERE workspace_id=?
+                """,
+                (
+                    record.default_mount.root_reference,
+                    "filesystem",
+                    "{}",
+                    record.default_mount_name,
+                    now,
+                    workspace_id,
+                ),
+            )
+            if updated.rowcount == 0:
+                raise KeyError(f"Unknown workspace_id: {workspace_id}")
+            self._conn.execute(
+                "DELETE FROM workspace_mounts WHERE workspace_id=?",
+                (workspace_id,),
+            )
+            for mount in record.mounts:
+                self._insert_mount_row(
+                    workspace_id=record.workspace_id,
+                    mount=mount,
+                    created_at=existing.created_at.isoformat(),
+                    updated_at=now,
+                )
+
+        run_sqlite_write_with_retry(
+            conn=self._conn,
+            db_path=self._db_path,
+            operation=operation,
+            lock=self._lock,
+            repository_name="WorkspaceRepository",
+            operation_name="update",
+        )
+        return record
+
+    async def update_async(
+        self,
+        *,
+        workspace_id: str,
+        mounts: tuple[WorkspaceMountRecord, ...],
+        default_mount_name: str,
+    ) -> WorkspaceRecord:
+        existing = await self.get_async(workspace_id)
+        now = datetime.now(tz=timezone.utc).isoformat()
+        record = WorkspaceRecord(
+            workspace_id=workspace_id,
+            default_mount_name=default_mount_name,
+            mounts=mounts,
+            created_at=existing.created_at,
+            updated_at=datetime.fromisoformat(now),
+        )
+
+        async def operation(conn: aiosqlite.Connection) -> None:
+            cursor = await conn.execute(
+                """
+                UPDATE workspaces
+                SET root_path=?,
+                    backend=?,
+                    profile_json=?,
+                    default_mount_name=?,
+                    updated_at=?
+                WHERE workspace_id=?
+                """,
+                (
+                    record.default_mount.root_reference,
+                    "filesystem",
+                    "{}",
+                    record.default_mount_name,
+                    now,
+                    workspace_id,
+                ),
+            )
+            rowcount = cursor.rowcount
+            await cursor.close()
+            if rowcount == 0:
+                raise KeyError(f"Unknown workspace_id: {workspace_id}")
+            cursor = await conn.execute(
+                "DELETE FROM workspace_mounts WHERE workspace_id=?",
+                (workspace_id,),
+            )
+            await cursor.close()
+            for mount in record.mounts:
+                await self._insert_mount_row_async(
+                    conn=conn,
+                    workspace_id=record.workspace_id,
+                    mount=mount,
+                    created_at=existing.created_at.isoformat(),
+                    updated_at=now,
+                )
+
+        await self._run_async_write(
+            operation_name="update_async",
+            operation=operation,
+        )
+        return record
+
+    def list_all(self) -> tuple[WorkspaceRecord, ...]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM workspaces ORDER BY created_at DESC"
+            ).fetchall()
+            mount_rows = self._conn.execute(
+                """
+                SELECT * FROM workspace_mounts
+                ORDER BY
+                    workspace_id ASC,
+                    CASE provider
+                        WHEN 'local' THEN 0
+                        WHEN 'ssh' THEN 1
+                        ELSE 2
+                    END ASC,
+                    mount_name ASC
+                """
+            ).fetchall()
+        mounts_by_workspace: dict[str, list[sqlite3.Row]] = {}
+        for row in mount_rows:
+            mounts_by_workspace.setdefault(str(row["workspace_id"]), []).append(row)
+        records: list[WorkspaceRecord] = []
+        for row in rows:
+            try:
+                records.append(
+                    self._to_record(
+                        row=row,
+                        mount_rows=tuple(
+                            mounts_by_workspace.get(str(row["workspace_id"]), [])
+                        ),
+                    )
+                )
+            except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+                _log_invalid_workspace_row(row=row, error=exc)
+        return tuple(records)
+
+    async def list_all_async(self) -> tuple[WorkspaceRecord, ...]:
+        async def operation(conn: aiosqlite.Connection) -> tuple[WorkspaceRecord, ...]:
+            rows = await async_fetchall(
+                conn,
+                "SELECT * FROM workspaces ORDER BY created_at DESC",
+            )
+            mount_rows = await async_fetchall(
+                conn,
+                """
+                SELECT * FROM workspace_mounts
+                ORDER BY
+                    workspace_id ASC,
+                    CASE provider
+                        WHEN 'local' THEN 0
+                        WHEN 'ssh' THEN 1
+                        ELSE 2
+                    END ASC,
+                    mount_name ASC
+                """,
+            )
+            mounts_by_workspace: dict[str, list[sqlite3.Row]] = {}
+            for row in mount_rows:
+                mounts_by_workspace.setdefault(str(row["workspace_id"]), []).append(row)
+            records: list[WorkspaceRecord] = []
+            for row in rows:
+                try:
+                    records.append(
+                        self._to_record(
+                            row=row,
+                            mount_rows=tuple(
+                                mounts_by_workspace.get(str(row["workspace_id"]), [])
+                            ),
+                        )
+                    )
+                except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+                    _log_invalid_workspace_row(row=row, error=exc)
+            return tuple(records)
+
+        return await self._run_async_read(operation)
+
+    async def list_page_async(
+        self,
+        *,
+        limit: int,
+        before_activity_at: datetime | None = None,
+        before_activity_sort_at: str | None = None,
+        before_workspace_id: str | None = None,
+        sort: WorkspacePageSort = WorkspacePageSort.ACTIVITY,
+    ) -> tuple[WorkspacePageRecord, ...]:
+        if before_activity_at is not None and before_activity_sort_at is not None:
+            raise ValueError(
+                "Use either before_activity_at or before_activity_sort_at, not both"
+            )
+        if (before_activity_at is not None or before_activity_sort_at is not None) != (
+            before_workspace_id is not None
+        ):
+            raise ValueError(
+                "Both an activity cursor and before_workspace_id are required "
+                "for paged workspace queries"
+            )
+
+        async def operation(
+            conn: aiosqlite.Connection,
+        ) -> tuple[WorkspacePageRecord, ...]:
+            safe_limit = max(1, int(limit))
+            cursor_activity_at = before_activity_sort_at
+            if cursor_activity_at is None and before_activity_at is not None:
+                cursor_activity_at = before_activity_at.isoformat()
+            session_table_row = await async_fetchone(
+                conn,
+                """
+                SELECT 1
+                FROM sqlite_master
+                WHERE type='table' AND name='sessions'
+                LIMIT 1
+                """,
+            )
+            records: list[WorkspacePageRecord] = []
+            cursor_workspace_id = before_workspace_id
+            while len(records) < safe_limit:
+                requested = safe_limit - len(records)
+                rows = await _fetch_workspace_activity_rows_async(
+                    conn=conn,
+                    limit=requested,
+                    cursor_activity_at=cursor_activity_at,
+                    cursor_workspace_id=cursor_workspace_id,
+                    include_sessions=session_table_row is not None,
+                    sort=sort,
+                )
+                if not rows:
+                    break
+                workspace_ids = tuple(str(row["workspace_id"]) for row in rows)
+                mounts_by_workspace: dict[str, list[sqlite3.Row]] = {}
+                if workspace_ids:
+                    placeholders = ",".join("?" for _ in workspace_ids)
+                    mount_rows = await async_fetchall(
+                        conn,
+                        f"""
+                        SELECT * FROM workspace_mounts
+                        WHERE workspace_id IN ({placeholders})
+                        ORDER BY
+                            workspace_id ASC,
+                            CASE provider
+                                WHEN 'local' THEN 0
+                                WHEN 'ssh' THEN 1
+                                ELSE 2
+                            END ASC,
+                            mount_name ASC
+                        """,
+                        workspace_ids,
+                    )
+                    for row in mount_rows:
+                        mounts_by_workspace.setdefault(
+                            str(row["workspace_id"]),
+                            [],
+                        ).append(row)
+                for row in rows:
+                    try:
+                        record = self._to_record(
+                            row=row,
+                            mount_rows=tuple(
+                                mounts_by_workspace.get(str(row["workspace_id"]), [])
+                            ),
+                        )
+                        records.append(
+                            WorkspacePageRecord(
+                                record=record,
+                                activity_at=_workspace_page_activity_sort_value(row),
+                            )
+                        )
+                    except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+                        _log_invalid_workspace_row(row=row, error=exc)
+                if len(rows) < requested:
+                    break
+                last_row = rows[-1]
+                cursor_activity_at = _workspace_page_activity_sort_value(last_row)
+                cursor_workspace_id = str(last_row["workspace_id"])
+            return tuple(records)
+
+        return await self._run_async_read(operation)
+
+    def delete(self, workspace_id: str) -> None:
+        def operation() -> None:
+            self._conn.execute(
+                "DELETE FROM workspace_mounts WHERE workspace_id=?",
+                (workspace_id,),
+            )
+            self._conn.execute(
+                "DELETE FROM workspaces WHERE workspace_id=?",
+                (workspace_id,),
+            )
+
+        run_sqlite_write_with_retry(
+            conn=self._conn,
+            db_path=self._db_path,
+            operation=operation,
+            lock=self._lock,
+            repository_name="WorkspaceRepository",
+            operation_name="delete",
+        )
+
+    async def delete_async(self, workspace_id: str) -> None:
+        async def operation(conn: aiosqlite.Connection) -> None:
+            cursor = await conn.execute(
+                "DELETE FROM workspace_mounts WHERE workspace_id=?",
+                (workspace_id,),
+            )
+            await cursor.close()
+            cursor = await conn.execute(
+                "DELETE FROM workspaces WHERE workspace_id=?",
+                (workspace_id,),
+            )
+            await cursor.close()
+
+        await self._run_async_write(
+            operation_name="delete_async",
+            operation=operation,
+        )
+
+    def exists(self, workspace_id: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM workspaces WHERE workspace_id=?",
+                (workspace_id,),
+            ).fetchone()
+        return row is not None
+
+    async def exists_async(self, workspace_id: str) -> bool:
+        async def operation(conn: aiosqlite.Connection) -> bool:
+            row = await async_fetchone(
+                conn,
+                "SELECT 1 FROM workspaces WHERE workspace_id=?",
+                (workspace_id,),
+            )
+            return row is not None
+
+        return await self._run_async_read(operation)
+
+    def _insert_mount_row(
+        self,
+        *,
+        workspace_id: str,
+        mount: WorkspaceMountRecord,
+        created_at: str,
+        updated_at: str,
+    ) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO workspace_mounts(
+                workspace_id,
+                mount_name,
+                provider,
+                provider_config_json,
+                working_directory,
+                readable_paths_json,
+                writable_paths_json,
+                capabilities_json,
+                branch_name,
+                source_root_path,
+                forked_from_workspace_id,
+                created_at,
+                updated_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                workspace_id,
+                mount.mount_name,
+                mount.provider.value,
+                json.dumps(
+                    mount.provider_config.model_dump(mode="json"), ensure_ascii=False
+                ),
+                mount.working_directory,
+                json.dumps(list(mount.readable_paths), ensure_ascii=False),
+                json.dumps(list(mount.writable_paths), ensure_ascii=False),
+                json.dumps(
+                    (
+                        mount.capabilities or default_mount_capabilities(mount.provider)
+                    ).model_dump(mode="json"),
+                    ensure_ascii=False,
+                ),
+                mount.branch_name,
+                mount.source_root_path,
+                mount.forked_from_workspace_id,
+                created_at,
+                updated_at,
+            ),
+        )
+
+    @staticmethod
+    async def _insert_mount_row_async(
+        *,
+        conn: aiosqlite.Connection,
+        workspace_id: str,
+        mount: WorkspaceMountRecord,
+        created_at: str,
+        updated_at: str,
+    ) -> None:
+        cursor = await conn.execute(
+            """
+            INSERT INTO workspace_mounts(
+                workspace_id,
+                mount_name,
+                provider,
+                provider_config_json,
+                working_directory,
+                readable_paths_json,
+                writable_paths_json,
+                capabilities_json,
+                branch_name,
+                source_root_path,
+                forked_from_workspace_id,
+                created_at,
+                updated_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                workspace_id,
+                mount.mount_name,
+                mount.provider.value,
+                json.dumps(
+                    mount.provider_config.model_dump(mode="json"), ensure_ascii=False
+                ),
+                mount.working_directory,
+                json.dumps(list(mount.readable_paths), ensure_ascii=False),
+                json.dumps(list(mount.writable_paths), ensure_ascii=False),
+                json.dumps(
+                    (
+                        mount.capabilities or default_mount_capabilities(mount.provider)
+                    ).model_dump(mode="json"),
+                    ensure_ascii=False,
+                ),
+                mount.branch_name,
+                mount.source_root_path,
+                mount.forked_from_workspace_id,
+                created_at,
+                updated_at,
+            ),
+        )
+        await cursor.close()
+
+    def _migrate_legacy_workspace_rows(self) -> None:
+        rows = self._conn.execute("SELECT * FROM workspaces").fetchall()
+        for row in rows:
+            workspace_id = str(row["workspace_id"])
+            mount_row = self._conn.execute(
+                """
+                SELECT 1 FROM workspace_mounts
+                WHERE workspace_id=?
+                LIMIT 1
+                """,
+                (workspace_id,),
+            ).fetchone()
+            if mount_row is not None:
+                continue
+            mount_name = (
+                str(row["default_mount_name"] or "default").strip() or "default"
+            )
+            try:
+                profile_raw = str(row["profile_json"] or "{}")
+                loaded = json.loads(profile_raw)
+                profile = (
+                    WorkspaceProfile.model_validate(loaded)
+                    if isinstance(loaded, dict) and loaded
+                    else default_workspace_profile()
+                )
+                mount = legacy_workspace_mount_from_profile(
+                    root_path=Path(str(row["root_path"])).resolve(),
+                    profile=profile,
+                    mount_name=mount_name,
+                )
+            except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+                _log_invalid_workspace_row(row=row, error=exc)
+                continue
+            created_at = (
+                str(row["created_at"])
+                if str(row["created_at"]).strip()
+                else datetime.now(tz=timezone.utc).isoformat()
+            )
+            updated_at = (
+                str(row["updated_at"]) if str(row["updated_at"]).strip() else created_at
+            )
+            self._insert_mount_row(
+                workspace_id=workspace_id,
+                mount=mount,
+                created_at=created_at,
+                updated_at=updated_at,
+            )
+            self._conn.execute(
+                """
+                UPDATE workspaces
+                SET default_mount_name=?
+                WHERE workspace_id=?
+                """,
+                (mount_name, workspace_id),
+            )
+
+    def _to_record(
+        self,
+        *,
+        row: sqlite3.Row,
+        mount_rows: tuple[sqlite3.Row, ...] | list[sqlite3.Row],
+    ) -> WorkspaceRecord:
+        workspace_id = require_persisted_identifier(
+            row["workspace_id"],
+            field_name="workspace_id",
+        )
+        mounts = tuple(self._to_mount_record(row=item) for item in mount_rows)
+        return WorkspaceRecord(
+            workspace_id=workspace_id,
+            default_mount_name=require_persisted_identifier(
+                row["default_mount_name"],
+                field_name="default_mount_name",
+            ),
+            mounts=mounts,
+            created_at=_require_workspace_timestamp(
+                row=row,
+                workspace_id=workspace_id,
+                field_name="created_at",
+            ),
+            updated_at=_require_workspace_timestamp(
+                row=row,
+                workspace_id=workspace_id,
+                field_name="updated_at",
+            ),
+        )
+
+    @staticmethod
+    def _to_mount_record(*, row: sqlite3.Row) -> WorkspaceMountRecord:
+        provider = WorkspaceMountProvider(str(row["provider"]))
+        provider_config_loaded = json.loads(str(row["provider_config_json"] or "{}"))
+        if provider == WorkspaceMountProvider.LOCAL:
+            provider_config = WorkspaceLocalMountConfig.model_validate(
+                provider_config_loaded
+            )
+        else:
+            provider_config = WorkspaceSshMountConfig.model_validate(
+                provider_config_loaded
+            )
+        readable_paths = tuple(
+            str(item)
+            for item in json.loads(str(row["readable_paths_json"] or "[]"))
+            if str(item).strip()
+        )
+        writable_paths = tuple(
+            str(item)
+            for item in json.loads(str(row["writable_paths_json"] or "[]"))
+            if str(item).strip()
+        )
+        capabilities = _normalize_mount_capabilities(
+            provider=provider,
+            capabilities_loaded=json.loads(str(row["capabilities_json"] or "{}")),
+        )
+        return WorkspaceMountRecord(
+            mount_name=require_persisted_identifier(
+                row["mount_name"],
+                field_name="mount_name",
+            ),
+            provider=provider,
+            provider_config=provider_config,
+            working_directory=str(row["working_directory"] or "."),
+            readable_paths=readable_paths or (".",),
+            writable_paths=writable_paths or (".",),
+            capabilities=capabilities,
+            branch_name=_normalize_optional_text(row["branch_name"]),
+            source_root_path=_normalize_optional_text(row["source_root_path"]),
+            forked_from_workspace_id=_normalize_optional_identifier(
+                row["forked_from_workspace_id"]
+            ),
+        )
+
+
+def _normalize_mount_capabilities(
+    *,
+    provider: WorkspaceMountProvider,
+    capabilities_loaded: object,
+) -> WorkspaceMountCapabilities:
+    capabilities = (
+        WorkspaceMountCapabilities.model_validate(capabilities_loaded)
+        if isinstance(capabilities_loaded, dict) and capabilities_loaded
+        else default_mount_capabilities(provider)
+    )
+    if (
+        provider == WorkspaceMountProvider.SSH
+        and capabilities.can_diff != default_mount_capabilities(provider).can_diff
+    ):
+        return capabilities.model_copy(update={"can_diff": True})
+    return capabilities
+
+
+def _normalize_optional_text(value: object) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def _normalize_optional_identifier(value: object) -> str | None:
+    normalized = _normalize_optional_text(value)
+    if normalized is None:
+        return None
+    return require_persisted_identifier(
+        normalized,
+        field_name="forked_from_workspace_id",
+    )
+
+
+def _require_workspace_timestamp(
+    *,
+    row: sqlite3.Row,
+    workspace_id: str,
+    field_name: str,
+) -> datetime:
+    parsed = parse_persisted_datetime_or_none(row[field_name])
+    if parsed is not None:
+        return parsed
+    _log_invalid_workspace_timestamp(
+        workspace_id=workspace_id,
+        field_name=field_name,
+        raw_preview=_persisted_value_preview(row[field_name]),
+    )
+    raise ValueError(f"Invalid persisted {field_name}")
+
+
+def _persisted_value_preview(value: object) -> str:
+    if value is None:
+        return "<null>"
+    return str(value)[:200]
+
+
+def _log_invalid_workspace_timestamp(
+    *,
+    workspace_id: str,
+    field_name: str,
+    raw_preview: str,
+) -> None:
+    payload: dict[str, JsonValue] = {
+        "workspace_id": workspace_id,
+        "field_name": field_name,
+        "raw_preview": raw_preview,
+    }
+    log_event(
+        LOGGER,
+        logging.WARNING,
+        event="workspace.repository.timestamp_invalid",
+        message="Invalid persisted workspace timestamp",
+        payload=payload,
+    )
+
+
+def _log_invalid_workspace_row(*, row: sqlite3.Row, error: Exception) -> None:
+    payload: dict[str, JsonValue] = {
+        "workspace_id": _persisted_value_preview(row["workspace_id"]),
+        "created_at": _persisted_value_preview(row["created_at"]),
+        "updated_at": _persisted_value_preview(row["updated_at"]),
+        "error_type": type(error).__name__,
+        "error": str(error),
+    }
+    log_event(
+        LOGGER,
+        logging.WARNING,
+        event="workspace.repository.row_invalid",
+        message="Skipping invalid persisted workspace row",
+        payload=payload,
+    )

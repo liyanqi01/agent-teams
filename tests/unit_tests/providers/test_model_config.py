@@ -1,0 +1,121 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from relay_teams.providers.model_config import (
+    CodeAgentAuthMethod,
+    CodeAgentAuthConfig,
+    MaaSAuthConfig,
+    MASKED_MODEL_PASSWORD,
+    ModelAuthSource,
+    ModelEndpointConfig,
+    ProviderType,
+    SpeechRealtimeConfig,
+    is_masked_model_password,
+)
+
+
+def test_codeagent_auth_with_secret_owner_copies_private_metadata() -> None:
+    auth_config = CodeAgentAuthConfig(refresh_token="refresh-token")
+
+    copied = auth_config.with_secret_owner(
+        config_dir=Path("C:/tmp/.agent-teams"),
+        owner_id="codeagent-profile",
+    )
+
+    assert copied is not auth_config
+    assert copied._secret_config_dir == Path("C:/tmp/.agent-teams")
+    assert copied._secret_owner_id == "codeagent-profile"
+    assert auth_config._secret_config_dir is None
+    assert auth_config._secret_owner_id is None
+
+
+def test_is_masked_model_password_accepts_current_and_legacy_masks() -> None:
+    assert is_masked_model_password(MASKED_MODEL_PASSWORD) is True
+    assert is_masked_model_password("***") is True
+    assert is_masked_model_password("relay-password") is False
+
+
+def test_model_endpoint_config_requires_maas_auth() -> None:
+    with pytest.raises(
+        ValueError,
+        match="MAAS model endpoint config requires maas_auth configuration.",
+    ):
+        ModelEndpointConfig(
+            provider=ProviderType.MAAS,
+            model="maas-chat",
+            base_url="https://maas.example/api/v2",
+        )
+
+
+def test_model_endpoint_config_requires_maas_password() -> None:
+    with pytest.raises(
+        ValueError,
+        match="MAAS model endpoint config requires maas_auth.username and maas_auth.password.",
+    ):
+        ModelEndpointConfig(
+            provider=ProviderType.MAAS,
+            model="maas-chat",
+            base_url="https://maas.example/api/v2",
+            maas_auth=MaaSAuthConfig(username="relay-user"),
+        )
+
+
+def test_model_endpoint_config_requires_codeagent_password_fields() -> None:
+    with pytest.raises(
+        ValueError,
+        match="CodeAgent model endpoint config requires codeagent_auth.username and codeagent_auth.password for password auth.",
+    ):
+        ModelEndpointConfig(
+            provider=ProviderType.CODEAGENT,
+            model="codeagent-chat",
+            base_url="https://codeagent.example/codeAgentPro",
+            codeagent_auth=CodeAgentAuthConfig(
+                auth_method=CodeAgentAuthMethod.PASSWORD,
+                username="relay-user",
+            ),
+        )
+
+
+def test_model_endpoint_config_accepts_w3_auth_source_without_profile_password() -> (
+    None
+):
+    maas_config = ModelEndpointConfig(
+        provider=ProviderType.MAAS,
+        model="maas-chat",
+        base_url="https://maas.example/api/v2",
+        maas_auth=MaaSAuthConfig(auth_source=ModelAuthSource.W3),
+    )
+    codeagent_config = ModelEndpointConfig(
+        provider=ProviderType.CODEAGENT,
+        model="codeagent-chat",
+        base_url="https://codeagent.example/codeAgentPro",
+        codeagent_auth=CodeAgentAuthConfig(
+            auth_method=CodeAgentAuthMethod.PASSWORD,
+            auth_source=ModelAuthSource.W3,
+        ),
+    )
+
+    assert maas_config.maas_auth is not None
+    assert maas_config.maas_auth.auth_source == ModelAuthSource.W3
+    assert codeagent_config.codeagent_auth is not None
+    assert codeagent_config.codeagent_auth.auth_source == ModelAuthSource.W3
+
+
+def test_speech_realtime_config_normalizes_blank_optional_fields() -> None:
+    config = SpeechRealtimeConfig(
+        websocket_url_template=" ",
+        model=" qwen3-omni-flash-realtime ",
+        send_openai_beta_header=False,
+    )
+
+    assert config.websocket_url_template is None
+    assert config.model == "qwen3-omni-flash-realtime"
+    assert config.send_openai_beta_header is False
+
+
+def test_speech_realtime_config_rejects_non_string_optional_text() -> None:
+    with pytest.raises(ValueError):
+        SpeechRealtimeConfig.model_validate({"websocket_url_template": 123})

@@ -1,17 +1,36 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 import json
 from pathlib import Path
+import sqlite3
+import threading
 from typing import cast
 
-from pydantic_ai.messages import ModelRequest, ToolReturnPart, UserPromptPart
+import pytest
+from pydantic_ai.messages import (
+    ImageUrl,
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ToolCallPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
 
-from agent_teams.agents.execution.message_repository import MessageRepository
-from agent_teams.sessions.session_history_marker_repository import (
+from relay_teams.agents.execution.message_repository import (
+    MessageRepository,
+    _is_system_reminder_projection_message,
+)
+from relay_teams.agents.execution import message_repository as message_repo_module
+from relay_teams.reminders import render_system_reminder
+from relay_teams.sessions.session_history_marker_repository import (
     SessionHistoryMarkerRepository,
 )
-from agent_teams.workspace import build_conversation_id
+from relay_teams.workspace import build_conversation_id
 
 
 def test_message_repo_sanitizes_stale_task_status_error_on_read(tmp_path: Path) -> None:
@@ -24,19 +43,30 @@ def test_message_repo_sanitizes_stale_task_status_error_on_read(tmp_path: Path) 
         task_id="task-1",
         trace_id="run-1",
         messages=[
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="orch_dispatch_task",
+                        args={"task": "ask_time"},
+                        tool_call_id="orch_dispatch_task:1",
+                    )
+                ]
+            ),
             ModelRequest(
                 parts=[
                     ToolReturnPart(
-                        tool_name="dispatch_task",
-                        tool_call_id="dispatch_task:1",
+                        tool_name="orch_dispatch_task",
+                        tool_call_id="orch_dispatch_task:1",
                         content={"ok": True},
                     )
                 ]
-            )
+            ),
         ],
     )
 
-    row = repo._conn.execute("SELECT id, message_json FROM messages").fetchone()
+    row = repo._conn.execute(
+        "SELECT id, message_json FROM messages WHERE role='user'"
+    ).fetchone()
     assert row is not None
     payload = json.loads(str(row["message_json"]))
     tool_return = payload[0]["parts"][0]["content"]
@@ -60,7 +90,7 @@ def test_message_repo_sanitizes_stale_task_status_error_on_read(tmp_path: Path) 
     repo._conn.commit()
 
     messages = repo.get_messages_by_session("session-1")
-    message = cast(dict[str, object], messages[0]["message"])
+    message = cast(dict[str, object], messages[1]["message"])
     parts = cast(list[object], message["parts"])
     part = cast(dict[str, object], parts[0])
     content = cast(dict[str, object], part["content"])
@@ -72,12 +102,96 @@ def test_message_repo_sanitizes_stale_task_status_error_on_read(tmp_path: Path) 
     assert "error" not in task_status
 
     history = repo.get_history("inst-1")
-    history_part = history[0].parts[0]
+    history_part = history[1].parts[0]
     assert isinstance(history_part, ToolReturnPart)
     assert isinstance(history_part.content, dict)
-    history_task_status = history_part.content["data"]["task_status"]["ask_time"]
+    history_content = cast(dict[str, object], history_part.content)
+    history_data = cast(dict[str, object], history_content["data"])
+    history_task_status_map = cast(dict[str, object], history_data["task_status"])
+    history_task_status = cast(dict[str, object], history_task_status_map["ask_time"])
     assert history_task_status["status"] == "completed"
     assert "error" not in history_task_status
+
+
+def test_validated_history_skips_rows_outside_safe_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "message_repo_safe_boundary.db"
+    repo = MessageRepository(db_path)
+    repo.append(
+        session_id="session-1",
+        workspace_id="default",
+        conversation_id="conversation-1",
+        agent_role_id="time",
+        instance_id="inst-1",
+        task_id="task-1",
+        trace_id="run-1",
+        messages=[
+            ModelRequest(parts=[UserPromptPart(content="keep")]),
+            ModelRequest(parts=[UserPromptPart(content="drop")]),
+        ],
+    )
+    rows = tuple(repo._conn.execute("SELECT id, message_json FROM messages").fetchall())
+    assert len(rows) == 2
+    first_id = rows[0]["id"]
+    assert isinstance(first_id, int)
+
+    def safe_first_row_only(_rows: Sequence[sqlite3.Row]) -> set[int]:
+        return {first_id}
+
+    def validate_row(row: sqlite3.Row) -> list[ModelMessage]:
+        return [ModelRequest(parts=[UserPromptPart(content=f"row-{row['id']}")])]
+
+    monkeypatch.setattr(message_repo_module, "_safe_row_ids", safe_first_row_only)
+    monkeypatch.setattr(message_repo_module, "_validate_message_row", validate_row)
+
+    history = message_repo_module._validated_history_from_rows(rows)
+
+    assert len(history) == 1
+    assert isinstance(history[0], ModelRequest)
+    assert history[0].parts[0].content == f"row-{first_id}"
+
+
+@pytest.mark.asyncio
+async def test_async_history_replay_validation_does_not_block_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "message_repo_async_replay.db"
+    repo = MessageRepository(db_path)
+    message_count = 30
+    repo.append(
+        session_id="session-1",
+        workspace_id="default",
+        conversation_id="conversation-1",
+        agent_role_id="time",
+        instance_id="inst-1",
+        task_id="task-1",
+        trace_id="run-1",
+        messages=[
+            ModelRequest(parts=[UserPromptPart(content=f"query {index}")])
+            for index in range(message_count)
+        ],
+    )
+    main_thread_id = threading.get_ident()
+    validator_thread_ids: set[int] = set()
+
+    def validate_message_row(_row: sqlite3.Row) -> list[ModelMessage]:
+        validator_thread_ids.add(threading.get_ident())
+        return [ModelRequest(parts=[UserPromptPart(content="validated")])]
+
+    monkeypatch.setattr(
+        message_repo_module,
+        "_validate_message_row",
+        validate_message_row,
+    )
+
+    history = await repo.get_history_for_conversation_async("conversation-1")
+
+    assert len(history) == message_count
+    assert validator_thread_ids
+    assert main_thread_id not in validator_thread_ids
 
 
 def test_message_repo_hides_duplicate_task_objective_messages(tmp_path: Path) -> None:
@@ -103,6 +217,187 @@ def test_message_repo_hides_duplicate_task_objective_messages(tmp_path: Path) ->
     messages = repo.get_messages_by_session("session-1")
 
     assert len(messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_message_repo_returns_latest_task_message_id(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "message_repo_latest_task_message.db"
+    repo = MessageRepository(db_path)
+
+    repo.append(
+        session_id="session-1",
+        workspace_id="default",
+        conversation_id="conversation-1",
+        agent_role_id="time",
+        instance_id="inst-1",
+        task_id="task-1",
+        trace_id="run-1",
+        messages=[ModelRequest(parts=[UserPromptPart(content="first")])],
+    )
+    repo.append(
+        session_id="session-1",
+        workspace_id="default",
+        conversation_id="conversation-1",
+        agent_role_id="time",
+        instance_id="inst-2",
+        task_id="task-1",
+        trace_id="run-1",
+        messages=[ModelResponse(parts=[TextPart(content="other instance")])],
+    )
+    repo.append(
+        session_id="session-1",
+        workspace_id="default",
+        conversation_id="conversation-1",
+        agent_role_id="time",
+        instance_id="inst-1",
+        task_id="task-1",
+        trace_id="run-1",
+        messages=[ModelResponse(parts=[TextPart(content="latest")])],
+    )
+
+    latest_for_task = await repo.get_latest_task_message_id_async(task_id="task-1")
+    latest_for_instance = await repo.get_latest_task_message_id_async(
+        task_id="task-1",
+        instance_id="inst-1",
+    )
+    missing = await repo.get_latest_task_message_id_async(task_id="missing")
+
+    assert latest_for_task == 3
+    assert latest_for_instance == 3
+    assert missing == 0
+
+
+@pytest.mark.asyncio
+async def test_message_repo_lists_messages_by_session_run_ids(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "message_repo_session_run_ids.db"
+    repo = MessageRepository(db_path)
+    reminder = render_system_reminder("Check todos.")
+
+    repo.append(
+        session_id="session-1",
+        workspace_id="default",
+        conversation_id="conversation-1",
+        agent_role_id="time",
+        instance_id="inst-1",
+        task_id="task-1",
+        trace_id="run-1",
+        messages=[ModelRequest(parts=[UserPromptPart(content="query time")])],
+    )
+    repo.append_user_prompt_if_missing(
+        session_id="session-1",
+        workspace_id="default",
+        conversation_id="conversation-1",
+        agent_role_id="time",
+        instance_id="inst-1",
+        task_id="task-2",
+        trace_id="run-2",
+        content=reminder,
+    )
+    repo.append(
+        session_id="session-2",
+        workspace_id="default",
+        instance_id="inst-2",
+        task_id="task-3",
+        trace_id="run-1",
+        messages=[ModelRequest(parts=[UserPromptPart(content="other session")])],
+    )
+
+    empty_messages = repo.get_messages_by_session_run_ids(
+        "session-1",
+        ("", "   "),
+    )
+    messages = await repo.get_messages_by_session_run_ids_async(
+        "session-1",
+        ("run-1", "run-2", "run-1"),
+    )
+
+    assert empty_messages == []
+    assert [message["trace_id"] for message in messages] == ["run-1"]
+    payload = cast(dict[str, object], messages[0]["message"])
+    parts = cast(list[dict[str, object]], payload["parts"])
+    assert parts[0]["content"] == "query time"
+
+
+def test_message_repo_filters_system_reminders_from_public_message_reads(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "message_repo_system_reminder.db"
+    repo = MessageRepository(db_path)
+    reminder = render_system_reminder("Check todos.")
+    repo.append(
+        session_id="session-1",
+        workspace_id="default",
+        conversation_id="conversation-1",
+        agent_role_id="time",
+        instance_id="inst-1",
+        task_id="task-1",
+        trace_id="run-1",
+        messages=[ModelRequest(parts=[UserPromptPart(content="query time")])],
+    )
+    repo.append_user_prompt_if_missing(
+        session_id="session-1",
+        workspace_id="default",
+        conversation_id="conversation-1",
+        agent_role_id="time",
+        instance_id="inst-1",
+        task_id="task-1",
+        trace_id="run-1",
+        content=reminder,
+    )
+
+    session_messages = repo.get_messages_by_session("session-1")
+    user_messages = repo.get_user_messages_by_session("session-1")
+    instance_messages = repo.get_messages_for_instance("session-1", "inst-1")
+    history = repo.get_history_for_conversation("conversation-1")
+
+    assert len(session_messages) == 1
+    assert len(user_messages) == 1
+    assert len(instance_messages) == 1
+    assert len(history) == 2
+    assert isinstance(history[-1], ModelRequest)
+    assert history[-1].parts[0].content == reminder
+
+
+def test_message_repo_keeps_user_authored_system_reminder_wrappers(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "message_repo_user_system_reminder.db"
+    repo = MessageRepository(db_path)
+    content = "<system-reminder>\nQuoted docs.\n</system-reminder>"
+    repo.append(
+        session_id="session-1",
+        workspace_id="default",
+        conversation_id="conversation-1",
+        agent_role_id="time",
+        instance_id="inst-1",
+        task_id="task-1",
+        trace_id="run-1",
+        messages=[ModelRequest(parts=[UserPromptPart(content=content)])],
+    )
+
+    messages = repo.get_messages_by_session("session-1")
+    message = messages[0]["message"]
+
+    assert len(messages) == 1
+    assert isinstance(message, dict)
+    parts = message["parts"]
+    assert isinstance(parts, list)
+    first_part = parts[0]
+    assert isinstance(first_part, dict)
+    assert first_part.get("content") == content
+
+
+def test_system_reminder_projection_filter_rejects_non_prompt_shapes() -> None:
+    assert not _is_system_reminder_projection_message(object())
+    assert not _is_system_reminder_projection_message({"parts": []})
+    assert not _is_system_reminder_projection_message({"parts": [object()]})
+    assert not _is_system_reminder_projection_message(
+        {"parts": [{"part_kind": "system-prompt", "content": "system"}]}
+    )
 
 
 def test_append_user_prompt_if_missing_dedupes_only_tail_prompt(tmp_path: Path) -> None:
@@ -132,6 +427,51 @@ def test_append_user_prompt_if_missing_dedupes_only_tail_prompt(tmp_path: Path) 
     assert len(history) == 1
     assert isinstance(history[0], ModelRequest)
     assert history[0].parts[0].content == "query time"
+
+
+def test_append_user_prompt_if_missing_dedupes_structured_prompt_content(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "message_repo_structured_prompt.db"
+    repo = MessageRepository(db_path)
+    prompt_content = (
+        "describe this image",
+        ImageUrl(
+            url="/api/sessions/session-1/media/asset-1/file",
+            media_type="image/png",
+        ),
+    )
+
+    inserted_first = repo.append_user_prompt_if_missing(
+        session_id="session-1",
+        workspace_id="default",
+        instance_id="inst-1",
+        task_id="task-1",
+        trace_id="run-1",
+        content=prompt_content,
+    )
+    inserted_second = repo.append_user_prompt_if_missing(
+        session_id="session-1",
+        workspace_id="default",
+        instance_id="inst-1",
+        task_id="task-1",
+        trace_id="run-1",
+        content=prompt_content,
+    )
+
+    assert inserted_first is True
+    assert inserted_second is False
+    history = repo.get_history_for_task("inst-1", "task-1")
+    assert len(history) == 1
+    assert isinstance(history[0], ModelRequest)
+    prompt_part = history[0].parts[0]
+    assert isinstance(prompt_part, UserPromptPart)
+    assert isinstance(prompt_part.content, list)
+    assert prompt_part.content[0] == "describe this image"
+    assert prompt_part.content[1] == ImageUrl(
+        url="/api/sessions/session-1/media/asset-1/file",
+        media_type="image/png",
+    )
 
 
 def test_conversation_history_can_span_multiple_instances(tmp_path: Path) -> None:
@@ -170,6 +510,345 @@ def test_conversation_history_can_span_multiple_instances(tmp_path: Path) -> Non
     assert history[1].parts[0].content == "second turn"
 
 
+def test_message_repo_drops_duplicate_late_tool_return_but_keeps_user_prompt(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "message_repo_duplicate_tool_return.db"
+    repo = MessageRepository(db_path)
+    conversation_id = build_conversation_id("session-1", "time")
+
+    repo.append(
+        session_id="session-1",
+        workspace_id="default",
+        conversation_id=conversation_id,
+        agent_role_id="time",
+        instance_id="inst-1",
+        task_id="task-1",
+        trace_id="run-1",
+        messages=[
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="write",
+                        args={"content": "hello"},
+                        tool_call_id="call-1",
+                    )
+                ]
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name="write",
+                        tool_call_id="call-1",
+                        content={"ok": True},
+                    )
+                ]
+            ),
+        ],
+    )
+    repo.append(
+        session_id="session-1",
+        workspace_id="default",
+        conversation_id=conversation_id,
+        agent_role_id="time",
+        instance_id="inst-1",
+        task_id="task-1",
+        trace_id="run-1",
+        messages=[
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name="write",
+                        tool_call_id="call-1",
+                        content={"ok": True},
+                    ),
+                    UserPromptPart(content="optimize it"),
+                ]
+            )
+        ],
+    )
+
+    history = repo.get_history_for_conversation(conversation_id)
+
+    assert len(history) == 3
+    assert isinstance(history[0], ModelResponse)
+    assert isinstance(history[1], ModelRequest)
+    assert isinstance(history[1].parts[0], ToolReturnPart)
+    assert isinstance(history[2], ModelRequest)
+    assert len(history[2].parts) == 1
+    assert isinstance(history[2].parts[0], UserPromptPart)
+    assert history[2].parts[0].content == "optimize it"
+
+
+def test_message_repo_drops_duplicate_late_tool_pair_from_reads(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "message_repo_duplicate_tool_pair.db"
+    repo = MessageRepository(db_path)
+    conversation_id = build_conversation_id("session-1", "time")
+
+    repo.append(
+        session_id="session-1",
+        workspace_id="default",
+        conversation_id=conversation_id,
+        agent_role_id="time",
+        instance_id="inst-1",
+        task_id="task-1",
+        trace_id="run-1",
+        messages=[
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="shell",
+                        args={"command": "pwd"},
+                        tool_call_id="call-1",
+                    )
+                ]
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name="shell",
+                        tool_call_id="call-1",
+                        content={"ok": True, "data": "/workspace"},
+                    )
+                ]
+            ),
+            ModelResponse(parts=[TextPart(content="/workspace")]),
+        ],
+    )
+    repo.append(
+        session_id="session-1",
+        workspace_id="default",
+        conversation_id=conversation_id,
+        agent_role_id="time",
+        instance_id="inst-1",
+        task_id="task-1",
+        trace_id="run-1",
+        messages=[
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="shell",
+                        args={"command": "pwd"},
+                        tool_call_id="call-1",
+                    )
+                ]
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name="shell",
+                        tool_call_id="call-1",
+                        content={"ok": True, "data": "/workspace"},
+                    )
+                ]
+            ),
+        ],
+    )
+
+    history = repo.get_history_for_conversation(conversation_id)
+    projected = repo.get_messages_by_session("session-1")
+    projected_with_hidden = repo.get_messages_by_session(
+        "session-1",
+        include_hidden_from_context=True,
+    )
+    projected_by_run_with_hidden = repo.get_messages_by_session_run_ids(
+        "session-1",
+        ("run-1",),
+        include_hidden_from_context=True,
+    )
+
+    assert len(history) == 3
+    assert isinstance(history[0], ModelResponse)
+    assert isinstance(history[0].parts[0], ToolCallPart)
+    assert isinstance(history[1], ModelRequest)
+    assert isinstance(history[1].parts[0], ToolReturnPart)
+    assert isinstance(history[2], ModelResponse)
+    assert isinstance(history[2].parts[0], TextPart)
+    assert len(projected) == 3
+    assert len(projected_with_hidden) == 3
+    assert len(projected_by_run_with_hidden) == 3
+
+
+def test_message_repo_keeps_reused_tool_call_id_for_new_tool_occurrence(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "message_repo_reused_tool_call_id.db"
+    repo = MessageRepository(db_path)
+    conversation_id = build_conversation_id("session-1", "time")
+
+    repo.append(
+        session_id="session-1",
+        workspace_id="default",
+        conversation_id=conversation_id,
+        agent_role_id="time",
+        instance_id="inst-1",
+        task_id="task-1",
+        trace_id="run-1",
+        messages=[
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="shell",
+                        args={"command": "pwd"},
+                        tool_call_id="call-1",
+                    )
+                ]
+            )
+        ],
+    )
+    repo.append(
+        session_id="session-1",
+        workspace_id="default",
+        conversation_id=conversation_id,
+        agent_role_id="time",
+        instance_id="inst-1",
+        task_id="task-1",
+        trace_id="run-1",
+        messages=[
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name="shell",
+                        tool_call_id="call-1",
+                        content="/workspace/agent-teams",
+                    )
+                ]
+            )
+        ],
+    )
+    repo.append(
+        session_id="session-1",
+        workspace_id="default",
+        conversation_id=conversation_id,
+        agent_role_id="time",
+        instance_id="inst-1",
+        task_id="task-1",
+        trace_id="run-1",
+        messages=[
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="shell",
+                        args={"command": "cd .. && pwd"},
+                        tool_call_id="call-1",
+                    )
+                ]
+            )
+        ],
+    )
+    repo.append(
+        session_id="session-1",
+        workspace_id="default",
+        conversation_id=conversation_id,
+        agent_role_id="time",
+        instance_id="inst-1",
+        task_id="task-1",
+        trace_id="run-1",
+        messages=[
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name="shell",
+                        tool_call_id="call-1",
+                        content="/workspace",
+                    )
+                ]
+            )
+        ],
+    )
+
+    history = repo.get_history_for_conversation(conversation_id)
+
+    assert len(history) == 4
+    assert isinstance(history[0], ModelResponse)
+    assert isinstance(history[0].parts[0], ToolCallPart)
+    assert history[0].parts[0].args == {"command": "pwd"}
+    assert isinstance(history[1], ModelRequest)
+    assert isinstance(history[1].parts[0], ToolReturnPart)
+    assert isinstance(history[2], ModelResponse)
+    assert isinstance(history[2].parts[0], ToolCallPart)
+    assert history[2].parts[0].args == {"command": "cd .. && pwd"}
+    assert isinstance(history[3], ModelRequest)
+    assert isinstance(history[3].parts[0], ToolReturnPart)
+
+
+def test_message_repo_drops_orphan_tool_return_request_from_history(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "message_repo_orphan_tool_return.db"
+    repo = MessageRepository(db_path)
+    conversation_id = build_conversation_id("session-1", "time")
+
+    repo.append(
+        session_id="session-1",
+        workspace_id="default",
+        conversation_id=conversation_id,
+        agent_role_id="time",
+        instance_id="inst-1",
+        task_id="task-1",
+        trace_id="run-1",
+        messages=[
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name="write",
+                        tool_call_id="call-missing",
+                        content={"ok": False},
+                    )
+                ]
+            ),
+            ModelRequest(parts=[UserPromptPart(content="continue")]),
+        ],
+    )
+
+    history = repo.get_history_for_conversation(conversation_id)
+
+    assert len(history) == 1
+    assert isinstance(history[0], ModelRequest)
+    assert isinstance(history[0].parts[0], UserPromptPart)
+    assert history[0].parts[0].content == "continue"
+
+
+def test_message_repo_skips_invalid_history_rows(tmp_path: Path) -> None:
+    db_path = tmp_path / "message_repo_invalid_row.db"
+    repo = MessageRepository(db_path)
+    repo.append(
+        session_id="session-1",
+        workspace_id="default",
+        instance_id="inst-1",
+        task_id="task-1",
+        trace_id="run-1",
+        messages=[ModelRequest(parts=[UserPromptPart(content="continue")])],
+    )
+    repo._conn.execute(
+        "INSERT INTO messages(session_id, workspace_id, conversation_id, agent_role_id, instance_id, task_id, trace_id, role, message_json, created_at) "
+        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "session-1",
+            "default",
+            "inst-1",
+            "time",
+            "inst-1",
+            "task-1",
+            "run-1",
+            "assistant",
+            "{not valid json",
+            "2026-03-07T10:00:01+00:00",
+        ),
+    )
+    repo._conn.commit()
+
+    history = repo.get_history("inst-1")
+
+    assert len(history) == 1
+    assert isinstance(history[0], ModelRequest)
+    assert isinstance(history[0].parts[0], UserPromptPart)
+    assert history[0].parts[0].content == "continue"
+
+
+@pytest.mark.timeout(15)
 def test_message_repo_append_is_thread_safe_under_parallel_writes(
     tmp_path: Path,
 ) -> None:
@@ -191,11 +870,107 @@ def test_message_repo_append_is_thread_safe_under_parallel_writes(
     with ThreadPoolExecutor(max_workers=8) as pool:
         futures = [pool.submit(_write, i) for i in range(200)]
         for future in futures:
-            future.result()
+            future.result(timeout=10)
 
     row = repo._conn.execute("SELECT COUNT(*) AS c FROM messages").fetchone()
     assert row is not None
     assert int(row["c"]) == 200
+
+
+def test_message_repo_first_append_after_restart_preserves_created_at_order(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "message_repo_restart_created_at.db"
+    repo = MessageRepository(db_path)
+    repo.append(
+        session_id="session-1",
+        workspace_id="default",
+        instance_id="inst-1",
+        task_id="task-1",
+        trace_id="run-1",
+        messages=[ModelRequest(parts=[UserPromptPart(content="existing")])],
+    )
+    persisted_created_at = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    repo._conn.execute(
+        "UPDATE messages SET created_at=? WHERE session_id=?",
+        (persisted_created_at.isoformat(), "session-1"),
+    )
+    repo._conn.commit()
+
+    restarted_repo = MessageRepository(db_path)
+    restarted_repo.append(
+        session_id="session-1",
+        workspace_id="default",
+        instance_id="inst-1",
+        task_id="task-2",
+        trace_id="run-2",
+        messages=[ModelRequest(parts=[UserPromptPart(content="after restart")])],
+    )
+
+    rows = restarted_repo._conn.execute(
+        "SELECT created_at FROM messages WHERE session_id=? ORDER BY id ASC",
+        ("session-1",),
+    ).fetchall()
+    created_at_values = [datetime.fromisoformat(str(row["created_at"])) for row in rows]
+
+    assert len(created_at_values) == 2
+    assert created_at_values[1] > created_at_values[0]
+
+
+def test_message_repo_normalizes_repaired_tool_call_args_before_persist(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "message_repo_tool_args.db"
+    repo = MessageRepository(db_path)
+
+    repo.append(
+        session_id="session-1",
+        workspace_id="default",
+        instance_id="inst-1",
+        task_id="task-1",
+        trace_id="run-1",
+        messages=[
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="shell",
+                        args=(
+                            '{"command":"python -c \\"print(\\\'hello\\\')\\""'
+                            ',"background":true,"yield_time_ms":null,'
+                            '"timeout_ms":null,"workdir":null,"tty":false}'
+                        ),
+                        tool_call_id="call-1",
+                    )
+                ]
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name="shell",
+                        tool_call_id="call-1",
+                        content={"ok": True},
+                    )
+                ]
+            ),
+        ],
+    )
+
+    history = repo.get_history("inst-1")
+
+    assert len(history) == 2
+    stored_response = history[0]
+    assert isinstance(stored_response, ModelResponse)
+    stored_tool_call = stored_response.parts[0]
+    assert isinstance(stored_tool_call, ToolCallPart)
+    assert isinstance(stored_tool_call.args, str)
+    assert json.loads(stored_tool_call.args) == {
+        "command": "python -c \"print('hello')\"",
+        "background": True,
+        "yield_time_ms": None,
+        "timeout_ms": None,
+        "workdir": None,
+        "tty": False,
+    }
 
 
 def test_message_repo_filters_active_segment_after_clear_marker(tmp_path: Path) -> None:
@@ -244,7 +1019,48 @@ def test_message_repo_filters_active_segment_after_clear_marker(tmp_path: Path) 
     assert active_history_part.content == "after clear"
 
 
-def test_compact_conversation_history_preserves_pre_clear_messages(
+def test_message_repo_returns_user_messages_for_timeline_after_clear_marker(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "message_repo_user_messages_timeline.db"
+    marker_repo = SessionHistoryMarkerRepository(db_path)
+    repo = MessageRepository(
+        db_path,
+        session_history_marker_repo=marker_repo,
+    )
+
+    repo.append(
+        session_id="session-1",
+        workspace_id="default",
+        instance_id="inst-1",
+        task_id="task-1",
+        trace_id="run-1",
+        messages=[ModelRequest(parts=[UserPromptPart(content="before clear")])],
+    )
+    marker_repo.create_clear_marker("session-1")
+    repo.append(
+        session_id="session-1",
+        workspace_id="default",
+        instance_id="inst-2",
+        task_id="task-2",
+        trace_id="run-2",
+        messages=[ModelRequest(parts=[UserPromptPart(content="after clear")])],
+    )
+
+    active_messages = repo.get_user_messages_by_session("session-1")
+    all_messages = repo.get_user_messages_by_session(
+        "session-1",
+        include_cleared=True,
+    )
+
+    assert [message["trace_id"] for message in active_messages] == ["run-2"]
+    assert [message["trace_id"] for message in all_messages] == ["run-1", "run-2"]
+    payload = cast(dict[str, object], active_messages[0]["message"])
+    parts = cast(list[dict[str, object]], payload["parts"])
+    assert parts[0]["content"] == "after clear"
+
+
+def test_compact_conversation_history_marks_messages_hidden_from_context(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "message_repo_compaction_markers.db"
@@ -282,11 +1098,23 @@ def test_compact_conversation_history_preserves_pre_clear_messages(
 
     repo.compact_conversation_history(conversation_id, keep_message_count=1)
 
-    all_messages = repo.get_messages_by_session("session-1", include_cleared=True)
+    raw_messages = repo.get_messages_by_session(
+        "session-1",
+        include_cleared=True,
+        include_hidden_from_context=True,
+    )
     active_history = repo.get_history_for_conversation(conversation_id)
 
-    assert len(all_messages) == 2
+    assert len(raw_messages) == 4
     assert len(active_history) == 1
     final_history_part = active_history[0].parts[0]
     assert isinstance(final_history_part, UserPromptPart)
     assert final_history_part.content == "post-clear-3"
+    hidden_messages = [
+        message for message in raw_messages if message["hidden_from_context"]
+    ]
+    assert len(hidden_messages) == 2
+    hidden_reasons = {
+        cast(str, message["hidden_reason"]) for message in hidden_messages
+    }
+    assert hidden_reasons == {"compaction"}

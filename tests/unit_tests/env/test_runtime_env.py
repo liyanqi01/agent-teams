@@ -3,12 +3,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agent_teams.env import runtime_env
+from relay_teams.env import runtime_env
 
 
 def test_load_merged_env_vars_reads_app_env_file(tmp_path: Path) -> None:
     user_home = tmp_path / "home"
-    app_env_dir = user_home / ".agent-teams"
+    app_env_dir = user_home / ".relay-teams"
     app_env_dir.mkdir(parents=True)
     (app_env_dir / ".env").write_text(
         "APP_ONLY=one\nSHARED_KEY=app\n", encoding="utf-8"
@@ -27,7 +27,7 @@ def test_load_merged_env_vars_reads_secret_backed_app_env_values(
     tmp_path: Path,
 ) -> None:
     user_home = tmp_path / "home"
-    app_env_dir = user_home / ".agent-teams"
+    app_env_dir = user_home / ".relay-teams"
     app_env_dir.mkdir(parents=True)
     (app_env_dir / ".env").write_text("APP_ONLY=one\n", encoding="utf-8")
     (app_env_dir / "secrets.json").write_text(
@@ -57,12 +57,49 @@ def test_load_merged_env_vars_reads_secret_backed_app_env_values(
     assert merged["OPENAI_API_KEY"] == "secret-key"
 
 
+def test_sync_app_env_to_process_env_reads_secret_backed_values(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    config_dir = tmp_path / ".relay-teams"
+    config_dir.mkdir(parents=True)
+    env_file = config_dir / ".env"
+    env_file.write_text("APP_ONLY=one\n", encoding="utf-8")
+    (config_dir / "secrets.json").write_text(
+        (
+            "{\n"
+            '  "version": 1,\n'
+            '  "entries": [\n'
+            "    {\n"
+            '      "namespace": "app_env",\n'
+            '      "owner_id": "app",\n'
+            '      "field_name": "OPENAI_API_KEY",\n'
+            '      "storage": "file",\n'
+            '      "value": "secret-key"\n'
+            "    }\n"
+            "  ]\n"
+            "}\n"
+        ),
+        encoding="utf-8",
+    )
+    runtime_env.PROCESS_ENV_BASELINE.clear()
+    runtime_env.SYNCED_APP_ENV_KEYS.clear()
+    monkeypatch.delenv("APP_ONLY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    synced = runtime_env.sync_app_env_to_process_env(env_file)
+
+    assert synced == {"APP_ONLY": "one", "OPENAI_API_KEY": "secret-key"}
+    assert runtime_env.os.environ["APP_ONLY"] == "one"
+    assert runtime_env.os.environ["OPENAI_API_KEY"] == "secret-key"
+
+
 def test_get_env_var_process_env_has_highest_priority(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     user_home = tmp_path / "home"
-    app_env_dir = user_home / ".agent-teams"
+    app_env_dir = user_home / ".relay-teams"
     app_env_dir.mkdir(parents=True)
     (app_env_dir / ".env").write_text("ENV_KEY=app\n", encoding="utf-8")
     monkeypatch.setenv("ENV_KEY", "process")
@@ -87,6 +124,22 @@ def test_load_env_file_ignores_invalid_lines_and_strips_quotes(tmp_path: Path) -
     assert values == {"A": "1", "B": "two", "C": "three"}
 
 
+def test_load_env_file_does_not_resolve_path(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("A=1\n", encoding="utf-8")
+
+    def _raise_resolve(_self: Path, strict: bool = False) -> Path:
+        _ = strict
+        raise AssertionError("load_env_file should not resolve the path")
+
+    monkeypatch.setattr(Path, "resolve", _raise_resolve)
+
+    assert runtime_env.load_env_file(env_file) == {"A": "1"}
+
+
 def test_get_env_var_returns_default_when_missing(tmp_path: Path) -> None:
     user_home = tmp_path / "home"
 
@@ -101,7 +154,7 @@ def test_get_env_var_returns_default_when_missing(tmp_path: Path) -> None:
 
 
 def test_get_app_env_file_path_uses_app_config_dir(monkeypatch, tmp_path: Path) -> None:
-    config_dir = tmp_path.resolve() / ".agent-teams"
+    config_dir = tmp_path.resolve() / ".relay-teams"
     monkeypatch.setattr(runtime_env, "get_app_config_dir", lambda **kwargs: config_dir)
 
     env_file_path = runtime_env.get_app_env_file_path()
@@ -113,11 +166,11 @@ def test_sync_app_env_to_process_env_applies_and_removes_managed_keys(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    env_file = tmp_path / ".agent-teams" / ".env"
+    env_file = tmp_path / ".relay-teams" / ".env"
     env_file.parent.mkdir(parents=True)
     env_file.write_text("SYNCED_KEY=from-file\n", encoding="utf-8")
-    monkeypatch.setattr(runtime_env, "_PROCESS_ENV_BASELINE", {})
-    monkeypatch.setattr(runtime_env, "_SYNCED_APP_ENV_KEYS", set())
+    runtime_env.PROCESS_ENV_BASELINE.clear()
+    runtime_env.SYNCED_APP_ENV_KEYS.clear()
     monkeypatch.delenv("SYNCED_KEY", raising=False)
 
     synced_env = runtime_env.sync_app_env_to_process_env(env_file)
@@ -135,11 +188,12 @@ def test_sync_app_env_to_process_env_restores_baseline_values(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    env_file = tmp_path / ".agent-teams" / ".env"
+    env_file = tmp_path / ".relay-teams" / ".env"
     env_file.parent.mkdir(parents=True)
     env_file.write_text("RESTORE_KEY=overlay\n", encoding="utf-8")
-    monkeypatch.setattr(runtime_env, "_PROCESS_ENV_BASELINE", {"RESTORE_KEY": "base"})
-    monkeypatch.setattr(runtime_env, "_SYNCED_APP_ENV_KEYS", set())
+    runtime_env.PROCESS_ENV_BASELINE.clear()
+    runtime_env.PROCESS_ENV_BASELINE["RESTORE_KEY"] = "base"
+    runtime_env.SYNCED_APP_ENV_KEYS.clear()
     monkeypatch.setenv("RESTORE_KEY", "base")
 
     runtime_env.sync_app_env_to_process_env(env_file)

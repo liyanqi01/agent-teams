@@ -1,0 +1,236 @@
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+import json
+import time
+
+import httpx
+from pydantic import BaseModel, ConfigDict
+import pytest
+
+from relay_teams.agents.orchestration.delegation_planning import AUTO_PLANNER_NODE_ID
+
+from integration_tests.support.api_helpers import (
+    create_run,
+    create_session,
+    new_session_id,
+    stream_run_until_terminal,
+)
+from integration_tests.support.environment import IntegrationEnvironment
+
+
+class _BenchmarkResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    duration_seconds: float
+    terminal_event_type: str
+    completed_tasks: int
+    output_text: str
+
+
+def test_orchestration_parallel_same_role_clone_completes_via_api(
+    api_client: httpx.Client,
+) -> None:
+    result = _run_orchestration_clone_benchmark(
+        api_client,
+        mode="parallel",
+        task_count=3,
+        delay_ms=50,
+    )
+
+    assert result.terminal_event_type == "run_completed"
+    assert result.completed_tasks == 3
+    assert "[fake-llm] orchestration clone benchmark completed" in str(
+        result.output_text
+    )
+
+
+@pytest.mark.skip(reason="Timing-sensitive; unreliable on shared CI runners")
+@pytest.mark.timeout(120)
+def test_concurrent_sessions_share_llm_http_concurrency_budget(
+    api_client: httpx.Client,
+    integration_env: IntegrationEnvironment,
+) -> None:
+    slow_session_id = create_session(
+        api_client,
+        session_id=new_session_id("concurrent-slow-session"),
+    )
+    slow_run_id = create_run(
+        api_client,
+        session_id=slow_session_id,
+        execution_mode="ai",
+        intent="[slow-stream-hold ms=10000] keep one primary run active.",
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        slow_future = executor.submit(
+            _stream_run_with_new_client,
+            integration_env.api_base_url,
+            slow_run_id,
+        )
+        _wait_for_fake_llm_active(integration_env, minimum_active=1)
+        result = _run_orchestration_clone_benchmark(
+            api_client,
+            mode="parallel",
+            task_count=5,
+            delay_ms=900,
+        )
+        slow_events = slow_future.result(timeout=60.0)
+
+    health_response = api_client.get("/api/system/health")
+    health_response.raise_for_status()
+    metrics = _get_fake_llm_metrics(integration_env)
+    max_active = _metric_int(metrics, "max_active_chat_completions")
+
+    assert result.terminal_event_type == "run_completed"
+    assert result.completed_tasks == 5
+    assert str(slow_events[-1].get("event_type") or "") == "run_completed"
+    assert max_active == 4
+
+
+@pytest.mark.skip(reason="Timing-sensitive; unreliable on shared CI runners")
+@pytest.mark.timeout(90)
+def test_orchestration_parallel_clone_endpoint_is_faster_than_serial(
+    api_client: httpx.Client,
+) -> None:
+    delay_ms = 500
+    serial = _run_orchestration_clone_benchmark(
+        api_client,
+        mode="serial",
+        task_count=5,
+        delay_ms=delay_ms,
+    )
+    parallel = _run_orchestration_clone_benchmark(
+        api_client,
+        mode="parallel",
+        task_count=5,
+        delay_ms=delay_ms,
+    )
+    saved_seconds = serial.duration_seconds - parallel.duration_seconds
+    summary = json.dumps(
+        {
+            "serial_seconds": serial.duration_seconds,
+            "parallel_seconds": parallel.duration_seconds,
+            "saved_seconds": saved_seconds,
+        },
+        sort_keys=True,
+    )
+
+    assert serial.terminal_event_type == "run_completed"
+    assert parallel.terminal_event_type == "run_completed"
+    assert serial.completed_tasks == 5
+    assert parallel.completed_tasks == 5
+    assert parallel.duration_seconds < serial.duration_seconds, summary
+    assert saved_seconds >= delay_ms / 1000.0, summary
+
+
+def _run_orchestration_clone_benchmark(
+    client: httpx.Client,
+    *,
+    mode: str,
+    task_count: int,
+    delay_ms: int,
+) -> _BenchmarkResult:
+    session_id = create_session(
+        client,
+        session_id=new_session_id(f"orch-clone-{mode}"),
+    )
+    topology_response = client.patch(
+        f"/api/sessions/{session_id}/topology",
+        json={"session_mode": "orchestration"},
+    )
+    topology_response.raise_for_status()
+    run_id = create_run(
+        client,
+        session_id=session_id,
+        execution_mode="ai",
+        yolo=True,
+        intent=(
+            f"[orch-clone-bench {mode} count={task_count} delay={delay_ms}] "
+            "Create and dispatch same-role benchmark tasks."
+        ),
+    )
+    started_at = time.perf_counter()
+    events = stream_run_until_terminal(client, run_id=run_id, timeout_seconds=120.0)
+    duration_seconds = time.perf_counter() - started_at
+    terminal_event = events[-1]
+    tasks_response = client.get(f"/api/tasks/runs/{run_id}")
+    tasks_response.raise_for_status()
+    task_items = tasks_response.json().get("tasks")
+    if not isinstance(task_items, list):
+        raise AssertionError(f"Invalid task list response: {tasks_response.json()}")
+    completed_tasks = [
+        task
+        for task in task_items
+        if isinstance(task, dict)
+        and task.get("status") == "completed"
+        and task.get("orchestration_node_id") != AUTO_PLANNER_NODE_ID
+    ]
+    return _BenchmarkResult(
+        duration_seconds=duration_seconds,
+        terminal_event_type=str(terminal_event.get("event_type") or ""),
+        completed_tasks=len(completed_tasks),
+        output_text=_text_output(events),
+    )
+
+
+def _text_output(events: list[dict[str, object]]) -> str:
+    parts: list[str] = []
+    for event in events:
+        if str(event.get("event_type") or "") != "text_delta":
+            continue
+        payload = json.loads(str(event.get("payload_json") or "{}"))
+        parts.append(str(payload.get("text") or ""))
+    return "".join(parts)
+
+
+def _stream_run_with_new_client(
+    base_url: str,
+    run_id: str,
+) -> list[dict[str, object]]:
+    with httpx.Client(base_url=base_url, timeout=120.0, trust_env=False) as client:
+        return stream_run_until_terminal(
+            client,
+            run_id=run_id,
+            timeout_seconds=120.0,
+        )
+
+
+def _wait_for_fake_llm_active(
+    integration_env: IntegrationEnvironment,
+    *,
+    minimum_active: int,
+    timeout_seconds: float = 15.0,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        metrics = _get_fake_llm_metrics(integration_env)
+        active = _metric_int(metrics, "active_chat_completions")
+        if active >= minimum_active:
+            return
+        time.sleep(0.05)
+    raise AssertionError("Timed out waiting for fake LLM active request")
+
+
+def _get_fake_llm_metrics(
+    integration_env: IntegrationEnvironment,
+) -> dict[str, object]:
+    response = httpx.get(
+        f"{integration_env.fake_llm_admin_url}/metrics",
+        timeout=5.0,
+        trust_env=False,
+    )
+    response.raise_for_status()
+    body = response.json()
+    if not isinstance(body, dict):
+        raise AssertionError(f"Invalid fake LLM metrics response: {body}")
+    return body
+
+
+def _metric_int(metrics: dict[str, object], key: str) -> int:
+    value = metrics.get(key)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        return int(value)
+    raise AssertionError(f"Invalid fake LLM metric {key}: {value}")

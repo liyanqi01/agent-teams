@@ -1,45 +1,290 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncIterator, Callable
+from concurrent.futures import ThreadPoolExecutor
+import logging
+from pathlib import Path
+import threading
+import time
+from types import SimpleNamespace
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import httpx
 
-from agent_teams.interfaces.server.deps import get_session_service
-from agent_teams.interfaces.server.routers import sessions
-from agent_teams.providers import AgentTokenSummary, RunTokenUsage, SessionTokenUsage
-from agent_teams.sessions.session_models import SessionMode, SessionRecord
+import pytest
+
+from relay_teams.interfaces.server.deps import (
+    get_model_config_service,
+    get_session_service,
+)
+from relay_teams.interfaces.server.routers import sessions, system
+from relay_teams.providers import AgentTokenSummary, RunTokenUsage, SessionTokenUsage
+from relay_teams.roles import SystemRolesUnavailableError
+from relay_teams.sessions.runs.enums import RunEventType
+from relay_teams.sessions.runs.run_models import RunEvent
+from relay_teams.sessions.session_models import (
+    SessionCreateMetadata,
+    SessionMetadataPatch,
+    SessionMode,
+    SessionRecord,
+    SessionSidebarRecord,
+)
+from relay_teams.sessions.session_read_models import (
+    SessionSnapshotCacheDiagnostics,
+    SessionSubagentsSnapshotResponse,
+    utc_now,
+)
 
 
 class _FakeSessionService:
     def __init__(self) -> None:
-        self.updated_calls: list[tuple[str, dict[str, str]]] = []
+        self.created_calls: list[
+            tuple[str | None, str, str | None, dict[str, str] | None]
+        ] = []
+        self.list_calls = 0
+        self.get_calls: list[str] = []
+        self.updated_calls: list[tuple[str, SessionMetadataPatch]] = []
+        self.terminal_view_calls: list[str] = []
         self.topology_update_calls: list[tuple[str, str, str | None, str | None]] = []
-        self.reflection_refresh_calls: list[tuple[str, str]] = []
-        self.reflection_update_calls: list[tuple[str, str, str]] = []
-        self.reflection_delete_calls: list[tuple[str, str]] = []
+        self.normal_model_profile_update_calls: list[tuple[str, str | None]] = []
+        self.delete_subagent_calls: list[tuple[str, str]] = []
+        self.create_session_error: Exception | None = None
         self.raise_missing = False
+        self.raise_missing = False
+        self.deleted_calls: list[tuple[str, bool, bool]] = []
+        self.delete_error: Exception | None = None
+        self.raise_missing_list_agents = False
+        self.raise_missing_list_subagents = False
+        self.raise_missing_subagent_stream = False
+        self.subagent_stream_calls: list[tuple[str, int]] = []
+        self.sessions_force_refresh_calls: list[bool] = []
+        self.rounds_force_refresh_calls: list[bool] = []
+        self.recovery_force_refresh_calls: list[bool] = []
+        self.agents_force_refresh_calls: list[bool] = []
+        self.subagents_force_refresh_calls: list[bool] = []
+        self.tasks_force_refresh_calls: list[bool] = []
+        self.token_usage_force_refresh_calls: list[bool] = []
+        self.delete_subagent_error: Exception | None = None
 
-    def update_session(self, session_id: str, metadata: dict[str, str]) -> None:
-        if self.raise_missing:
-            raise KeyError(session_id)
-        self.updated_calls.append((session_id, metadata))
-
-    def create_session(  # pragma: no cover
+    def create_session(
         self,
         *,
         session_id: str | None = None,
         workspace_id: str,
+        normal_model_profile: str | None = None,
         metadata: dict[str, str] | None = None,
     ) -> SessionRecord:
-        raise AssertionError("not used")
+        if self.create_session_error is not None:
+            raise self.create_session_error
+        self.created_calls.append(
+            (session_id, workspace_id, normal_model_profile, metadata)
+        )
+        return SessionRecord(
+            session_id=session_id or "session-created",
+            workspace_id=workspace_id,
+            normal_model_profile=normal_model_profile,
+            metadata={} if metadata is None else dict(metadata),
+        )
 
-    def list_sessions(self) -> tuple[SessionRecord, ...]:  # pragma: no cover
-        raise AssertionError("not used")
+    async def create_session_async(
+        self,
+        *,
+        session_id: str | None = None,
+        workspace_id: str,
+        normal_model_profile: str | None = None,
+        metadata: dict[str, str] | None = None,
+    ) -> SessionRecord:
+        return self.create_session(
+            session_id=session_id,
+            workspace_id=workspace_id,
+            normal_model_profile=normal_model_profile,
+            metadata=metadata,
+        )
 
-    def get_session(self, session_id: str) -> SessionRecord:  # pragma: no cover
-        raise AssertionError(f"not used: {session_id}")
+    def update_session(self, session_id: str, patch: SessionMetadataPatch) -> None:
+        if self.raise_missing:
+            raise KeyError(session_id)
+        self.updated_calls.append((session_id, patch))
 
-    def delete_session(self, session_id: str) -> None:  # pragma: no cover
-        raise AssertionError(f"not used: {session_id}")
+    async def update_session_async(
+        self, session_id: str, patch: SessionMetadataPatch
+    ) -> None:
+        self.update_session(session_id, patch)
+
+    def mark_latest_terminal_run_viewed(self, session_id: str) -> None:
+        if self.raise_missing:
+            raise KeyError(session_id)
+        self.terminal_view_calls.append(session_id)
+
+    async def mark_latest_terminal_run_viewed_async(self, session_id: str) -> None:
+        self.mark_latest_terminal_run_viewed(session_id)
+
+    def list_sessions(self) -> tuple[SessionRecord, ...]:
+        self.list_calls += 1
+        return (SessionRecord(session_id="session-listed", workspace_id="default"),)
+
+    async def list_sessions_async(
+        self,
+        *,
+        force_refresh: bool = False,
+    ) -> tuple[SessionRecord, ...]:
+        self.sessions_force_refresh_calls.append(force_refresh)
+        return self.list_sessions()
+
+    async def list_sidebar_sessions_async(
+        self,
+        *,
+        force_refresh: bool = False,
+    ) -> tuple[SessionSidebarRecord, ...]:
+        self.sessions_force_refresh_calls.append(force_refresh)
+        return tuple(
+            SessionSidebarRecord.from_session_record(record)
+            for record in self.list_sessions()
+        )
+
+    def list_normal_mode_subagents(
+        self, session_id: str
+    ) -> tuple[dict[str, object], ...]:
+        if self.raise_missing_list_subagents:
+            raise KeyError(session_id)
+        return (
+            {
+                "instance_id": "inst-subagent-1",
+                "role_id": "Explorer",
+                "run_id": "subagent_run_123",
+                "title": "Explore issue",
+                "status": "completed",
+                "run_status": "running",
+                "run_phase": "running",
+                "last_event_id": 12,
+                "checkpoint_event_id": 8,
+                "stream_connected": True,
+                "conversation_id": "conv_session_1_explorer_inst_subagent_1",
+            },
+        )
+
+    def list_agents_in_session(self, session_id: str) -> tuple[dict[str, object], ...]:
+        if self.raise_missing_list_agents:
+            raise KeyError(session_id)
+        return (
+            {
+                "instance_id": "inst-coordinator-1",
+                "role_id": "Coordinator",
+                "run_id": "run_123",
+                "status": "completed",
+                "conversation_id": "conv_session_1_coordinator_inst_coordinator_1",
+            },
+        )
+
+    async def list_normal_mode_subagents_async(
+        self, session_id: str
+    ) -> tuple[dict[str, object], ...]:
+        return self.list_normal_mode_subagents(session_id)
+
+    async def list_session_subagents_async(
+        self,
+        session_id: str,
+        *,
+        force_refresh: bool = False,
+    ) -> tuple[dict[str, object], ...]:
+        self.subagents_force_refresh_calls.append(force_refresh)
+        return self.list_normal_mode_subagents(session_id)
+
+    async def list_session_subagents_snapshot_async(
+        self,
+        session_id: str,
+        *,
+        force_refresh: bool = False,
+    ) -> SessionSubagentsSnapshotResponse:
+        _ = force_refresh
+        return SessionSubagentsSnapshotResponse(
+            session_id=session_id,
+            items=list(self.list_normal_mode_subagents(session_id)),
+            cache=SessionSnapshotCacheDiagnostics(
+                cache_hit=True,
+                stale=False,
+                dirty=False,
+                snapshot_age_ms=0,
+                refresh_duration_ms=1,
+                refresh_in_progress=False,
+                generated_at=utc_now(),
+            ),
+        )
+
+    async def list_agents_in_session_async(
+        self,
+        session_id: str,
+        *,
+        force_refresh: bool = False,
+    ) -> tuple[dict[str, object], ...]:
+        self.agents_force_refresh_calls.append(force_refresh)
+        return self.list_agents_in_session(session_id)
+
+    async def stream_normal_mode_subagent_events(
+        self,
+        session_id: str,
+        *,
+        after_event_id: int = 0,
+    ) -> AsyncIterator[RunEvent]:
+        self.subagent_stream_calls.append((session_id, after_event_id))
+        if self.raise_missing_subagent_stream:
+            raise KeyError(session_id)
+        yield RunEvent(
+            session_id=session_id,
+            run_id="subagent_run_123",
+            trace_id="subagent_run_123",
+            instance_id="inst-subagent-1",
+            event_type=RunEventType.MODEL_STEP_STARTED,
+            payload_json="{}",
+            event_id=after_event_id + 1,
+        )
+
+    def get_session(self, session_id: str) -> SessionRecord:
+        if self.raise_missing:
+            raise KeyError(session_id)
+        self.get_calls.append(session_id)
+        return SessionRecord(session_id=session_id, workspace_id="default")
+
+    async def get_session_async(self, session_id: str) -> SessionRecord:
+        return self.get_session(session_id)
+
+    def delete_session(
+        self,
+        session_id: str,
+        *,
+        force: bool = False,
+        cascade: bool = False,
+    ) -> None:
+        if self.delete_error is not None:
+            raise self.delete_error
+        self.deleted_calls.append((session_id, force, cascade))
+
+    async def delete_session_async(
+        self,
+        session_id: str,
+        *,
+        force: bool = False,
+        cascade: bool = False,
+    ) -> None:
+        self.delete_session(session_id, force=force, cascade=cascade)
+
+    def delete_normal_mode_subagent(
+        self,
+        session_id: str,
+        instance_id: str,
+    ) -> None:
+        if self.delete_subagent_error is not None:
+            raise self.delete_subagent_error
+        self.delete_subagent_calls.append((session_id, instance_id))
+
+    async def delete_normal_mode_subagent_async(
+        self,
+        session_id: str,
+        instance_id: str,
+    ) -> None:
+        self.delete_normal_mode_subagent(session_id, instance_id)
 
     def update_session_topology(
         self,
@@ -65,6 +310,36 @@ class _FakeSessionService:
             orchestration_preset_id=orchestration_preset_id,
         )
 
+    async def update_session_topology_async(
+        self,
+        session_id: str,
+        *,
+        session_mode: SessionMode,
+        normal_root_role_id: str | None,
+        orchestration_preset_id: str | None,
+    ) -> SessionRecord:
+        return self.update_session_topology(
+            session_id,
+            session_mode=session_mode,
+            normal_root_role_id=normal_root_role_id,
+            orchestration_preset_id=orchestration_preset_id,
+        )
+
+    async def update_session_normal_model_profile_async(
+        self,
+        session_id: str,
+        *,
+        normal_model_profile: str | None,
+    ) -> SessionRecord:
+        self.normal_model_profile_update_calls.append(
+            (session_id, normal_model_profile)
+        )
+        return SessionRecord(
+            session_id=session_id,
+            workspace_id="workspace-1",
+            normal_model_profile=normal_model_profile,
+        )
+
     def get_token_usage_by_session(self, session_id: str) -> SessionTokenUsage:
         return SessionTokenUsage(
             session_id=session_id,
@@ -81,14 +356,122 @@ class _FakeSessionService:
                     role_id="coordinator",
                     input_tokens=120,
                     cached_input_tokens=48,
+                    latest_input_tokens=44,
+                    max_input_tokens=64,
                     output_tokens=30,
                     reasoning_output_tokens=9,
                     total_tokens=150,
                     requests=3,
                     tool_calls=1,
+                    context_window=1_000_000,
+                    model_profile="gpt-4.1",
                 )
             },
         )
+
+    async def get_token_usage_by_session_async(
+        self,
+        session_id: str,
+        *,
+        force_refresh: bool = False,
+    ) -> SessionTokenUsage:
+        self.token_usage_force_refresh_calls.append(force_refresh)
+        return self.get_token_usage_by_session(session_id)
+
+    def get_session_rounds(
+        self,
+        session_id: str,
+        *,
+        limit: int,
+        cursor_run_id: str | None,
+        timeline: bool = False,
+        summary: bool = False,
+    ) -> dict[str, object]:
+        return {
+            "session_id": session_id,
+            "limit": limit,
+            "cursor_run_id": cursor_run_id,
+            "timeline": timeline,
+            "summary": summary,
+            "rounds": [],
+        }
+
+    async def get_session_rounds_async(
+        self,
+        session_id: str,
+        *,
+        limit: int,
+        cursor_run_id: str | None,
+        timeline: bool = False,
+        summary: bool = False,
+        force_refresh: bool = False,
+    ) -> dict[str, object]:
+        self.rounds_force_refresh_calls.append(force_refresh)
+        return self.get_session_rounds(
+            session_id,
+            limit=limit,
+            cursor_run_id=cursor_run_id,
+            timeline=timeline,
+            summary=summary,
+        )
+
+    def get_recovery_snapshot(self, session_id: str) -> dict[str, object]:
+        return {"session_id": session_id, "runs": []}
+
+    async def get_recovery_snapshot_async(
+        self,
+        session_id: str,
+        *,
+        force_refresh: bool = False,
+    ) -> dict[str, object]:
+        self.recovery_force_refresh_calls.append(force_refresh)
+        return self.get_recovery_snapshot(session_id)
+
+    def get_round(self, session_id: str, run_id: str) -> dict[str, object]:
+        return {"session_id": session_id, "run_id": run_id}
+
+    async def get_round_async(self, session_id: str, run_id: str) -> dict[str, object]:
+        return self.get_round(session_id, run_id)
+
+    def get_global_events(self, session_id: str) -> list[dict[str, object]]:
+        return [{"session_id": session_id, "event": "created"}]
+
+    async def get_global_events_async(self, session_id: str) -> list[dict[str, object]]:
+        return self.get_global_events(session_id)
+
+    def get_session_messages(self, session_id: str) -> list[dict[str, object]]:
+        return [{"session_id": session_id, "message": "hello"}]
+
+    async def get_session_messages_async(
+        self, session_id: str
+    ) -> list[dict[str, object]]:
+        return self.get_session_messages(session_id)
+
+    def get_agent_messages(
+        self,
+        session_id: str,
+        instance_id: str,
+    ) -> list[dict[str, object]]:
+        return [{"session_id": session_id, "instance_id": instance_id}]
+
+    async def get_agent_messages_async(
+        self,
+        session_id: str,
+        instance_id: str,
+    ) -> list[dict[str, object]]:
+        return self.get_agent_messages(session_id, instance_id)
+
+    def get_session_tasks(self, session_id: str) -> list[dict[str, object]]:
+        return [{"session_id": session_id, "task": "task-1"}]
+
+    async def get_session_tasks_async(
+        self,
+        session_id: str,
+        *,
+        force_refresh: bool = False,
+    ) -> list[dict[str, object]]:
+        self.tasks_force_refresh_calls.append(force_refresh)
+        return self.get_session_tasks(session_id)
 
     def get_token_usage_by_run(self, run_id: str) -> RunTokenUsage:
         return RunTokenUsage(
@@ -106,76 +489,133 @@ class _FakeSessionService:
                     role_id="coordinator",
                     input_tokens=44,
                     cached_input_tokens=12,
+                    latest_input_tokens=22,
+                    max_input_tokens=28,
                     output_tokens=10,
                     reasoning_output_tokens=4,
                     total_tokens=54,
                     requests=2,
                     tool_calls=0,
+                    context_window=1_000_000,
+                    model_profile="gpt-4.1",
                 )
             ],
         )
 
-    def get_agent_reflection(
-        self, session_id: str, instance_id: str
-    ) -> dict[str, object]:
-        return {
-            "session_id": session_id,
-            "instance_id": instance_id,
-            "role_id": "writer",
-            "summary": "Use concise drafts.",
-            "updated_at": "2026-03-13T00:01:30Z",
-            "source": "stored",
-        }
+    async def get_token_usage_by_run_async(self, run_id: str) -> RunTokenUsage:
+        return self.get_token_usage_by_run(run_id)
 
-    async def refresh_subagent_reflection(
-        self, session_id: str, instance_id: str
-    ) -> dict[str, object]:
-        self.reflection_refresh_calls.append((session_id, instance_id))
-        return {
-            "session_id": session_id,
-            "instance_id": instance_id,
-            "role_id": "writer",
-            "summary": "Use concise drafts.",
-            "updated_at": "2026-03-13T00:02:00Z",
-            "source": "manual",
-        }
 
-    def update_agent_reflection(
+class _SleepingRecoveryService(_FakeSessionService):
+    def get_recovery_snapshot(self, session_id: str) -> dict[str, object]:
+        time.sleep(0.2)
+        return {"session_id": session_id, "runs": []}
+
+    async def get_recovery_snapshot_async(
         self,
         session_id: str,
-        instance_id: str,
         *,
-        summary: str,
+        force_refresh: bool = False,
     ) -> dict[str, object]:
-        self.reflection_update_calls.append((session_id, instance_id, summary))
-        return {
-            "session_id": session_id,
-            "instance_id": instance_id,
-            "role_id": "writer",
-            "summary": summary,
-            "updated_at": "2026-03-13T00:03:00Z",
-            "source": "manual_edit",
-        }
+        _ = force_refresh
+        return await asyncio.to_thread(self.get_recovery_snapshot, session_id)
 
-    def delete_agent_reflection(
-        self, session_id: str, instance_id: str
+
+class _BlockingRecoveryService(_FakeSessionService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def get_recovery_snapshot(self, session_id: str) -> dict[str, object]:
+        self.started.set()
+        _ = self.release.wait(timeout=5.0)
+        return {"session_id": session_id, "runs": []}
+
+    async def get_recovery_snapshot_async(
+        self,
+        session_id: str,
+        *,
+        force_refresh: bool = False,
     ) -> dict[str, object]:
-        self.reflection_delete_calls.append((session_id, instance_id))
-        return {
-            "session_id": session_id,
-            "instance_id": instance_id,
-            "role_id": "writer",
-            "summary": "",
-            "updated_at": None,
-            "source": "manual_delete",
-        }
+        _ = force_refresh
+        return await asyncio.to_thread(self.get_recovery_snapshot, session_id)
 
 
-def _create_client(fake_service: _FakeSessionService) -> TestClient:
+class _BlockingTerminalViewService(_FakeSessionService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = False
+
+    async def mark_latest_terminal_run_viewed_async(self, session_id: str) -> None:
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        self.terminal_view_calls.append(session_id)
+
+
+class _FailingTerminalViewService(_BlockingTerminalViewService):
+    async def mark_latest_terminal_run_viewed_async(self, session_id: str) -> None:
+        await super().mark_latest_terminal_run_viewed_async(session_id)
+        raise RuntimeError("terminal marker failed")
+
+
+def _create_client(
+    fake_service: _FakeSessionService,
+    model_config_service_factory: Callable[[], SimpleNamespace] | None = None,
+) -> TestClient:
     app = FastAPI()
     app.include_router(sessions.router, prefix="/api")
     app.dependency_overrides[get_session_service] = lambda: fake_service
+    app.dependency_overrides[get_model_config_service] = (
+        model_config_service_factory or _fake_model_config_service
+    )
     return TestClient(app)
+
+
+def _fake_model_config_service() -> SimpleNamespace:
+    return SimpleNamespace(
+        runtime=SimpleNamespace(
+            default_model_profile="fast",
+            llm_profiles={"fast": object(), "precise": object()},
+        )
+    )
+
+
+def _fake_model_config_service_with_literal_default() -> SimpleNamespace:
+    return SimpleNamespace(
+        runtime=SimpleNamespace(
+            default_model_profile="fast",
+            llm_profiles={"default": object(), "fast": object()},
+        )
+    )
+
+
+def _create_sessions_and_system_app(fake_service: _FakeSessionService) -> FastAPI:
+    app = FastAPI()
+    app.include_router(sessions.router, prefix="/api")
+    app.include_router(system.router, prefix="/api")
+    app.dependency_overrides[get_session_service] = lambda: fake_service
+    app.state.container = SimpleNamespace(
+        config_dir=Path("/tmp/config"),
+        role_registry=None,
+        skill_registry=None,
+        tool_registry=None,
+    )
+    return app
+
+
+async def _wait_for_threading_event(event: threading.Event) -> bool:
+    for _ in range(50):
+        if event.is_set():
+            return True
+        await asyncio.sleep(0.02)
+    return event.is_set()
 
 
 def test_update_session_route_accepts_metadata_payload() -> None:
@@ -184,12 +624,570 @@ def test_update_session_route_accepts_metadata_payload() -> None:
 
     response = client.patch(
         "/api/sessions/session-1",
-        json={"metadata": {"title": "Renamed Session"}},
+        json={"title": "Renamed Session", "custom_metadata": {"label": "visible-name"}},
     )
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
-    assert fake_service.updated_calls == [("session-1", {"title": "Renamed Session"})]
+    assert fake_service.updated_calls == [
+        (
+            "session-1",
+            SessionMetadataPatch(
+                title="Renamed Session", custom_metadata={"label": "visible-name"}
+            ),
+        )
+    ]
+
+
+def test_mark_session_terminal_viewed_route_calls_service() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.post("/api/sessions/session-1/terminal-view")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert fake_service.terminal_view_calls == ["session-1"]
+
+
+def test_mark_session_terminal_viewed_route_uses_session_read_queue() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.post("/api/sessions/session-1/terminal-view")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert fake_service.terminal_view_calls == ["session-1"]
+
+
+def test_mark_session_terminal_viewed_route_returns_404_for_missing_session() -> None:
+    fake_service = _FakeSessionService()
+    fake_service.raise_missing = True
+    client = _create_client(fake_service)
+
+    response = client.post("/api/sessions/session-1/terminal-view")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Session not found"
+
+
+@pytest.mark.asyncio
+async def test_mark_session_terminal_viewed_timeout_keeps_marker_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_service = _BlockingTerminalViewService()
+    monkeypatch.setattr(sessions, "SESSION_TERMINAL_VIEW_TIMEOUT_SECONDS", 0.01)
+    app = _create_client(fake_service).app
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+        timeout=1.0,
+    ) as client:
+        response = await client.post("/api/sessions/session-1/terminal-view")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "deferred"}
+    await asyncio.wait_for(fake_service.started.wait(), timeout=1.0)
+    assert fake_service.cancelled is False
+
+    fake_service.release.set()
+    for _ in range(50):
+        if fake_service.terminal_view_calls:
+            break
+        await asyncio.sleep(0.02)
+
+    assert fake_service.cancelled is False
+    assert fake_service.terminal_view_calls == ["session-1"]
+
+
+@pytest.mark.asyncio
+async def test_deferred_terminal_view_result_logs_missing_session(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def raise_missing() -> None:
+        raise KeyError("session-1")
+
+    caplog.set_level(logging.WARNING)
+    marker_task = asyncio.create_task(raise_missing())
+    await asyncio.sleep(0)
+
+    sessions._log_deferred_terminal_view_result(marker_task, "session-1")
+
+    assert "Deferred session terminal view marker found no session" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_deferred_terminal_view_result_logs_cancelled_task(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO)
+    marker_task = asyncio.create_task(asyncio.sleep(1))
+    marker_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        _ = await marker_task
+
+    sessions._log_deferred_terminal_view_result(marker_task, "session-1")
+
+    assert "Deferred session terminal view marker was cancelled" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_mark_session_terminal_viewed_cancelled_request_observes_marker_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake_service = _FailingTerminalViewService()
+    app = _create_client(fake_service).app
+    transport = httpx.ASGITransport(app=app)
+
+    caplog.set_level(logging.ERROR)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+        timeout=1.0,
+    ) as client:
+        request_task = asyncio.create_task(
+            client.post("/api/sessions/session-1/terminal-view")
+        )
+        await asyncio.wait_for(fake_service.started.wait(), timeout=1.0)
+
+        request_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            _ = await request_task
+
+    fake_service.release.set()
+    for _ in range(50):
+        if "Deferred session terminal view marker failed" in caplog.text:
+            break
+        await asyncio.sleep(0.02)
+
+    assert fake_service.cancelled is False
+    assert "Deferred session terminal view marker failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_deferred_terminal_view_result_logs_unexpected_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def raise_unexpected() -> None:
+        raise RuntimeError("boom")
+
+    caplog.set_level(logging.ERROR)
+    marker_task = asyncio.create_task(raise_unexpected())
+    await asyncio.sleep(0)
+
+    sessions._log_deferred_terminal_view_result(marker_task, "session-1")
+
+    assert "Deferred session terminal view marker failed" in caplog.text
+
+
+@pytest.mark.timeout(5)
+def test_create_session_route_returns_created_session() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.post(
+        "/api/sessions",
+        json={"session_id": "session-1", "workspace_id": "default"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["session_id"] == "session-1"
+    assert fake_service.created_calls == [("session-1", "default", None, None)]
+
+
+def test_create_session_route_calls_service() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.post(
+        "/api/sessions",
+        json={"session_id": "session-1", "workspace_id": "default"},
+    )
+
+    assert response.status_code == 200
+    assert fake_service.created_calls == [("session-1", "default", None, None)]
+
+
+def test_create_session_route_accepts_normal_model_profile() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.post(
+        "/api/sessions",
+        json={
+            "session_id": "session-1",
+            "workspace_id": "default",
+            "normal_model_profile": "precise",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["normal_model_profile"] == "precise"
+    assert fake_service.created_calls == [("session-1", "default", "precise", None)]
+
+
+def test_create_session_route_accepts_literal_default_normal_model_profile() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(
+        fake_service,
+        model_config_service_factory=_fake_model_config_service_with_literal_default,
+    )
+
+    response = client.post(
+        "/api/sessions",
+        json={
+            "session_id": "session-1",
+            "workspace_id": "default",
+            "normal_model_profile": "default",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["normal_model_profile"] == "default"
+    assert fake_service.created_calls == [("session-1", "default", "default", None)]
+
+
+def test_create_session_route_rejects_default_alias_normal_model_profile() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.post(
+        "/api/sessions",
+        json={
+            "session_id": "session-1",
+            "workspace_id": "default",
+            "normal_model_profile": "default",
+        },
+    )
+
+    assert response.status_code == 422
+    assert fake_service.created_calls == []
+
+
+def test_create_session_route_rejects_unknown_normal_model_profile() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.post(
+        "/api/sessions",
+        json={
+            "session_id": "session-1",
+            "workspace_id": "default",
+            "normal_model_profile": "missing-profile",
+        },
+    )
+
+    assert response.status_code == 422
+    assert fake_service.created_calls == []
+
+
+def test_list_sessions_route_calls_service() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.get("/api/sessions")
+
+    assert response.status_code == 200
+    assert response.json()[0]["session_id"] == "session-listed"
+    assert fake_service.list_calls == 1
+
+
+def test_list_sidebar_sessions_route_uses_lightweight_projection() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.get("/api/sessions/sidebar")
+
+    assert response.status_code == 200
+    payload = response.json()[0]
+    assert payload["session_id"] == "session-listed"
+    assert "normal_model_profile" not in payload
+    assert fake_service.sessions_force_refresh_calls == [False]
+
+
+def test_session_routes_call_service() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    requests = [
+        client.get("/api/sessions/session-1"),
+        client.patch("/api/sessions/session-1", json={"title": "Renamed Session"}),
+        client.post("/api/sessions/session-1/terminal-view"),
+        client.patch(
+            "/api/sessions/session-1/topology",
+            json={"session_mode": "orchestration"},
+        ),
+        client.patch(
+            "/api/sessions/session-1/normal-model-profile",
+            json={"normal_model_profile": "precise"},
+        ),
+        client.request("DELETE", "/api/sessions/session-1"),
+        client.get("/api/sessions/session-1/rounds"),
+        client.get("/api/sessions/session-1/recovery"),
+        client.get("/api/sessions/session-1/rounds/run-1"),
+        client.get("/api/sessions/session-1/agents"),
+        client.get("/api/sessions/session-1/subagents"),
+        client.get("/api/sessions/session-1/subagents:snapshot"),
+        client.delete("/api/sessions/session-1/subagents/inst-subagent-1"),
+        client.get("/api/sessions/session-1/events"),
+        client.get("/api/sessions/session-1/messages"),
+        client.get("/api/sessions/session-1/agents/inst-1/messages"),
+        client.get("/api/sessions/session-1/tasks"),
+        client.get("/api/sessions/session-1/token-usage"),
+        client.get("/api/sessions/session-1/runs/run-1/token-usage"),
+    ]
+
+    assert [response.status_code for response in requests] == [200] * len(requests)
+
+
+def test_session_recovery_times_out_when_snapshot_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sessions, "SESSION_RECOVERY_TIMEOUT_SECONDS", 0.01)
+    client = _create_client(_SleepingRecoveryService())
+
+    response = client.get("/api/sessions/session-1/recovery")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Session recovery snapshot timed out"
+
+
+@pytest.mark.asyncio
+async def test_health_responds_while_recovery_uses_default_threadpool() -> None:
+    service = _BlockingRecoveryService()
+    executor = ThreadPoolExecutor(max_workers=1)
+    asyncio.get_running_loop().set_default_executor(executor)
+    app = _create_sessions_and_system_app(service)
+    transport = httpx.ASGITransport(app=app)
+
+    try:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+            timeout=None,
+        ) as client:
+            recovery_task = asyncio.create_task(
+                client.get("/api/sessions/session-1/recovery")
+            )
+            assert await _wait_for_threading_event(service.started) is True
+
+            health_response = await asyncio.wait_for(
+                client.get("/api/system/health"),
+                timeout=1.0,
+            )
+
+            assert health_response.status_code == 200
+            assert health_response.json()["status"] == "ok"
+            service.release.set()
+            recovery_response = await asyncio.wait_for(recovery_task, timeout=1.0)
+            assert recovery_response.status_code == 200
+    finally:
+        service.release.set()
+        executor.shutdown(wait=True)
+
+
+@pytest.mark.asyncio
+async def test_session_switch_reads_respond_while_default_threadpool_is_saturated() -> (
+    None
+):
+    service = _FakeSessionService()
+    executor = ThreadPoolExecutor(max_workers=1)
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(executor)
+    default_worker_started = threading.Event()
+    release_default_worker = threading.Event()
+    app = _create_client(service).app
+    transport = httpx.ASGITransport(app=app)
+
+    def block_default_worker() -> None:
+        default_worker_started.set()
+        _ = release_default_worker.wait(timeout=5.0)
+
+    blocking_task = asyncio.create_task(asyncio.to_thread(block_default_worker))
+
+    try:
+        assert await _wait_for_threading_event(default_worker_started) is True
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+            timeout=1.0,
+        ) as client:
+            responses = await asyncio.gather(
+                client.get("/api/sessions/session-1"),
+                client.get("/api/sessions/session-1/rounds"),
+                client.get("/api/sessions/session-1/recovery"),
+                client.get("/api/sessions/session-1/subagents"),
+                client.get("/api/sessions/session-1/token-usage"),
+            )
+
+        assert [response.status_code for response in responses] == [200] * 5
+        assert service.get_calls == ["session-1"]
+    finally:
+        release_default_worker.set()
+        completed = await blocking_task
+        assert completed is None
+        executor.shutdown(wait=True)
+
+
+def test_create_session_route_accepts_explicit_metadata_payload() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.post(
+        "/api/sessions",
+        json={
+            "session_id": "session-1",
+            "workspace_id": "default",
+            "metadata": {
+                "title": "Customer Support",
+                "source_label": "Group Chat",
+                "custom_metadata": {"project": "demo"},
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert fake_service.created_calls == [
+        (
+            "session-1",
+            "default",
+            None,
+            SessionCreateMetadata(
+                title="Customer Support",
+                source_label="Group Chat",
+                custom_metadata={"project": "demo"},
+            ).to_metadata_dict(),
+        )
+    ]
+
+
+def test_create_session_route_accepts_legacy_flat_metadata_payload() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.post(
+        "/api/sessions",
+        json={
+            "session_id": "session-1",
+            "workspace_id": "default",
+            "metadata": {
+                "title": "Customer Support",
+                "project": "demo",
+                "channel": "feishu",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert fake_service.created_calls == [
+        (
+            "session-1",
+            "default",
+            None,
+            {
+                "title": "Customer Support",
+                "title_source": "manual",
+                "project": "demo",
+                "channel": "feishu",
+            },
+        )
+    ]
+
+
+def test_create_session_route_ignores_reserved_keys_in_legacy_flat_metadata_payload() -> (
+    None
+):
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.post(
+        "/api/sessions",
+        json={
+            "session_id": "session-1",
+            "workspace_id": "default",
+            "metadata": {
+                "title": "Customer Support",
+                "project": "demo",
+                "source_provider": "feishu",
+                "feishu_chat_id": "chat-1",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert fake_service.created_calls == [
+        (
+            "session-1",
+            "default",
+            None,
+            {
+                "title": "Customer Support",
+                "title_source": "manual",
+                "project": "demo",
+            },
+        )
+    ]
+
+
+def test_create_session_route_rejects_reserved_custom_metadata_key() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.post(
+        "/api/sessions",
+        json={
+            "workspace_id": "default",
+            "metadata": {"custom_metadata": {"source_label": "bad"}},
+        },
+    )
+
+    assert response.status_code == 422
+    assert fake_service.created_calls == []
+
+
+def test_create_session_route_rejects_title_source_without_title() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.post(
+        "/api/sessions",
+        json={
+            "workspace_id": "default",
+            "metadata": {"title_source": "manual"},
+        },
+    )
+
+    assert response.status_code == 422
+    assert fake_service.created_calls == []
+
+
+def test_create_session_route_rejects_none_like_session_id() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.post(
+        "/api/sessions",
+        json={"session_id": "None", "workspace_id": "default"},
+    )
+
+    assert response.status_code == 422
+    assert fake_service.created_calls == []
+
+
+def test_create_session_route_returns_503_when_system_roles_are_missing() -> None:
+    fake_service = _FakeSessionService()
+    fake_service.create_session_error = SystemRolesUnavailableError(
+        "Required system roles are unavailable: main_agent: missing"
+    )
+    client = _create_client(fake_service)
+
+    response = client.post("/api/sessions", json={"workspace_id": "default"})
+
+    assert response.status_code == 503
+    assert "Required system roles are unavailable" in response.json()["detail"]
 
 
 def test_update_session_route_returns_not_found_for_missing_session() -> None:
@@ -199,11 +1197,320 @@ def test_update_session_route_returns_not_found_for_missing_session() -> None:
 
     response = client.patch(
         "/api/sessions/missing-session",
-        json={"metadata": {"title": "Renamed Session"}},
+        json={"title": "Renamed Session", "custom_metadata": {"label": "visible-name"}},
     )
 
     assert response.status_code == 404
     assert response.json() == {"detail": "Session not found"}
+
+
+def test_update_session_route_accepts_legacy_flat_metadata_snapshot() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.patch(
+        "/api/sessions/session-1",
+        json={
+            "title": "Renamed Session",
+            "title_source": "manual",
+            "source_label": "Feishu",
+            "source_icon": "message",
+            "source_provider": "feishu",
+            "feishu_chat_id": "chat-1",
+            "project": "demo",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert fake_service.updated_calls == [
+        (
+            "session-1",
+            SessionMetadataPatch(
+                title="Renamed Session",
+                title_source="manual",
+                source_label="Feishu",
+                source_icon="message",
+                custom_metadata={"project": "demo"},
+            ),
+        )
+    ]
+
+
+def test_update_session_route_accepts_legacy_wrapped_metadata_snapshot() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.patch(
+        "/api/sessions/session-1",
+        json={
+            "metadata": {
+                "title": "Renamed Session",
+                "source_provider": "feishu",
+                "project": "demo",
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    assert fake_service.updated_calls == [
+        (
+            "session-1",
+            SessionMetadataPatch(
+                title="Renamed Session",
+                custom_metadata={"project": "demo"},
+            ),
+        )
+    ]
+
+
+def test_update_session_route_clears_title_for_legacy_snapshot_without_title() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.patch(
+        "/api/sessions/session-1",
+        json={
+            "title_source": "manual",
+            "source_provider": "feishu",
+            "feishu_chat_id": "chat-1",
+            "project": "demo",
+        },
+    )
+
+    assert response.status_code == 200
+    assert fake_service.updated_calls == [
+        (
+            "session-1",
+            SessionMetadataPatch(
+                title=None,
+                custom_metadata={"project": "demo"},
+            ),
+        )
+    ]
+
+
+def test_update_session_route_rejects_reserved_custom_metadata_key() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.patch(
+        "/api/sessions/session-1",
+        json={"custom_metadata": {"source_label": "bad"}},
+    )
+
+    assert response.status_code == 422
+    assert fake_service.updated_calls == []
+
+
+def test_list_session_subagents_route_returns_projected_subagents() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.get("/api/sessions/session-1/subagents")
+
+    assert response.status_code == 200
+    assert response.json() == [
+        {
+            "instance_id": "inst-subagent-1",
+            "role_id": "Explorer",
+            "run_id": "subagent_run_123",
+            "title": "Explore issue",
+            "status": "completed",
+            "run_status": "running",
+            "run_phase": "running",
+            "last_event_id": 12,
+            "checkpoint_event_id": 8,
+            "stream_connected": True,
+            "conversation_id": "conv_session_1_explorer_inst_subagent_1",
+        }
+    ]
+    assert fake_service.subagents_force_refresh_calls == [False]
+
+
+def test_list_session_subagents_route_forwards_force_refresh() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.get("/api/sessions/session-1/subagents?force_refresh=true")
+
+    assert response.status_code == 200
+    assert fake_service.subagents_force_refresh_calls == [True]
+
+
+def test_cached_session_read_routes_use_fast_read_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_service = _FakeSessionService()
+    operations: list[str] = []
+
+    async def fake_fast_read_runner(operation, function, *args, **kwargs):
+        operations.append(str(operation))
+        result = function(*args, **kwargs)
+        if asyncio.iscoroutine(result):
+            return await result
+        return result
+
+    monkeypatch.setattr(
+        sessions,
+        "call_maybe_async_in_session_fast_read_thread",
+        fake_fast_read_runner,
+    )
+    client = _create_client(fake_service)
+
+    responses = [
+        client.get("/api/sessions"),
+        client.get("/api/sessions/session-1/rounds"),
+        client.get("/api/sessions/session-1/recovery"),
+        client.get("/api/sessions/session-1/agents"),
+        client.get("/api/sessions/session-1/subagents"),
+        client.get("/api/sessions/session-1/subagents:snapshot"),
+        client.get("/api/sessions/session-1/tasks"),
+        client.get("/api/sessions/session-1/token-usage"),
+    ]
+
+    assert [response.status_code for response in responses] == [200] * len(responses)
+    assert operations == [
+        "session.list",
+        "session.rounds",
+        "session.recovery",
+        "session.agents",
+        "session.subagents",
+        "session.subagents.snapshot",
+        "session.tasks",
+        "session.token_usage",
+    ]
+
+
+def test_cached_session_read_routes_forward_force_refresh() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    responses = [
+        client.get("/api/sessions?force_refresh=true"),
+        client.get("/api/sessions/session-1/rounds?force_refresh=true"),
+        client.get("/api/sessions/session-1/recovery?force_refresh=true"),
+        client.get("/api/sessions/session-1/agents?force_refresh=true"),
+        client.get("/api/sessions/session-1/tasks?force_refresh=true"),
+        client.get("/api/sessions/session-1/token-usage?force_refresh=true"),
+    ]
+
+    assert [response.status_code for response in responses] == [200] * len(responses)
+    assert fake_service.sessions_force_refresh_calls == [True]
+    assert fake_service.rounds_force_refresh_calls == [True]
+    assert fake_service.recovery_force_refresh_calls == [True]
+    assert fake_service.agents_force_refresh_calls == [True]
+    assert fake_service.tasks_force_refresh_calls == [True]
+    assert fake_service.token_usage_force_refresh_calls == [True]
+
+
+def test_list_session_subagents_snapshot_route_returns_diagnostics() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.get("/api/sessions/session-1/subagents:snapshot")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["session_id"] == "session-1"
+    assert payload["items"][0]["instance_id"] == "inst-subagent-1"
+    assert payload["cache"]["cache_hit"] is True
+    assert payload["cache"]["stale"] is False
+
+
+def test_stream_session_subagent_events_route_returns_sse_events() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.get("/api/sessions/session-1/subagents/events?after_event_id=9")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert fake_service.subagent_stream_calls == [("session-1", 9)]
+    assert '"run_id":"subagent_run_123"' in response.text
+    assert '"event_id":10' in response.text
+
+
+def test_stream_session_subagent_events_route_reports_missing_session() -> None:
+    fake_service = _FakeSessionService()
+    fake_service.raise_missing_subagent_stream = True
+    client = _create_client(fake_service)
+
+    response = client.get("/api/sessions/missing-session/subagents/events")
+
+    assert response.status_code == 200
+    assert response.text.strip() == 'data: {"error": "Session not found"}'
+    assert fake_service.subagent_stream_calls == [("missing-session", 0)]
+
+
+def test_delete_session_subagent_route_returns_ok() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.delete("/api/sessions/session-1/subagents/inst-subagent-1")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert fake_service.delete_subagent_calls == [("session-1", "inst-subagent-1")]
+
+
+def test_delete_session_subagent_route_returns_not_found() -> None:
+    fake_service = _FakeSessionService()
+    fake_service.delete_subagent_error = KeyError("missing")
+    client = _create_client(fake_service)
+
+    response = client.delete("/api/sessions/session-1/subagents/inst-missing")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Subagent not found"}
+
+
+def test_delete_session_subagent_route_returns_conflict_for_running_subagent() -> None:
+    fake_service = _FakeSessionService()
+    fake_service.delete_subagent_error = RuntimeError(
+        "Cannot delete a running subagent"
+    )
+    client = _create_client(fake_service)
+
+    response = client.delete("/api/sessions/session-1/subagents/inst-running")
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Cannot delete a running subagent"}
+
+
+def test_list_session_agents_route_returns_not_found_for_missing_session() -> None:
+    fake_service = _FakeSessionService()
+    fake_service.raise_missing_list_agents = True
+    client = _create_client(fake_service)
+
+    response = client.get("/api/sessions/missing-session/agents")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Session not found"}
+
+
+def test_list_session_subagents_route_returns_not_found_for_missing_session() -> None:
+    fake_service = _FakeSessionService()
+    fake_service.raise_missing_list_subagents = True
+    client = _create_client(fake_service)
+
+    response = client.get("/api/sessions/missing-session/subagents")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Session not found"}
+
+
+def test_update_session_route_rejects_none_like_path_identifier() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.patch(
+        "/api/sessions/None",
+        json={"title": "Renamed Session", "custom_metadata": {"label": "visible-name"}},
+    )
+
+    assert response.status_code == 422
+    assert fake_service.updated_calls == []
 
 
 def test_update_session_topology_route_returns_updated_session() -> None:
@@ -249,6 +1556,80 @@ def test_update_session_topology_route_accepts_normal_root_role() -> None:
     ]
 
 
+def test_update_session_normal_model_profile_route_returns_updated_session() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.patch(
+        "/api/sessions/session-1/normal-model-profile",
+        json={"normal_model_profile": "precise"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["normal_model_profile"] == "precise"
+    assert fake_service.normal_model_profile_update_calls == [("session-1", "precise")]
+
+
+def test_update_session_normal_model_profile_route_accepts_literal_default() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(
+        fake_service,
+        model_config_service_factory=_fake_model_config_service_with_literal_default,
+    )
+
+    response = client.patch(
+        "/api/sessions/session-1/normal-model-profile",
+        json={"normal_model_profile": "default"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["normal_model_profile"] == "default"
+    assert fake_service.normal_model_profile_update_calls == [("session-1", "default")]
+
+
+def test_update_session_normal_model_profile_route_clears_profile() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.patch(
+        "/api/sessions/session-1/normal-model-profile",
+        json={"normal_model_profile": None},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["normal_model_profile"] is None
+    assert fake_service.normal_model_profile_update_calls == [("session-1", None)]
+
+
+def test_update_session_normal_model_profile_route_rejects_unknown_profile() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.patch(
+        "/api/sessions/session-1/normal-model-profile",
+        json={"normal_model_profile": "missing-profile"},
+    )
+
+    assert response.status_code == 422
+    assert fake_service.normal_model_profile_update_calls == []
+
+
+def test_update_session_normal_model_profile_route_rejects_default_alias() -> None:
+    fake_service = _FakeSessionService()
+    client = _create_client(fake_service)
+
+    response = client.patch(
+        "/api/sessions/session-1/normal-model-profile",
+        json={"normal_model_profile": "default"},
+    )
+
+    assert response.status_code == 422
+    assert fake_service.normal_model_profile_update_calls == []
+
+
 def test_get_session_token_usage_route_returns_extended_totals() -> None:
     fake_service = _FakeSessionService()
     client = _create_client(fake_service)
@@ -270,11 +1651,15 @@ def test_get_session_token_usage_route_returns_extended_totals() -> None:
                 "role_id": "coordinator",
                 "input_tokens": 120,
                 "cached_input_tokens": 48,
+                "latest_input_tokens": 44,
+                "max_input_tokens": 64,
                 "output_tokens": 30,
                 "reasoning_output_tokens": 9,
                 "total_tokens": 150,
                 "requests": 3,
                 "tool_calls": 1,
+                "context_window": 1000000,
+                "model_profile": "gpt-4.1",
             }
         },
     }
@@ -302,60 +1687,54 @@ def test_get_run_token_usage_route_returns_extended_totals() -> None:
                 "role_id": "coordinator",
                 "input_tokens": 44,
                 "cached_input_tokens": 12,
+                "latest_input_tokens": 22,
+                "max_input_tokens": 28,
                 "output_tokens": 10,
                 "reasoning_output_tokens": 4,
                 "total_tokens": 54,
                 "requests": 2,
                 "tool_calls": 0,
+                "context_window": 1000000,
+                "model_profile": "gpt-4.1",
             }
         ],
     }
 
 
-def test_get_agent_reflection_route_returns_projection() -> None:
+def test_delete_session_route_forwards_force_and_cascade() -> None:
     fake_service = _FakeSessionService()
     client = _create_client(fake_service)
 
-    response = client.get("/api/sessions/session-1/agents/inst-1/reflection")
-
-    assert response.status_code == 200
-    assert response.json()["instance_id"] == "inst-1"
-    assert response.json()["source"] == "stored"
-
-
-def test_refresh_agent_reflection_route_returns_projection() -> None:
-    fake_service = _FakeSessionService()
-    client = _create_client(fake_service)
-
-    response = client.post("/api/sessions/session-1/agents/inst-1/reflection:refresh")
-
-    assert response.status_code == 200
-    assert response.json()["source"] == "manual"
-    assert fake_service.reflection_refresh_calls == [("session-1", "inst-1")]
-
-
-def test_update_agent_reflection_route_returns_projection() -> None:
-    fake_service = _FakeSessionService()
-    client = _create_client(fake_service)
-
-    response = client.patch(
-        "/api/sessions/session-1/agents/inst-1/reflection",
-        json={"summary": "Keep implementation notes concise."},
+    response = client.request(
+        "DELETE",
+        "/api/sessions/session-1",
+        json={"force": True, "cascade": True},
     )
 
     assert response.status_code == 200
-    assert response.json()["source"] == "manual_edit"
-    assert fake_service.reflection_update_calls == [
-        ("session-1", "inst-1", "Keep implementation notes concise.")
-    ]
+    assert response.json() == {"status": "ok"}
+    assert fake_service.deleted_calls == [("session-1", True, True)]
 
 
-def test_delete_agent_reflection_route_returns_projection() -> None:
+def test_delete_session_route_returns_conflict_for_missing_cascade() -> None:
     fake_service = _FakeSessionService()
+    fake_service.delete_error = RuntimeError(
+        "Cannot delete session without cascade while related session data exists"
+    )
     client = _create_client(fake_service)
 
-    response = client.delete("/api/sessions/session-1/agents/inst-1/reflection")
+    response = client.request("DELETE", "/api/sessions/session-1")
 
-    assert response.status_code == 200
-    assert response.json()["source"] == "manual_delete"
-    assert fake_service.reflection_delete_calls == [("session-1", "inst-1")]
+    assert response.status_code == 409
+    assert "without cascade" in response.json()["detail"]
+
+
+def test_delete_session_route_returns_not_found() -> None:
+    fake_service = _FakeSessionService()
+    fake_service.delete_error = KeyError("session-1")
+    client = _create_client(fake_service)
+
+    response = client.request("DELETE", "/api/sessions/session-1")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Session not found"}

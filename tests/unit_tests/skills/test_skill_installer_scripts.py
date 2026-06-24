@@ -1,22 +1,132 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 import json
 import os
+import runpy
 import subprocess
 import sys
 import threading
-from urllib.error import URLError
+from unittest.mock import MagicMock
+
+import httpx
 import zipfile
 
 import pytest
 
-from agent_teams.builtin import get_builtin_skills_dir
-from agent_teams.skills import installer_support
+from relay_teams.builtin import get_builtin_skills_dir
+from relay_teams.env.clawhub_cli import clear_clawhub_path_cache
+from relay_teams.skills import installer_support
+
+
+def _join_env_paths(first: Path | str, second: str) -> str:
+    delimiter = ";" if os.name == "nt" else ":"
+    first_value = str(first)
+    if not second:
+        return first_value
+    return delimiter.join((first_value, second))
+
+
+def _write_fake_clawhub(
+    *,
+    bin_dir: Path,
+    search_lines: tuple[str, ...] = (),
+    install_runtime_name: str | None = None,
+    install_description: str = "",
+) -> Path:
+    if os.name == "nt":
+        stub_path = bin_dir / "clawhub_stub.py"
+        stub_path.write_text(
+            "\n".join(
+                (
+                    "from __future__ import annotations",
+                    "",
+                    "import sys",
+                    "from pathlib import Path",
+                    f"SEARCH_LINES = {search_lines!r}",
+                    f"INSTALL_RUNTIME_NAME = {install_runtime_name!r}",
+                    f"INSTALL_DESCRIPTION = {install_description!r}",
+                    "",
+                    "args = sys.argv[1:]",
+                    "if args and Path(args[0]).name.lower() in {'clawhub.cmd', 'clawhub.exe', 'clawhub.ps1'}:",
+                    "    args = args[1:]",
+                    "if args and args[0] == 'search':",
+                    "    for line in SEARCH_LINES:",
+                    "        print(line)",
+                    "    raise SystemExit(0)",
+                    "if len(args) >= 5 and args[0] == '--workdir' and args[2] == '--no-input' and args[3] == 'install':",
+                    "    workdir = Path(args[1])",
+                    "    slug = args[4]",
+                    "    skill_dir = workdir / 'skills' / slug",
+                    "    skill_dir.mkdir(parents=True, exist_ok=True)",
+                    "    runtime_name = INSTALL_RUNTIME_NAME or slug",
+                    "    skill_dir.joinpath('SKILL.md').write_text(",
+                    "        '---\\n'",
+                    "        f'name: {runtime_name}\\n'",
+                    "        f'description: {INSTALL_DESCRIPTION}\\n'",
+                    "        '---\\n'",
+                    "        'Use this skill.\\n',",
+                    "        encoding='utf-8',",
+                    "    )",
+                    "    raise SystemExit(0)",
+                    "print('unexpected clawhub command', file=sys.stderr)",
+                    "raise SystemExit(1)",
+                )
+            ),
+            encoding="utf-8",
+        )
+        wrapper_path = bin_dir / "clawhub.cmd"
+        wrapper_path.write_text(
+            "\n".join(
+                (
+                    "@echo off",
+                    f'"{sys.executable}" "{stub_path}" %*',
+                )
+            ),
+            encoding="utf-8",
+        )
+        return wrapper_path
+
+    script_path = bin_dir / "clawhub"
+    lines = ["#!/bin/sh"]
+    if search_lines:
+        lines.extend(
+            [
+                'if [ "$1" = "search" ]; then',
+                *[f"  echo '{line}'" for line in search_lines],
+                "  exit 0",
+                "fi",
+            ]
+        )
+    if install_runtime_name is not None:
+        lines.extend(
+            [
+                'if [ "$1" = "--workdir" ] && [ "$3" = "--no-input" ] && [ "$4" = "install" ]; then',
+                '  mkdir -p "$2/skills/$5"',
+                "  cat > \"$2/skills/$5/SKILL.md\" <<'EOF'",
+                "---",
+                f"name: {install_runtime_name}",
+                f"description: {install_description}",
+                "---",
+                "Use this skill.",
+                "EOF",
+                "  exit 0",
+                "fi",
+            ]
+        )
+    lines.extend(
+        [
+            "echo 'unexpected clawhub command' >&2",
+            "exit 1",
+        ]
+    )
+    script_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    script_path.chmod(0o755)
+    return script_path
 
 
 def test_resolve_source_from_marketplace_page(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -116,7 +226,7 @@ def test_install_from_repo_paths_reports_download_and_git_failures(
 
 
 def test_list_skills_script_reports_installed_annotations(tmp_path: Path) -> None:
-    skill_dir = tmp_path / ".agent-teams" / "skills" / "alpha"
+    skill_dir = tmp_path / ".relay-teams" / "skills" / "alpha"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text(
         "---\nname: alpha\ndescription: installed alpha\n---\nUse alpha.\n",
@@ -159,6 +269,128 @@ def test_list_skills_script_reports_installed_annotations(tmp_path: Path) -> Non
     ]
 
 
+def test_search_clawhub_skills_script_reports_search_results(tmp_path: Path) -> None:
+    clawhub_bin_dir = tmp_path / "bin"
+    clawhub_bin_dir.mkdir(parents=True)
+    _ = _write_fake_clawhub(
+        bin_dir=clawhub_bin_dir,
+        search_lines=(
+            "skill-creator  Skill Creator  (3.389)",
+            "skill-creator-agent v0.1.0  Skill Creator Agent  (3.200)",
+        ),
+    )
+
+    result = _run_script(
+        script_name="search-clawhub-skills.py",
+        args=(
+            "--format",
+            "json",
+            "--limit",
+            "2",
+            "skill",
+            "creator",
+        ),
+        repo_root=Path(__file__).resolve().parents[3],
+        home_dir=tmp_path,
+        extra_env={
+            "PATH": _join_env_paths(clawhub_bin_dir, os.environ.get("PATH", ""))
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["query"] == "skill creator"
+    assert payload["items"] == [
+        {
+            "slug": "skill-creator",
+            "title": "Skill Creator",
+            "version": None,
+            "score": 3.389,
+        },
+        {
+            "slug": "skill-creator-agent",
+            "title": "Skill Creator Agent",
+            "version": "v0.1.0",
+            "score": 3.2,
+        },
+    ]
+
+
+def test_install_clawhub_skill_script_reports_runtime_identity(
+    tmp_path: Path,
+) -> None:
+    clawhub_bin_dir = tmp_path / "bin"
+    clawhub_bin_dir.mkdir(parents=True)
+    _ = _write_fake_clawhub(
+        bin_dir=clawhub_bin_dir,
+        install_runtime_name="skill-creator",
+        install_description="Skill creator runtime.",
+    )
+
+    result = _run_script(
+        script_name="install-clawhub-skill.py",
+        args=(
+            "--format",
+            "json",
+            "skill-creator-2",
+        ),
+        repo_root=Path(__file__).resolve().parents[3],
+        home_dir=tmp_path,
+        extra_env={
+            "PATH": _join_env_paths(clawhub_bin_dir, os.environ.get("PATH", ""))
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["slug"] == "skill-creator-2"
+    assert payload["installed_skill"]["skill_id"] == "skill-creator-2"
+    assert payload["installed_skill"]["runtime_name"] == "skill-creator"
+    assert payload["installed_skill"]["ref"] == "skill-creator"
+
+
+@pytest.mark.timeout(10)
+def test_search_and_install_clawhub_skill_script_runs_both_steps(
+    tmp_path: Path,
+) -> None:
+    clawhub_bin_dir = tmp_path / "bin"
+    clawhub_bin_dir.mkdir(parents=True)
+    _ = _write_fake_clawhub(
+        bin_dir=clawhub_bin_dir,
+        search_lines=(
+            "best-practice-skill-creator  Best Practice Skill Creator  (56.406)",
+        ),
+        install_runtime_name="best-practice-skill-creator",
+        install_description="Best practice installer.",
+    )
+
+    result = _run_script(
+        script_name="search-and-install-clawhub-skill.py",
+        args=(
+            "--format",
+            "json",
+            "--query",
+            "skill creator",
+            "--slug",
+            "best-practice-skill-creator",
+        ),
+        repo_root=Path(__file__).resolve().parents[3],
+        home_dir=tmp_path,
+        extra_env={
+            "PATH": _join_env_paths(clawhub_bin_dir, os.environ.get("PATH", ""))
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["search"]["ok"] is True
+    assert payload["search"]["items"][0]["slug"] == "best-practice-skill-creator"
+    assert payload["install"]["ok"] is True
+    assert payload["install"]["installed_skill"]["ref"] == "best-practice-skill-creator"
+
+
 def test_install_skill_script_downloads_and_installs_skill(tmp_path: Path) -> None:
     archive_bytes = _build_repo_archive(
         {
@@ -194,16 +426,16 @@ def test_install_skill_script_downloads_and_installs_skill(tmp_path: Path) -> No
         )
 
     assert result.returncode == 0, result.stderr
-    installed_skill_dir = tmp_path / ".agent-teams" / "skills" / "demo-skill"
+    installed_skill_dir = tmp_path / ".relay-teams" / "skills" / "demo-skill"
     assert (installed_skill_dir / "SKILL.md").exists()
     assert (installed_skill_dir / "scripts" / "demo.py").exists()
-    assert not (tmp_path / ".agent-teams" / "roles" / "MainAgent.md").exists()
+    assert not (tmp_path / ".relay-teams" / "roles" / "MainAgent.md").exists()
     assert "Restart Agent Teams to pick up new skills." in result.stdout
     assert result.stderr == ""
 
 
 def test_bind_skill_script_updates_main_agent_role(tmp_path: Path) -> None:
-    skill_dir = tmp_path / ".agent-teams" / "skills" / "demo-skill"
+    skill_dir = tmp_path / ".relay-teams" / "skills" / "demo-skill"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text(
         "---\nname: demo-skill\ndescription: demo installer\n---\nUse demo.\n",
@@ -224,16 +456,14 @@ def test_bind_skill_script_updates_main_agent_role(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    role_path = tmp_path / ".agent-teams" / "roles" / "MainAgent.md"
-    assert role_path.exists()
-    role_text = role_path.read_text(encoding="utf-8")
-    assert "- demo-skill" in role_text
-    assert "Updated roles: MainAgent" in result.stdout
+    role_path = tmp_path / ".relay-teams" / "roles" / "MainAgent.md"
+    assert not role_path.exists()
+    assert "Updated roles: <none>" in result.stdout
     assert result.stderr == ""
 
 
 def test_bind_skill_script_defaults_to_current_role_env(tmp_path: Path) -> None:
-    skill_dir = tmp_path / ".agent-teams" / "skills" / "demo-skill"
+    skill_dir = tmp_path / ".relay-teams" / "skills" / "demo-skill"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text(
         "---\nname: demo-skill\ndescription: demo installer\n---\nUse demo.\n",
@@ -254,15 +484,13 @@ def test_bind_skill_script_defaults_to_current_role_env(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    role_path = tmp_path / ".agent-teams" / "roles" / "Crafter.md"
-    assert role_path.exists()
-    role_text = role_path.read_text(encoding="utf-8")
-    assert "- demo-skill" in role_text
-    assert "Updated roles: Crafter" in result.stdout
+    role_path = tmp_path / ".relay-teams" / "roles" / "Crafter.md"
+    assert not role_path.exists()
+    assert "Updated roles: <none>" in result.stdout
 
 
 def test_mount_skills_to_roles_creates_main_agent_override(tmp_path: Path) -> None:
-    skill_dir = tmp_path / ".agent-teams" / "skills" / "demo-skill"
+    skill_dir = tmp_path / ".relay-teams" / "skills" / "demo-skill"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text(
         "---\nname: demo-skill\ndescription: demo installer\n---\nUse demo.\n",
@@ -288,13 +516,77 @@ def test_mount_skills_to_roles_creates_main_agent_override(tmp_path: Path) -> No
         else:
             os.environ["USERPROFILE"] = old_userprofile
 
-    assert mounted_roles == ("MainAgent",)
-    role_path = tmp_path / ".agent-teams" / "roles" / "MainAgent.md"
+    assert mounted_roles == ()
+    role_path = tmp_path / ".relay-teams" / "roles" / "MainAgent.md"
+    assert not role_path.exists()
+
+
+def test_mount_skills_to_roles_creates_non_wildcard_role_override(
+    tmp_path: Path,
+) -> None:
+    skill_dir = tmp_path / ".relay-teams" / "skills" / "demo-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: demo-skill\ndescription: demo installer\n---\nUse demo.\n",
+        encoding="utf-8",
+    )
+    old_home = os.environ.get("HOME")
+    old_userprofile = os.environ.get("USERPROFILE")
+    home_value = tmp_path.resolve().as_posix()
+    os.environ["HOME"] = home_value
+    os.environ["USERPROFILE"] = home_value
+    try:
+        mounted_roles = installer_support.mount_skills_to_roles(
+            role_ids=("daily-ai-report",),
+            skill_names=("demo-skill",),
+        )
+    finally:
+        if old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = old_home
+        if old_userprofile is None:
+            os.environ.pop("USERPROFILE", None)
+        else:
+            os.environ["USERPROFILE"] = old_userprofile
+
+    assert mounted_roles == ("daily-ai-report",)
+    role_path = tmp_path / ".relay-teams" / "roles" / "daily-ai-report.md"
     assert role_path.exists()
     role_text = role_path.read_text(encoding="utf-8")
-    assert "role_id: MainAgent" in role_text
-    assert "- skill-installer" in role_text
+    assert "role_id: daily-ai-report" in role_text
     assert "- demo-skill" in role_text
+
+
+def test_mount_skills_to_roles_rejects_project_only_skill_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    home_dir = tmp_path / "home"
+    project_dir = tmp_path / "repo"
+    project_skill_dir = project_dir / ".agents" / "skills" / "project-only"
+    project_skill_dir.mkdir(parents=True)
+    (project_skill_dir / "SKILL.md").write_text(
+        (
+            "---\n"
+            "name: project-only\n"
+            "description: project-only skill\n"
+            "---\n"
+            "Use the project-only skill.\n"
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", home_dir.resolve().as_posix())
+    monkeypatch.setenv("USERPROFILE", home_dir.resolve().as_posix())
+    monkeypatch.chdir(project_dir)
+
+    with pytest.raises(installer_support.SkillInstallerError) as exc_info:
+        installer_support.mount_skills_to_roles(
+            role_ids=("MainAgent",),
+            skill_names=("project-only",),
+        )
+
+    assert str(exc_info.value) == "Unknown skills: ['project-only']"
 
 
 def test_resolve_role_mount_targets_defaults_to_current_role_env(
@@ -310,10 +602,19 @@ def test_resolve_role_mount_targets_defaults_to_current_role_env(
 def test_request_bytes_reports_timeout_details(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def _raise_timeout(*args: object, **kwargs: object) -> object:
-        raise URLError(TimeoutError("timed out"))
+    class _TimeoutClient:
+        async def __aenter__(self) -> "_TimeoutClient":
+            return self
 
-    monkeypatch.setattr(installer_support, "urlopen", _raise_timeout)
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def get(self, url: str, *, headers: dict[str, str]) -> httpx.Response:
+            _ = (url, headers)
+            raise httpx.TimeoutException("timed out")
+
+    mock_factory = MagicMock(return_value=_TimeoutClient())
+    monkeypatch.setattr(installer_support, "create_async_http_client", mock_factory)
 
     with pytest.raises(installer_support.SkillInstallerError) as exc_info:
         installer_support._request_bytes("https://example.com/skills")
@@ -321,7 +622,6 @@ def test_request_bytes_reports_timeout_details(
     message = str(exc_info.value)
     assert "Request timed out after" in message
     assert "https://example.com/skills" in message
-    assert "TimeoutError: timed out" in message
 
 
 def test_run_git_reports_command_context_on_failure(
@@ -374,7 +674,7 @@ def test_run_git_reports_timeout(
 
 
 def test_install_skill_script_reports_errors_on_stderr(tmp_path: Path) -> None:
-    existing_skill_dir = tmp_path / ".agent-teams" / "skills" / "demo-skill"
+    existing_skill_dir = tmp_path / ".relay-teams" / "skills" / "demo-skill"
     existing_skill_dir.mkdir(parents=True)
     (existing_skill_dir / "SKILL.md").write_text(
         "---\nname: demo-skill\ndescription: existing\n---\nUse demo.\n",
@@ -425,23 +725,46 @@ def _run_script(
     env = os.environ.copy()
     existing_python_path = env.get("PYTHONPATH", "").strip()
     source_path = (repo_root / "src").resolve().as_posix()
-    env["PYTHONPATH"] = (
-        source_path
-        if not existing_python_path
-        else source_path + os.pathsep + existing_python_path
-    )
+    env["PYTHONPATH"] = _join_env_paths(source_path, existing_python_path)
     home_value = home_dir.resolve().as_posix()
     env["HOME"] = home_value
     env["USERPROFILE"] = home_value
     env.update(extra_env)
-    return subprocess.run(
-        [sys.executable, str(script_path), *args],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-        check=False,
-        env=env,
-        timeout=30,
+
+    clear_clawhub_path_cache()
+    old_cwd = Path.cwd()
+    old_argv = sys.argv[:]
+    old_env = os.environ.copy()
+    stdout_buffer = StringIO()
+    stderr_buffer = StringIO()
+    return_code = 0
+    try:
+        os.chdir(repo_root)
+        os.environ.clear()
+        os.environ.update(env)
+        sys.argv = [str(script_path), *args]
+        with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
+            try:
+                runpy.run_path(str(script_path), run_name="__main__")
+            except SystemExit as exc:
+                code = exc.code
+                if isinstance(code, int):
+                    return_code = code
+                elif code is None:
+                    return_code = 0
+                else:
+                    stderr_buffer.write(f"{code}\n")
+                    return_code = 1
+    finally:
+        sys.argv = old_argv
+        os.environ.clear()
+        os.environ.update(old_env)
+        os.chdir(old_cwd)
+    return subprocess.CompletedProcess(
+        args=[sys.executable, str(script_path), *args],
+        returncode=return_code,
+        stdout=stdout_buffer.getvalue(),
+        stderr=stderr_buffer.getvalue(),
     )
 
 

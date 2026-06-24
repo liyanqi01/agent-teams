@@ -4,13 +4,13 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from agent_teams.env.proxy_config_service import ProxyConfigService
-from agent_teams.env.proxy_env import (
+from relay_teams.env.proxy_config_service import ProxyConfigService
+from relay_teams.env.proxy_env import (
     ProxyEnvConfig,
     ProxyEnvInput,
     sync_proxy_env_to_process_env,
 )
-from agent_teams.env.proxy_secret_store import ProxySecretStore
+from relay_teams.env.proxy_secret_store import ProxySecretStore
 
 
 class _FakeProxySecretStore(ProxySecretStore):
@@ -52,7 +52,7 @@ def _clear_proxy_env(monkeypatch) -> None:
 
 def _set_test_app_config_dir(monkeypatch, config_dir: Path) -> None:
     monkeypatch.setattr(
-        "agent_teams.env.runtime_env.get_app_config_dir",
+        "relay_teams.env.runtime_env.get_app_config_dir",
         lambda user_home_dir=None: config_dir,
     )
 
@@ -343,7 +343,7 @@ def test_save_proxy_config_clears_runtime_proxy_env_when_proxy_removed(
     )
 
 
-def test_reload_proxy_config_ignores_stale_process_proxy_env(
+def test_reload_proxy_config_uses_effective_process_proxy_env(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -365,7 +365,7 @@ def test_reload_proxy_config_ignores_stale_process_proxy_env(
 
     assert captured == [
         ProxyEnvConfig(
-            http_proxy=None,
+            http_proxy="http://bad-proxy.invalid:8080",
             https_proxy=None,
             all_proxy=None,
             no_proxy=None,

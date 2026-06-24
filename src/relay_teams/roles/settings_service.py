@@ -1,0 +1,755 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+from collections.abc import Callable
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import yaml
+
+from relay_teams.mcp.mcp_registry import McpRegistry
+from relay_teams.roles.default_role_tools import apply_default_role_tools
+from relay_teams.roles.role_models import (
+    RoleConfigSource,
+    RoleDefinition,
+    RoleDocumentDraft,
+    RoleDocumentRecord,
+    RoleDocumentSummary,
+    RoleValidationResult,
+)
+from relay_teams.roles.role_registry import RoleLoader, RoleRegistry
+from relay_teams.roles.role_registry import (
+    COORDINATOR_REQUIRED_TOOLS,
+    ensure_required_system_roles,
+    is_coordinator_role_definition,
+    is_reserved_system_role_definition,
+)
+from relay_teams.plugins.plugin_models import PluginComponentSource
+from relay_teams.skills.skill_registry import SkillRegistry
+from relay_teams.tools.registry import ToolRegistry
+from relay_teams.roles.memory_models import default_memory_profile
+from relay_teams.roles.tool_diet_policy import ToolDietPolicy
+from relay_teams.roles.tool_diet_validation import (
+    validate_tool_diet,
+)
+from relay_teams.roles.role_contracts import (
+    RoleContract,
+    RoleContractInvariant,
+    is_empty_role_contract,
+    role_contract_invariant_failures,
+)
+
+import asyncio
+
+if TYPE_CHECKING:
+    from relay_teams.agent_runtimes import ExternalAgentConfigService
+
+
+from relay_teams.roles.tool_diet_validation import should_reject
+
+
+class RoleSettingsService:
+    def __init__(
+        self,
+        *,
+        roles_dir: Path,
+        builtin_roles_dir: Path,
+        get_tool_registry: Callable[[], ToolRegistry],
+        get_mcp_registry: Callable[[], McpRegistry],
+        get_skill_registry: Callable[[], SkillRegistry],
+        get_external_agent_service: Callable[[], ExternalAgentConfigService] | None,
+        on_roles_reloaded: Callable[[RoleRegistry], None],
+        reload_skill_registry: Callable[[], SkillRegistry] | None = None,
+        plugin_sources: tuple[PluginComponentSource, ...] = (),
+        tool_diet_policy: ToolDietPolicy | None = None,
+    ) -> None:
+        self._roles_dir: Path = roles_dir
+        self._builtin_roles_dir: Path = builtin_roles_dir
+        self._plugin_sources: tuple[PluginComponentSource, ...] = plugin_sources
+        self._loader: RoleLoader = RoleLoader()
+        self._get_tool_registry: Callable[[], ToolRegistry] = get_tool_registry
+        self._get_mcp_registry: Callable[[], McpRegistry] = get_mcp_registry
+        self._get_skill_registry: Callable[[], SkillRegistry] = get_skill_registry
+        self._reload_skill_registry = reload_skill_registry
+        self._get_external_agent_service = get_external_agent_service
+        self._on_roles_reloaded: Callable[[RoleRegistry], None] = on_roles_reloaded
+        self._tool_diet_policy = tool_diet_policy or ToolDietPolicy()
+
+    def replace_plugin_sources(
+        self,
+        plugin_sources: tuple[PluginComponentSource, ...],
+    ) -> None:
+        self._plugin_sources = plugin_sources
+
+    def list_role_documents(self) -> tuple[RoleDocumentSummary, ...]:
+        builtin_role_ids = self._load_builtin_role_ids()
+        documents: list[RoleDocumentSummary] = []
+        for role_id, (role_path, source) in self._loader.build_effective_role_map(
+            builtin_roles_dir=self._builtin_roles_dir,
+            app_roles_dir=self._roles_dir,
+            plugin_sources=self._plugin_sources,
+        ).items():
+            definition = self._role_definition_for_source(
+                role_path=role_path,
+                source=source,
+            )
+            definition = self._validate_definition(
+                definition,
+                strict_capability_validation=False,
+                consumer=f"roles.settings_service.list_role_documents.role:{role_id}",
+            )
+            documents.append(
+                self._summary_from_definition(
+                    definition,
+                    source=source,
+                    builtin_role_ids=builtin_role_ids,
+                )
+            )
+        return tuple(documents)
+
+    def get_role_document(self, role_id: str) -> RoleDocumentRecord:
+        role_path, source = self._find_role_record(role_id)
+        content = role_path.read_text(encoding="utf-8")
+        role = self._canonicalize_role_capabilities_for_record(
+            self._role_definition_for_source(
+                role_path=role_path,
+                source=source,
+            ),
+            consumer=f"roles.settings_service.get_role_document.role:{role_id}",
+        )
+        return self._record_from_definition(
+            definition=role,
+            file_name=role_path.name,
+            content=content,
+            source=source,
+        )
+
+    def validate_role_document(
+        self,
+        draft: RoleDocumentDraft,
+    ) -> RoleValidationResult:
+        normalized = self._normalize_draft(draft)
+        content = self._serialize_role_document(normalized)
+        role = self._loader.load_from_text(
+            content,
+            source_name=f"{normalized.role_id}.md",
+        )
+        validated_role = self._validate_definition(
+            role,
+            strict_capability_validation=True,
+            consumer=f"roles.settings_service.validate_role_document.role:{normalized.role_id}",
+        )
+        canonical_role = _collapse_wildcard_capabilities(validated_role)
+        canonical_content = self._serialize_role_document(
+            normalized.model_copy(
+                update={
+                    "mcp_servers": canonical_role.mcp_servers,
+                    "skills": canonical_role.skills,
+                }
+            )
+        )
+        diet_report = validate_tool_diet(
+            policy=self._tool_diet_policy,
+            tool_count=len(canonical_role.tools),
+            objective=canonical_role.system_prompt,
+            role_id=normalized.role_id,
+            verification_acceptance_criteria_count=self._tool_diet_policy.min_verification_fields,
+        )
+        diet_warnings = tuple(f for f in diet_report.findings)
+        return RoleValidationResult(
+            valid=True,
+            role=self._record_from_definition(
+                definition=canonical_role,
+                file_name=f"{normalized.role_id}.md",
+                content=canonical_content,
+                source_role_id=normalized.source_role_id,
+                source=RoleConfigSource.APP,
+            ),
+            diet_warnings=diet_warnings,
+        )
+
+    def save_role_document(
+        self,
+        role_id: str,
+        draft: RoleDocumentDraft,
+    ) -> RoleDocumentRecord:
+        normalized = self._normalize_draft(draft)
+        if normalized.role_id != role_id:
+            raise ValueError("Path role_id must match payload role_id")
+
+        source_role_id = normalized.source_role_id or role_id
+        source_record = self._find_role_record_optional(source_role_id)
+        source_path = None if source_record is None else source_record[0]
+        if source_path is not None:
+            source_definition = self._loader.load_one(source_path)
+            self._validate_reserved_role_mutation(
+                source_definition=source_definition,
+                draft=normalized,
+            )
+        validation_result = self.validate_role_document(normalized)
+        diet_report = getattr(validation_result, "diet_report", None)
+        if diet_report is not None and should_reject(diet_report):
+            error_msg = "; ".join(
+                f.message for f in diet_report.findings if f.severity.value == "error"
+            )
+            raise ValueError(f"Role tool diet validation failed: {error_msg}")
+        validated = validation_result.role
+        target_path = self._roles_dir / f"{normalized.role_id}.md"
+        if source_record is None and normalized.source_role_id:
+            raise ValueError(f"Role not found: {source_role_id}")
+        if target_path.exists() and (
+            source_path is None or target_path.resolve() != source_path.resolve()
+        ):
+            raise ValueError(f"Role file already exists: {target_path.name}")
+
+        self._roles_dir.mkdir(parents=True, exist_ok=True)
+        target_path.write_text(validated.content, encoding="utf-8")
+        if (
+            source_path is not None
+            and source_record is not None
+            and source_record[1] == RoleConfigSource.APP
+            and target_path != source_path
+            and source_path.exists()
+        ):
+            source_path.unlink()
+
+        registry = self._load_registry(
+            strict_capability_validation=False,
+            consumer_prefix="roles.settings_service.save_role_document",
+        )
+        self._on_roles_reloaded(registry)
+        return self.get_role_document(normalized.role_id)
+
+    def delete_role_document(self, role_id: str) -> None:
+        normalized_role_id = role_id.strip()
+        if not normalized_role_id:
+            raise ValueError("Role not found: ")
+        builtin_role_ids = self._load_builtin_role_ids()
+        role_path, source = self._find_role_record(normalized_role_id)
+        if not self._is_role_deletable(
+            role_id=normalized_role_id,
+            source=source,
+            builtin_role_ids=builtin_role_ids,
+        ):
+            raise ValueError(f"Role cannot be deleted: {normalized_role_id}")
+        role_path.unlink()
+        registry = self._load_registry(
+            strict_capability_validation=False,
+            consumer_prefix="roles.settings_service.delete_role_document",
+        )
+        self._on_roles_reloaded(registry)
+
+    def validate_all_roles(self) -> dict[str, int | bool]:
+        registry = self._load_registry(
+            strict_capability_validation=True,
+            consumer_prefix="roles.settings_service.validate_all_roles",
+        )
+        ensure_required_system_roles(registry)
+        return {
+            "valid": True,
+            "loaded_count": len(registry.list_roles()),
+        }
+
+    async def list_role_documents_async(self) -> tuple[RoleDocumentSummary, ...]:
+
+        return await asyncio.to_thread(self.list_role_documents)
+
+    async def get_role_document_async(self, role_id: str) -> RoleDocumentRecord:
+
+        return await asyncio.to_thread(self.get_role_document, role_id)
+
+    async def save_role_document_async(
+        self, role_id: str, draft: RoleDocumentDraft
+    ) -> RoleDocumentRecord:
+
+        return await asyncio.to_thread(self.save_role_document, role_id, draft)
+
+    async def delete_role_document_async(self, role_id: str) -> None:
+
+        return await asyncio.to_thread(self.delete_role_document, role_id)
+
+    async def validate_all_roles_async(self) -> dict[str, int | bool]:
+
+        return await asyncio.to_thread(self.validate_all_roles)
+
+    async def validate_role_document_async(
+        self, draft: RoleDocumentDraft
+    ) -> RoleValidationResult:
+
+        return await asyncio.to_thread(self.validate_role_document, draft)
+
+    def _summary_from_definition(
+        self,
+        definition: RoleDefinition,
+        *,
+        source: RoleConfigSource,
+        builtin_role_ids: frozenset[str],
+    ) -> RoleDocumentSummary:
+        return RoleDocumentSummary(
+            role_id=definition.role_id,
+            name=definition.name,
+            description=definition.description,
+            version=definition.version,
+            model_profile=definition.model_profile,
+            bound_agent_id=definition.bound_agent_id,
+            execution_surface=definition.execution_surface,
+            mode=definition.mode,
+            source=source,
+            deletable=self._is_role_deletable(
+                role_id=definition.role_id,
+                source=source,
+                builtin_role_ids=builtin_role_ids,
+            ),
+        )
+
+    def _record_from_definition(
+        self,
+        *,
+        definition: RoleDefinition,
+        file_name: str,
+        content: str,
+        source_role_id: str | None = None,
+        source: RoleConfigSource = RoleConfigSource.APP,
+    ) -> RoleDocumentRecord:
+        return RoleDocumentRecord(
+            source_role_id=source_role_id,
+            role_id=definition.role_id,
+            name=definition.name,
+            description=definition.description,
+            version=definition.version,
+            tools=definition.tools,
+            mcp_servers=definition.mcp_servers,
+            skills=definition.skills,
+            model_profile=definition.model_profile,
+            bound_agent_id=definition.bound_agent_id,
+            execution_surface=definition.execution_surface,
+            mode=definition.mode,
+            memory_profile=definition.memory_profile,
+            contract=definition.contract,
+            system_prompt=definition.system_prompt,
+            source=source,
+            file_name=file_name,
+            content=content,
+        )
+
+    @staticmethod
+    def _normalize_draft(draft: RoleDocumentDraft) -> RoleDocumentDraft:
+        normalized_role_id = draft.role_id.strip()
+        return draft.model_copy(
+            update={
+                "role_id": normalized_role_id,
+                "name": draft.name.strip(),
+                "description": draft.description.strip(),
+                "version": draft.version.strip(),
+                "model_profile": draft.model_profile.strip(),
+                "bound_agent_id": _normalize_optional_text(draft.bound_agent_id),
+                "system_prompt": draft.system_prompt.strip(),
+                "tools": apply_default_role_tools(
+                    role_id=normalized_role_id,
+                    role_name=draft.name,
+                    mode=draft.mode.value,
+                    tools=tuple(item.strip() for item in draft.tools if item.strip()),
+                ),
+                "mcp_servers": _normalize_capability_references(draft.mcp_servers),
+                "skills": _normalize_capability_references(draft.skills),
+            }
+        )
+
+    @staticmethod
+    def _serialize_role_document(draft: RoleDocumentDraft) -> str:
+        front_matter: dict[str, object] = {
+            "role_id": draft.role_id,
+            "name": draft.name,
+            "description": draft.description,
+            "model_profile": draft.model_profile,
+            "version": draft.version,
+            "tools": list(draft.tools),
+            "execution_surface": draft.execution_surface.value,
+            "mode": draft.mode.value,
+        }
+        if draft.bound_agent_id:
+            front_matter["bound_agent_id"] = draft.bound_agent_id
+        if draft.mcp_servers:
+            front_matter["mcp_servers"] = list(draft.mcp_servers)
+        if draft.skills:
+            front_matter["skills"] = list(draft.skills)
+        if draft.memory_profile != default_memory_profile():
+            front_matter["memory_profile"] = draft.memory_profile.model_dump(
+                mode="json"
+            )
+        if not is_empty_role_contract(draft.contract):
+            front_matter["contract"] = draft.contract.model_dump(
+                mode="json",
+                exclude_defaults=True,
+            )
+        serialized_front_matter = yaml.safe_dump(
+            front_matter,
+            sort_keys=False,
+            allow_unicode=False,
+        ).strip()
+        return f"---\n{serialized_front_matter}\n---\n\n{draft.system_prompt.strip()}\n"
+
+    def _load_registry(
+        self,
+        *,
+        strict_capability_validation: bool,
+        consumer_prefix: str,
+    ) -> RoleRegistry:
+        registry = self._loader.load_builtin_app_and_plugins(
+            builtin_roles_dir=self._builtin_roles_dir,
+            app_roles_dir=self._roles_dir,
+            plugin_sources=self._plugin_sources,
+            allow_empty=True,
+        )
+        sanitized_registry = RoleRegistry()
+        for definition in registry.list_roles():
+            consumer = f"{consumer_prefix}.role:{definition.role_id}"
+            validated_definition = self._validate_definition(
+                definition,
+                strict_capability_validation=strict_capability_validation,
+                consumer=consumer,
+            )
+            sanitized_registry.register(validated_definition)
+        return sanitized_registry
+
+    def _validate_definition(
+        self,
+        definition: RoleDefinition,
+        *,
+        strict_capability_validation: bool,
+        consumer: str,
+    ) -> RoleDefinition:
+        if strict_capability_validation:
+            tools = definition.tools
+            mcp_servers = definition.mcp_servers
+            self._get_tool_registry().validate_known(tools)
+            self._get_mcp_registry().validate_known(mcp_servers)
+            contract = self._validate_contract_capability_references(
+                definition.contract,
+                strict=True,
+                consumer=consumer,
+            )
+            skills = self._resolve_strict_skills_with_recovery(
+                definition.skills,
+                consumer=consumer,
+            )
+            mcp_servers = self._get_mcp_registry().resolve_server_names(
+                mcp_servers,
+                strict=True,
+                consumer=consumer,
+                expand_wildcards=False,
+            )
+            definition = definition.model_copy(
+                update={
+                    "tools": tools,
+                    "mcp_servers": mcp_servers,
+                    "skills": skills,
+                    "contract": contract,
+                }
+            )
+        else:
+            tools = self._get_tool_registry().resolve_known(
+                definition.tools,
+                strict=False,
+                consumer=consumer,
+            )
+            mcp_servers = self._get_mcp_registry().resolve_server_names(
+                definition.mcp_servers,
+                strict=False,
+                consumer=consumer,
+                expand_wildcards=False,
+            )
+            skills = self._get_skill_registry().resolve_known(
+                definition.skills,
+                strict=False,
+                consumer=consumer,
+                expand_wildcards=False,
+            )
+            contract = self._validate_contract_capability_references(
+                definition.contract,
+                strict=False,
+                consumer=consumer,
+            )
+            definition = definition.model_copy(
+                update={
+                    "tools": tools,
+                    "mcp_servers": mcp_servers,
+                    "skills": skills,
+                    "contract": contract,
+                }
+            )
+        if strict_capability_validation:
+            invariant_failures = role_contract_invariant_failures(
+                contract=definition.contract,
+                tools=definition.tools,
+                mcp_servers=definition.mcp_servers,
+                skills=definition.skills,
+            )
+            if invariant_failures:
+                raise ValueError(
+                    "Role contract invariants failed: " + "; ".join(invariant_failures)
+                )
+        if definition.bound_agent_id:
+            if self._get_external_agent_service is None:
+                raise ValueError(
+                    "External agent bindings are not available in this runtime"
+                )
+            try:
+                self._get_external_agent_service().get_agent(definition.bound_agent_id)
+            except KeyError as exc:
+                raise ValueError(
+                    f"Unknown external agent binding: {definition.bound_agent_id}"
+                ) from exc
+        if is_reserved_system_role_definition(definition):
+            missing_tools = COORDINATOR_REQUIRED_TOOLS.difference(definition.tools)
+            if missing_tools and is_coordinator_role_definition(definition):
+                missing = ", ".join(sorted(missing_tools))
+                raise ValueError(
+                    f"Coordinator role must keep required tools: {missing}"
+                )
+        return definition
+
+    def _validate_contract_capability_references(
+        self,
+        contract: RoleContract,
+        *,
+        strict: bool,
+        consumer: str,
+    ) -> RoleContract:
+        if is_empty_role_contract(contract):
+            return contract
+        updated_invariants: list[RoleContractInvariant] = []
+        changed = False
+        for invariant in contract.invariants:
+            tools = invariant.tools
+            if invariant.tools:
+                tools = self._get_tool_registry().resolve_known(
+                    invariant.tools,
+                    strict=strict,
+                    consumer=consumer,
+                )
+            mcp_servers = invariant.mcp_servers
+            if invariant.mcp_servers:
+                mcp_servers = self._get_mcp_registry().resolve_server_names(
+                    invariant.mcp_servers,
+                    strict=strict,
+                    consumer=consumer,
+                    expand_wildcards=False,
+                )
+            skills = invariant.skills
+            if invariant.skills:
+                if strict:
+                    skills = self._resolve_strict_skills_with_recovery(
+                        invariant.skills,
+                        consumer=consumer,
+                    )
+                else:
+                    skills = self._get_skill_registry().resolve_known(
+                        invariant.skills,
+                        strict=False,
+                        consumer=consumer,
+                        expand_wildcards=False,
+                    )
+            if (
+                tools != invariant.tools
+                or mcp_servers != invariant.mcp_servers
+                or skills != invariant.skills
+            ):
+                changed = True
+                invariant = invariant.model_copy(
+                    update={
+                        "tools": tools,
+                        "mcp_servers": mcp_servers,
+                        "skills": skills,
+                    }
+                )
+            updated_invariants.append(invariant)
+        if changed:
+            return contract.model_copy(update={"invariants": tuple(updated_invariants)})
+        return contract
+
+    def _resolve_strict_skills_with_recovery(
+        self,
+        skill_names: tuple[str, ...],
+        *,
+        consumer: str,
+    ) -> tuple[str, ...]:
+        try:
+            return self._get_skill_registry().resolve_known(
+                skill_names,
+                strict=True,
+                consumer=consumer,
+                expand_wildcards=False,
+            )
+        except ValueError as exc:
+            if not _should_retry_builtin_skill_resolution(exc):
+                raise
+            if self._reload_skill_registry is None:
+                raise
+            reloaded_registry = self._reload_skill_registry()
+            return reloaded_registry.resolve_known(
+                skill_names,
+                strict=True,
+                consumer=consumer,
+                expand_wildcards=False,
+            )
+
+    def _canonicalize_role_capabilities_for_record(
+        self,
+        definition: RoleDefinition,
+        *,
+        consumer: str,
+    ) -> RoleDefinition:
+        normalized_tools: list[str] = []
+        for tool_name in definition.tools:
+            normalized_tool_name = tool_name.strip()
+            if not normalized_tool_name:
+                continue
+            resolved_tools = self._get_tool_registry().resolve_known(
+                (normalized_tool_name,),
+                strict=False,
+                consumer=consumer,
+            )
+            if resolved_tools:
+                normalized_tools.append(resolved_tools[0])
+            else:
+                normalized_tools.append(normalized_tool_name)
+        normalized_skills: list[str] = []
+        for skill_name in definition.skills:
+            normalized_skill_name = skill_name.strip()
+            if not normalized_skill_name:
+                continue
+            resolved = self._get_skill_registry().resolve_known(
+                (normalized_skill_name,),
+                strict=False,
+                consumer=consumer,
+                expand_wildcards=False,
+            )
+            if resolved:
+                normalized_skills.append(resolved[0])
+            else:
+                normalized_skills.append(normalized_skill_name)
+        return definition.model_copy(
+            update={
+                "tools": tuple(normalized_tools),
+                "skills": tuple(normalized_skills),
+            }
+        )
+
+    def _validate_reserved_role_mutation(
+        self,
+        *,
+        source_definition: RoleDefinition,
+        draft: RoleDocumentDraft,
+    ) -> None:
+        if not is_reserved_system_role_definition(source_definition):
+            return
+        locked_pairs = (
+            ("role_id", source_definition.role_id, draft.role_id),
+            ("name", source_definition.name, draft.name),
+            ("description", source_definition.description, draft.description),
+            ("version", source_definition.version, draft.version),
+            ("mode", source_definition.mode.value, draft.mode.value),
+        )
+        for field_name, source_value, next_value in locked_pairs:
+            if str(source_value) != str(next_value):
+                raise ValueError(
+                    f"{field_name} is locked for reserved system role {source_definition.role_id}"
+                )
+
+    def _find_role_record(self, role_id: str) -> tuple[Path, RoleConfigSource]:
+        role_record = self._find_role_record_optional(role_id)
+        if role_record is None:
+            raise ValueError(f"Role not found: {role_id}")
+        return role_record
+
+    def _find_role_record_optional(
+        self,
+        role_id: str,
+    ) -> tuple[Path, RoleConfigSource] | None:
+        return self._loader.build_effective_role_map(
+            builtin_roles_dir=self._builtin_roles_dir,
+            app_roles_dir=self._roles_dir,
+            plugin_sources=self._plugin_sources,
+        ).get(role_id)
+
+    def _resolve_role_source(self, role_id: str) -> RoleConfigSource:
+        return self._load_role_sources().get(role_id, RoleConfigSource.APP)
+
+    def _load_role_sources(self) -> dict[str, RoleConfigSource]:
+        return {
+            role_id: source
+            for role_id, (_, source) in self._loader.build_effective_role_map(
+                builtin_roles_dir=self._builtin_roles_dir,
+                app_roles_dir=self._roles_dir,
+                plugin_sources=self._plugin_sources,
+            ).items()
+        }
+
+    def _load_builtin_role_ids(self) -> frozenset[str]:
+        return frozenset(
+            self._loader.load_one(md_file).role_id
+            for md_file in sorted(self._builtin_roles_dir.glob("*.md"))
+        )
+
+    def _is_role_deletable(
+        self,
+        *,
+        role_id: str,
+        source: RoleConfigSource,
+        builtin_role_ids: frozenset[str],
+    ) -> bool:
+        return source == RoleConfigSource.APP and role_id not in builtin_role_ids
+
+    def _role_definition_for_source(
+        self,
+        *,
+        role_path: Path,
+        source: RoleConfigSource,
+    ) -> RoleDefinition:
+        if source != RoleConfigSource.PLUGIN:
+            return self._loader.load_one(role_path)
+        plugin_name = self._plugin_name_for_role_path(role_path)
+        if plugin_name is None:
+            return self._loader.load_one(role_path)
+        return self._loader.load_plugin_one(role_path, plugin_name=plugin_name)
+
+    def _plugin_name_for_role_path(self, role_path: Path) -> str | None:
+        resolved_role_path = role_path.expanduser().resolve()
+        for plugin_source in self._plugin_sources:
+            resolved_source_path = plugin_source.path.expanduser().resolve()
+            try:
+                resolved_role_path.relative_to(resolved_source_path)
+            except ValueError:
+                continue
+            return plugin_source.plugin_name
+        return None
+
+
+def _normalize_optional_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    return normalized
+
+
+def _normalize_capability_references(values: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(item.strip() for item in values if item.strip())
+
+
+def _collapse_wildcard_capabilities(definition: RoleDefinition) -> RoleDefinition:
+    updates: dict[str, tuple[str, ...]] = {}
+    if "*" in definition.mcp_servers:
+        updates["mcp_servers"] = ("*",)
+    if "*" in definition.skills:
+        updates["skills"] = ("*",)
+    if not updates:
+        return definition
+    return definition.model_copy(update=updates)
+
+
+def _should_retry_builtin_skill_resolution(error: ValueError) -> bool:
+    message = str(error)
+    return "Unknown skills:" in message

@@ -3,39 +3,55 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from concurrent.futures import Future
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock
 from typing import cast
 
 import pytest
+from pydantic import ValidationError
 
 from pydantic import JsonValue
 
-from agent_teams.gateway.gateway_models import GatewayChannelType, GatewaySessionRecord
-from agent_teams.gateway.gateway_session_service import GatewaySessionService
-from agent_teams.gateway.im import ImSessionCommandService, ImToolService
-from agent_teams.gateway.wechat.account_repository import WeChatAccountRepository
-from agent_teams.gateway.wechat.client import WeChatClient
-from agent_teams.gateway.wechat.models import (
-    WeChatAccountRecord,
-    WeChatInboundMessage,
-    WeChatMessageItem,
+from relay_teams.gateway.gateway_models import GatewayChannelType, GatewaySessionRecord
+from relay_teams.gateway.gateway_session_service import GatewaySessionService
+from relay_teams.gateway.im.command_service import ImSessionCommandService
+from relay_teams.gateway.im.service import ImToolService
+from relay_teams.gateway.wechat.account_repository import WeChatAccountRepository
+from relay_teams.gateway.wechat.client import WeChatClient
+from relay_teams.gateway.wechat.inbound_queue_repository import (
+    WeChatInboundQueueRepository,
 )
-from agent_teams.gateway.wechat.secret_store import WeChatSecretStore
-from agent_teams.gateway.wechat.service import WeChatGatewayService
-from agent_teams.sessions import SessionService
-from agent_teams.sessions.runs.enums import RunEventType
-from agent_teams.sessions.runs.run_manager import RunManager
-from agent_teams.sessions.runs.run_models import RunEvent
-from agent_teams.sessions.session_models import SessionMode
+from relay_teams.gateway.wechat.models import (
+    WeChatAccountRecord,
+    WeChatAccountUpdateInput,
+    WeChatGetUpdatesResponse,
+    WeChatInboundMessage,
+    WeChatInboundQueueRecord,
+    WeChatInboundQueueStatus,
+    WeChatLoginStartRequest,
+    WeChatLoginWaitRequest,
+    WeChatMessageItem,
+    WeChatQrCodeResponse,
+    WeChatQrStatusResponse,
+)
+from relay_teams.gateway.wechat.secret_store import WeChatSecretStore
+from relay_teams.gateway.wechat.service import WeChatGatewayService
+from relay_teams.gateway.user_questions import UserQuestionAnswerStatus
+from relay_teams.media import content_parts_from_text
+from relay_teams.sessions.session_service import SessionService
+from relay_teams.sessions.runs.enums import RunEventType
+from relay_teams.sessions.runs.run_service import SessionRunService
+from relay_teams.sessions.runs.run_models import RunEvent, RunResult
+from relay_teams.sessions.runs.user_question_models import (
+    UserQuestionAnswerSubmission,
+)
+from relay_teams.sessions.session_models import SessionMode
 
 _RECEIPT_CREATED = "\u6536\u5230\uff0c\u6b63\u5728\u5904\u7406\u3002"
-_RECEIPT_JOINED = (
-    "\u6536\u5230\uff0c\u5df2\u52a0\u5165\u5f53\u524d\u4f1a\u8bdd\u5904\u7406\u3002"
-)
+_RECEIPT_QUEUED = "\u6536\u5230\uff0c\u5df2\u8fdb\u5165\u6392\u961f\u3002\u5f53\u524d\u4f1a\u8bdd\u524d\u9762\u8fd8\u6709 1 \u6761\u6d88\u606f\u3002"
 
 
 def test_normalize_qr_code_url_keeps_image_url() -> None:
@@ -123,6 +139,74 @@ async def test_await_terminal_and_reply_records_success() -> None:
 
 
 @pytest.mark.asyncio
+async def test_start_and_wait_login_use_async_client() -> None:
+    (
+        service,
+        _gateway_session_service,
+        _run_service,
+        _im_tool_service,
+        _command_service,
+    ) = _build_service(events=())
+
+    start_response = await service.start_login(
+        WeChatLoginStartRequest(
+            base_url="https://login.example.test",
+            route_tag="route-a",
+            bot_type="bot-a",
+        )
+    )
+    wait_response = await service.wait_login(
+        WeChatLoginWaitRequest(session_key=start_response.session_key, timeout_ms=1000)
+    )
+
+    client = cast(_FakeWeChatClient, service._client)
+    assert client.start_login_calls == [
+        {
+            "base_url": "https://login.example.test",
+            "route_tag": "route-a",
+            "bot_type": "bot-a",
+        }
+    ]
+    assert client.wait_login_calls == [1000]
+    assert wait_response.connected is False
+
+
+def test_run_monitor_uses_async_monitor_wrapper() -> None:
+    (
+        service,
+        _gateway_session_service,
+        _run_service,
+        _im_tool_service,
+        _command_service,
+    ) = _build_service(events=())
+    stop_event = Event()
+    stop_event.set()
+
+    service._run_monitor("wx-account-1", stop_event)
+
+    assert service._status("wx-account-1").running is True
+
+
+@pytest.mark.asyncio
+async def test_run_monitor_async_polls_updates_until_stopped() -> None:
+    (
+        service,
+        _gateway_session_service,
+        _run_service,
+        _im_tool_service,
+        _command_service,
+    ) = _build_service(events=())
+    stop_event = Event()
+    client = cast(_FakeWeChatClient, service._client)
+    client.stop_event = stop_event
+
+    await service._run_monitor_async("wx-account-1", stop_event)
+
+    assert client.get_updates_calls == [("wx-account-1", "bot-token", 35000)]
+    assert service._status("wx-account-1").last_event_at is not None
+
+
+@pytest.mark.asyncio
 async def test_await_terminal_and_reply_records_failure_when_send_fails() -> None:
     service, gateway_session_service, _, _, _ = _build_service(
         events=(
@@ -155,6 +239,368 @@ async def test_await_terminal_and_reply_records_failure_when_send_fails() -> Non
     assert "run-1" not in service._watched_runs
 
 
+@pytest.mark.asyncio
+async def test_await_terminal_and_reply_uses_structured_completed_output() -> None:
+    service, _, _, im_tool_service, _ = _build_service(
+        events=(
+            RunEvent(
+                session_id="session-1",
+                run_id="run-1",
+                trace_id="run-1",
+                event_type=RunEventType.RUN_COMPLETED,
+                payload_json=RunResult(
+                    trace_id="run-1",
+                    root_task_id="task-root-1",
+                    status="completed",
+                    output=content_parts_from_text("Structured reply"),
+                ).model_dump_json(),
+                occurred_at=datetime.now(tz=timezone.utc),
+            ),
+        )
+    )
+    service._watched_runs.add("run-1")
+
+    await service._await_terminal_and_reply(
+        account_id="wx-account-1",
+        gateway_session_id="gws-1",
+        run_id="run-1",
+        peer_user_id="wx-peer-1",
+        context_token="ctx-1",
+    )
+
+    assert im_tool_service.send_text_calls == [
+        {
+            "account_id": "wx-account-1",
+            "peer_user_id": "wx-peer-1",
+            "text": "Structured reply",
+            "context_token": "ctx-1",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_await_terminal_and_reply_sends_pause_notice_without_clearing_binding() -> (
+    None
+):
+    service, gateway_session_service, _, im_tool_service, _ = _build_service(
+        events=(
+            _event(
+                run_id="run-1",
+                event_type=RunEventType.RUN_PAUSED,
+                payload={"error_message": "stream interrupted"},
+            ),
+        )
+    )
+    service._watched_runs.add("run-1")
+
+    await service._await_terminal_and_reply(
+        account_id="wx-account-1",
+        gateway_session_id="gws-1",
+        run_id="run-1",
+        peer_user_id="wx-peer-1",
+        context_token="ctx-1",
+    )
+
+    assert im_tool_service.send_text_calls == [
+        {
+            "account_id": "wx-account-1",
+            "peer_user_id": "wx-peer-1",
+            "text": "Run paused: stream interrupted\nSend resume to continue.",
+            "context_token": "ctx-1",
+        }
+    ]
+    assert gateway_session_service.bind_calls == []
+    snapshot = service._status("wx-account-1")
+    assert snapshot.last_error is None
+    assert snapshot.last_outbound_at is not None
+    assert snapshot.last_event_at == snapshot.last_outbound_at
+    assert "run-1" not in service._watched_runs
+
+
+@pytest.mark.asyncio
+async def test_await_terminal_and_reply_sends_user_question_notice() -> None:
+    service, gateway_session_service, run_service, im_tool_service, _ = _build_service(
+        events=(
+            _event(
+                run_id="run-1",
+                event_type=RunEventType.USER_QUESTION_REQUESTED,
+                payload={
+                    "question_id": "question-1",
+                    "questions": [
+                        {
+                            "question": "Pick a target",
+                            "options": [{"label": "Ship"}, {"label": "Wait"}],
+                        }
+                    ],
+                },
+            ),
+            _event(
+                run_id="run-1",
+                event_type=RunEventType.RUN_PAUSED,
+                payload={"error_message": "waiting for user input"},
+            ),
+            _event(
+                run_id="run-1",
+                event_type=RunEventType.RUN_COMPLETED,
+                payload={"output": "done"},
+            ),
+        )
+    )
+    run_service.user_questions = [_user_question_record()]
+    service._watched_runs.add("run-1")
+
+    await service._await_terminal_and_reply(
+        account_id="wx-account-1",
+        gateway_session_id="gws-1",
+        run_id="run-1",
+        peer_user_id="wx-peer-1",
+        context_token="ctx-1",
+    )
+
+    assert "Pick a target" in str(im_tool_service.send_text_calls[0]["text"])
+    assert im_tool_service.send_text_calls[1]["text"] == "done"
+    assert len(im_tool_service.send_text_calls) == 2
+    assert gateway_session_service.bind_calls == [("gws-1", None)]
+
+
+@pytest.mark.asyncio
+async def test_await_terminal_uses_live_stream_after_question_pause_without_event_id() -> (
+    None
+):
+    class NoEventIdRunService(_FakeRunService):
+        def __init__(self) -> None:
+            super().__init__(())
+            self.offsets: list[int] = []
+            self.stop_on_pause_values: list[bool] = []
+
+        async def stream_run_events(
+            self,
+            run_id: str,
+            after_event_id: int = 0,
+            *,
+            stop_on_pause: bool = True,
+        ) -> AsyncIterator[RunEvent]:
+            self.offsets.append(after_event_id)
+            self.stop_on_pause_values.append(stop_on_pause)
+            yield _event(
+                run_id=run_id,
+                event_type=RunEventType.USER_QUESTION_REQUESTED,
+                payload={
+                    "question_id": "question-1",
+                    "questions": [
+                        {
+                            "question": "Pick one",
+                            "options": [{"label": "Ship"}],
+                        }
+                    ],
+                },
+            ).model_copy(update={"event_id": None})
+            yield _event(
+                run_id=run_id,
+                event_type=RunEventType.RUN_PAUSED,
+                payload={"error_message": "waiting for user input"},
+            ).model_copy(update={"event_id": None})
+            yield _event(
+                run_id=run_id,
+                event_type=RunEventType.RUN_COMPLETED,
+                payload={"output": "done"},
+            ).model_copy(update={"event_id": None})
+
+    run_service = NoEventIdRunService()
+    service, _gateway_session_service, _unused_run_service, im_tool_service, _ = (
+        _build_service(events=())
+    )
+    service._run_service = cast(SessionRunService, run_service)
+    run_service.user_questions = [_user_question_record()]
+    service._watched_runs.add("run-1")
+
+    await service._await_terminal_and_reply(
+        account_id="wx-account-1",
+        gateway_session_id="gws-1",
+        run_id="run-1",
+        peer_user_id="wx-peer-1",
+        context_token="ctx-1",
+    )
+
+    assert run_service.offsets == [0]
+    assert run_service.stop_on_pause_values == [False]
+    assert "Pick one" in str(im_tool_service.send_text_calls[0]["text"])
+    assert im_tool_service.send_text_calls[1]["text"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_await_terminal_and_reply_sends_later_pause_after_question_pause() -> (
+    None
+):
+    service, gateway_session_service, run_service, im_tool_service, _ = _build_service(
+        events=(
+            _event(
+                run_id="run-1",
+                event_type=RunEventType.USER_QUESTION_REQUESTED,
+                payload={
+                    "question_id": "question-1",
+                    "questions": [
+                        {
+                            "question": "Pick a target",
+                            "options": [{"label": "Ship"}, {"label": "Wait"}],
+                        }
+                    ],
+                },
+            ),
+            _event(
+                run_id="run-1",
+                event_type=RunEventType.RUN_PAUSED,
+                payload={"error_message": "waiting for user input"},
+            ),
+            _event(
+                run_id="run-1",
+                event_type=RunEventType.RUN_PAUSED,
+                payload={"error_message": "stream interrupted"},
+            ),
+            _event(
+                run_id="run-1",
+                event_type=RunEventType.RUN_COMPLETED,
+                payload={"output": "done"},
+            ),
+        )
+    )
+    run_service.user_questions = [_user_question_record()]
+    service._watched_runs.add("run-1")
+
+    await service._await_terminal_and_reply(
+        account_id="wx-account-1",
+        gateway_session_id="gws-1",
+        run_id="run-1",
+        peer_user_id="wx-peer-1",
+        context_token="ctx-1",
+    )
+
+    assert "Pick a target" in str(im_tool_service.send_text_calls[0]["text"])
+    assert (
+        im_tool_service.send_text_calls[1]["text"]
+        == "Run paused: stream interrupted\nSend resume to continue."
+    )
+    assert len(im_tool_service.send_text_calls) == 2
+    assert gateway_session_service.bind_calls == []
+
+
+def test_handle_message_answers_pending_user_question() -> None:
+    service, gateway_session_service, run_service, im_tool_service, command_service = (
+        _build_service(
+            events=(),
+            command_response="[Session Commands]",
+            has_active_run=True,
+        )
+    )
+    watcher_calls: list[dict[str, object]] = []
+    service._start_run_watcher = lambda **kwargs: watcher_calls.append(kwargs)
+    run_service.user_questions = [
+        {
+            "question_id": "question-1",
+            "run_id": "run-1",
+            "session_id": "session-1",
+            "task_id": "task-1",
+            "instance_id": "instance-1",
+            "role_id": "role-1",
+            "tool_name": "ask_question",
+            "questions": [
+                {
+                    "question": "Pick a target",
+                    "options": [{"label": "Ship"}, {"label": "Wait"}],
+                }
+            ],
+            "status": "requested",
+            "answers": [],
+            "created_at": "2026-05-12T00:00:00+00:00",
+            "updated_at": "2026-05-12T00:00:00+00:00",
+            "resolved_at": None,
+        }
+    ]
+
+    service._handle_message(
+        _account(),
+        WeChatInboundMessage(
+            message_id=1001,
+            from_user_id="wx-peer-1",
+            item_list=(_text_item("Ship"),),
+        ),
+    )
+
+    assert len(run_service.created_intents) == 0
+    assert run_service.answered_questions[0][0] == "run-1"
+    assert run_service.answered_questions[0][1] == "question-1"
+    assert run_service.answered_questions[0][2].answers[0].selections[0].label == "Ship"
+    assert command_service.calls == []
+    assert im_tool_service.send_text_calls[0]["text"] == "已收到回答，正在继续处理。"
+    assert watcher_calls == []
+    assert gateway_session_service.bind_calls == []
+    consumed = service._inbound_queue_repo.get_by_message_key(
+        account_id="wx-account-1",
+        peer_user_id="wx-peer-1",
+        message_key="mid:1001",
+    )
+    assert consumed.status == WeChatInboundQueueStatus.COMPLETED
+    assert consumed.run_id is None
+
+    run_service.user_questions = []
+    service._session_service = cast(
+        SessionService,
+        _FakeSessionService(has_active_run=False),
+    )
+    service._handle_message(
+        _account(),
+        WeChatInboundMessage(
+            message_id=1001,
+            from_user_id="wx-peer-1",
+            item_list=(_text_item("/help"),),
+        ),
+    )
+
+    assert len(run_service.answered_questions) == 1
+    assert len(im_tool_service.send_text_calls) == 1
+    assert command_service.calls == []
+
+
+def test_wechat_question_answer_failure_returns_not_pending() -> None:
+    (
+        service,
+        _gateway_session_service,
+        run_service,
+        _im_tool_service,
+        _command_service,
+    ) = _build_service(events=(), has_active_run=True)
+    run_service.user_questions = [_user_question_record()]
+    run_service.answer_error = RuntimeError("answer failed")
+
+    status = service._try_answer_user_question(
+        run_id="run-1",
+        text="Ship",
+    )
+
+    assert status == UserQuestionAnswerStatus.NOT_PENDING
+
+
+@pytest.mark.asyncio
+async def test_await_run_completion_for_queue_drain_stops_on_terminal_event() -> None:
+    service, _gateway_session_service, _run_service, _im_tool_service, _ = (
+        _build_service(
+            events=(
+                _event(
+                    run_id="external-run-1",
+                    event_type=RunEventType.RUN_COMPLETED,
+                    payload={"output": "done"},
+                ),
+            ),
+            has_active_run=False,
+        )
+    )
+
+    await service._await_run_completion_for_queue_drain(
+        session_id="session-1",
+        run_id="external-run-1",
+    )
+
+
 def test_handle_reply_future_records_cancelled_future() -> None:
     service, gateway_session_service, _, _, _ = _build_service(events=())
     future: Future[None] = Future()
@@ -182,7 +628,6 @@ def test_handle_message_intercepts_session_command() -> None:
 
     service._handle_message(
         _account(),
-        "bot-token",
         WeChatInboundMessage(
             from_user_id="wx-peer-1",
             item_list=(_text_item("help"),),
@@ -218,7 +663,6 @@ def test_handle_message_sends_receipt_before_starting_run() -> None:
 
     service._handle_message(
         _account(),
-        "bot-token",
         WeChatInboundMessage(
             from_user_id="wx-peer-1",
             context_token="ctx-1",
@@ -240,24 +684,410 @@ def test_handle_message_sends_receipt_before_starting_run() -> None:
     assert gateway_session_service.bind_calls == [("gws-1", "run-created")]
 
 
-def test_handle_message_uses_joined_receipt_when_run_already_active() -> None:
+def test_handle_message_queues_when_run_is_already_active() -> None:
     service, _, run_service, im_tool_service, _ = _build_service(
         events=(),
         has_active_run=True,
     )
-    service._watched_runs.add("run-created")
 
     service._handle_message(
         _account(),
-        "bot-token",
         WeChatInboundMessage(
             from_user_id="wx-peer-1",
             item_list=(_text_item("follow up"),),
         ),
     )
 
-    assert im_tool_service.send_text_calls[0]["text"] == _RECEIPT_JOINED
+    assert im_tool_service.send_text_calls[0]["text"] == _RECEIPT_QUEUED
+    assert len(run_service.created_intents) == 0
+
+
+def test_drain_inbound_queue_starts_queue_drain_watcher_for_external_blocker() -> None:
+    service, _gateway_session_service, run_service, _im_tool_service, _ = (
+        _build_service(
+            events=(),
+            has_active_run=True,
+        )
+    )
+    repo = cast(_FakeInboundQueueRepo, service._inbound_queue_repo)
+    watcher_calls: list[tuple[str, str]] = []
+    repo.records["inq-external"] = WeChatInboundQueueRecord(
+        inbound_queue_id="inq-external",
+        account_id="wx-account-1",
+        message_key="mid:external",
+        gateway_session_id="gws-1",
+        session_id="session-1",
+        peer_user_id="wx-peer-1",
+        text="hello",
+    )
+    setattr(
+        service,
+        "_start_queue_drain_watcher",
+        lambda *, session_id, run_id: watcher_calls.append((session_id, run_id)),
+    )
+
+    service._drain_inbound_queue()
+
+    assert watcher_calls == [("session-1", "run-1")]
+    assert run_service.created_intents == []
+    queued = repo.get("inq-external")
+    assert queued is not None
+    assert queued.status == WeChatInboundQueueStatus.QUEUED
+
+
+def test_drain_inbound_queue_starts_queue_drain_watcher_for_waiting_result_blocker() -> (
+    None
+):
+    service, _gateway_session_service, run_service, _im_tool_service, _ = (
+        _build_service(
+            events=(),
+            has_active_run=True,
+        )
+    )
+    repo = cast(_FakeInboundQueueRepo, service._inbound_queue_repo)
+    repo.records["inq-active"] = WeChatInboundQueueRecord(
+        inbound_queue_id="inq-active",
+        account_id="wx-account-1",
+        message_key="mid:active",
+        gateway_session_id="gws-1",
+        session_id="session-1",
+        peer_user_id="wx-peer-1",
+        text="first",
+        status=WeChatInboundQueueStatus.WAITING_RESULT,
+        run_id="run-1",
+    )
+    repo.records["inq-queued"] = WeChatInboundQueueRecord(
+        inbound_queue_id="inq-queued",
+        account_id="wx-account-1",
+        message_key="mid:queued",
+        gateway_session_id="gws-1",
+        session_id="session-1",
+        peer_user_id="wx-peer-1",
+        text="second",
+    )
+    watcher_calls: list[tuple[str, str]] = []
+    setattr(
+        service,
+        "_start_queue_drain_watcher",
+        lambda *, session_id, run_id: watcher_calls.append((session_id, run_id)),
+    )
+
+    service._drain_inbound_queue()
+
+    assert watcher_calls == [("session-1", "run-1")]
+    assert run_service.created_intents == []
+    queued = repo.get("inq-queued")
+    assert queued is not None
+    assert queued.status == WeChatInboundQueueStatus.QUEUED
+
+
+def test_start_queued_record_busy_retry_does_not_clobber_waiting_result() -> None:
+    service, _gateway_session_service, _run_service, _im_tool_service, _ = (
+        _build_service(
+            events=(),
+            has_active_run=False,
+        )
+    )
+    repo = cast(_FakeInboundQueueRepo, service._inbound_queue_repo)
+    record = WeChatInboundQueueRecord(
+        inbound_queue_id="inq-1",
+        account_id="wx-account-1",
+        message_key="mid:1",
+        gateway_session_id="gws-1",
+        session_id="session-1",
+        peer_user_id="wx-peer-1",
+        context_token="ctx-1",
+        text="hello",
+        status=WeChatInboundQueueStatus.STARTING,
+    )
+    repo.records[record.inbound_queue_id] = record
+
+    def _simulate_concurrent_start(intent: object) -> str:
+        _ = intent
+        current = repo.get("inq-1")
+        assert current is not None
+        repo.update(
+            current.model_copy(
+                update={
+                    "status": WeChatInboundQueueStatus.WAITING_RESULT,
+                    "run_id": "run-existing",
+                    "updated_at": datetime.now(tz=timezone.utc),
+                }
+            )
+        )
+        raise RuntimeError("session_busy")
+
+    setattr(service, "_start_session_ingress_run", _simulate_concurrent_start)
+
+    started = service._start_queued_record(record)
+    updated = repo.get("inq-1")
+
+    assert started is False
+    assert updated is not None
+    assert updated.status == WeChatInboundQueueStatus.WAITING_RESULT
+    assert updated.run_id == "run-existing"
+
+
+def test_start_queued_record_uses_general_shell_policy() -> None:
+    service, _gateway_session_service, run_service, _im_tool_service, _ = (
+        _build_service(
+            events=(),
+            get_shell_safety_policy_enabled=lambda: False,
+        )
+    )
+    repo = cast(_FakeInboundQueueRepo, service._inbound_queue_repo)
+    watcher_calls: list[dict[str, str | None]] = []
+    setattr(
+        service,
+        "_start_run_watcher",
+        lambda **kwargs: watcher_calls.append(cast(dict[str, str | None], kwargs)),
+    )
+    record = WeChatInboundQueueRecord(
+        inbound_queue_id="inq-shell-policy",
+        account_id="wx-account-1",
+        message_key="mid:shell-policy",
+        gateway_session_id="gws-1",
+        session_id="session-1",
+        peer_user_id="wx-peer-1",
+        context_token="ctx-shell-policy",
+        text="run curl",
+        status=WeChatInboundQueueStatus.STARTING,
+    )
+    repo.records[record.inbound_queue_id] = record
+
+    assert service._start_queued_record(record) is True
+
+    assert run_service.created_intents == [
+        {
+            "session_id": "session-1",
+            "intent": "run curl",
+            "yolo": True,
+            "shell_safety_policy_enabled": False,
+        }
+    ]
+    assert watcher_calls == [
+        {
+            "account_id": "wx-account-1",
+            "gateway_session_id": "gws-1",
+            "run_id": "run-created",
+            "peer_user_id": "wx-peer-1",
+            "context_token": "ctx-shell-policy",
+        }
+    ]
+
+
+def test_handle_queue_drain_future_redrains_when_blocker_clears() -> None:
+    service, _gateway_session_service, _run_service, _im_tool_service, _ = (
+        _build_service(
+            events=(),
+            has_active_run=False,
+        )
+    )
+    future: Future[None] = Future()
+    future.set_result(None)
+    drain_calls: list[str] = []
+    service._drain_watched_runs.add("external-run-1")
+    setattr(service, "_drain_inbound_queue", lambda: drain_calls.append("drain"))
+
+    service._handle_queue_drain_future(
+        session_id="session-1",
+        run_id="external-run-1",
+        future=future,
+    )
+
+    assert drain_calls == ["drain"]
+    assert "external-run-1" not in service._drain_watched_runs
+
+
+def test_start_queued_record_requeues_non_busy_start_failure() -> None:
+    service, _gateway_session_service, _run_service, _im_tool_service, _ = (
+        _build_service(
+            events=(),
+            has_active_run=False,
+        )
+    )
+    repo = cast(_FakeInboundQueueRepo, service._inbound_queue_repo)
+    record = WeChatInboundQueueRecord(
+        inbound_queue_id="inq-2",
+        account_id="wx-account-1",
+        message_key="mid:2",
+        gateway_session_id="gws-1",
+        session_id="session-1",
+        peer_user_id="wx-peer-1",
+        context_token="ctx-2",
+        text="hello",
+        status=WeChatInboundQueueStatus.STARTING,
+    )
+    repo.records[record.inbound_queue_id] = record
+
+    def _fail_start(intent: object) -> str:
+        _ = intent
+        raise RuntimeError("temporary_start_failure")
+
+    setattr(service, "_start_session_ingress_run", _fail_start)
+
+    started = service._start_queued_record(record)
+    updated = repo.get("inq-2")
+
+    assert started is False
+    assert updated is not None
+    assert updated.status == WeChatInboundQueueStatus.QUEUED
+    assert updated.last_error == "temporary_start_failure"
+    assert updated.completed_at is None
+
+
+def test_start_queued_record_marks_missing_account_failed() -> None:
+    service, _gateway_session_service, _run_service, _im_tool_service, _ = (
+        _build_service(
+            events=(),
+            has_active_run=False,
+        )
+    )
+    repo = cast(_FakeInboundQueueRepo, service._inbound_queue_repo)
+    record = WeChatInboundQueueRecord(
+        inbound_queue_id="inq-missing-account",
+        account_id="missing-account",
+        message_key="mid:missing-account",
+        gateway_session_id="gws-1",
+        session_id="session-1",
+        peer_user_id="wx-peer-1",
+        context_token="ctx-1",
+        text="hello",
+        status=WeChatInboundQueueStatus.STARTING,
+    )
+    repo.records[record.inbound_queue_id] = record
+
+    started = service._start_queued_record(record)
+    updated = repo.get("inq-missing-account")
+
+    assert started is False
+    assert updated is not None
+    assert updated.status == WeChatInboundQueueStatus.FAILED
+    assert updated.run_id is None
+    assert updated.last_error == "WeChat account not found: missing-account"
+    assert updated.completed_at is not None
+
+
+def test_drain_inbound_queue_skips_missing_account_and_starts_later_record() -> None:
+    service, _gateway_session_service, run_service, _im_tool_service, _ = (
+        _build_service(
+            events=(),
+            has_active_run=False,
+        )
+    )
+    repo = cast(_FakeInboundQueueRepo, service._inbound_queue_repo)
+    setattr(service, "_start_run_watcher", lambda **_: None)
+    repo.records["inq-bad"] = WeChatInboundQueueRecord(
+        inbound_queue_id="inq-bad",
+        account_id="missing-account",
+        message_key="mid:bad",
+        gateway_session_id="gws-bad",
+        session_id="session-bad",
+        peer_user_id="wx-peer-1",
+        context_token="ctx-bad",
+        text="bad",
+    )
+    repo.records["inq-good"] = WeChatInboundQueueRecord(
+        inbound_queue_id="inq-good",
+        account_id="wx-account-1",
+        message_key="mid:good",
+        gateway_session_id="gws-1",
+        session_id="session-1",
+        peer_user_id="wx-peer-1",
+        context_token="ctx-1",
+        text="good",
+    )
+
+    service._drain_inbound_queue()
+
+    bad = repo.get("inq-bad")
+    good = repo.get("inq-good")
+    assert bad is not None
+    assert bad.status == WeChatInboundQueueStatus.FAILED
+    assert bad.last_error == "WeChat account not found: missing-account"
+    assert good is not None
+    assert good.status == WeChatInboundQueueStatus.WAITING_RESULT
     assert len(run_service.created_intents) == 1
+    assert run_service.created_intents[0]["session_id"] == "session-1"
+
+
+@pytest.mark.asyncio
+async def test_send_typing_schedules_when_event_loop_is_running() -> None:
+    service, _gateway_session_service, _run_service, _im_tool_service, _ = (
+        _build_service(events=())
+    )
+    client = cast(_FakeWeChatClient, service._client)
+
+    service._send_typing(
+        _account(),
+        "bot-token",
+        "wx-peer-1",
+        "ctx-1",
+        1,
+    )
+    await asyncio.sleep(0)
+
+    assert client.typing_calls == [
+        {
+            "account_id": "wx-account-1",
+            "token": "bot-token",
+            "peer_user_id": "wx-peer-1",
+            "typing_ticket": "typing-ticket",
+            "status": 1,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_send_intermediate_text_schedules_when_event_loop_is_running() -> None:
+    service, gateway_session_service, _run_service, im_tool_service, _ = _build_service(
+        events=()
+    )
+
+    service._send_intermediate_text(
+        account_id="wx-account-1",
+        gateway_session_id="gws-1",
+        peer_user_id="wx-peer-1",
+        context_token="ctx-1",
+        text="queued",
+        event_name="wechat.test",
+        failure_message="failed",
+    )
+    await asyncio.sleep(0)
+
+    assert im_tool_service.send_text_calls == [
+        {
+            "account_id": "wx-account-1",
+            "peer_user_id": "wx-peer-1",
+            "text": "queued",
+            "context_token": "ctx-1",
+        }
+    ]
+    assert gateway_session_service.update_calls[0]["gateway_session_id"] == "gws-1"
+
+
+def test_build_receipt_text_returns_failure_receipt_for_failed_record() -> None:
+    service, _gateway_session_service, _run_service, _im_tool_service, _ = (
+        _build_service(
+            events=(),
+            has_active_run=False,
+        )
+    )
+    record = WeChatInboundQueueRecord(
+        inbound_queue_id="inq-failed",
+        account_id="wx-account-1",
+        message_key="mid:failed",
+        gateway_session_id="gws-1",
+        session_id="session-1",
+        peer_user_id="wx-peer-1",
+        text="hello",
+        status=WeChatInboundQueueStatus.FAILED,
+        last_error="temporary_start_failure",
+    )
+
+    receipt_text = service._build_receipt_text(record)
+
+    assert receipt_text == "收到，但处理失败：temporary_start_failure"
 
 
 class _FakeRepository:
@@ -282,8 +1112,46 @@ class _FakeSecretStore:
 class _FakeWeChatClient:
     def __init__(self) -> None:
         self.typing_calls: list[dict[str, object]] = []
+        self.start_login_calls: list[dict[str, str | None]] = []
+        self.wait_login_calls: list[int] = []
+        self.get_updates_calls: list[tuple[str, str, int]] = []
+        self.stop_event: Event | None = None
 
-    def get_typing_ticket(
+    async def start_qr_login(
+        self,
+        *,
+        base_url: str,
+        route_tag: str | None = None,
+        bot_type: str,
+    ) -> WeChatQrCodeResponse:
+        self.start_login_calls.append(
+            {"base_url": base_url, "route_tag": route_tag, "bot_type": bot_type}
+        )
+        return WeChatQrCodeResponse(qrcode="qr-token", qrcode_img_content="iVBORw0")
+
+    async def wait_qr_login(
+        self,
+        *,
+        login_session: object,
+        timeout_ms: int,
+    ) -> WeChatQrStatusResponse:
+        _ = login_session
+        self.wait_login_calls.append(timeout_ms)
+        return WeChatQrStatusResponse(status="expired")
+
+    async def get_updates(
+        self,
+        *,
+        account: WeChatAccountRecord,
+        token: str,
+        timeout_ms: int,
+    ) -> WeChatGetUpdatesResponse:
+        self.get_updates_calls.append((account.account_id, token, timeout_ms))
+        if self.stop_event is not None:
+            self.stop_event.set()
+        return WeChatGetUpdatesResponse()
+
+    async def get_typing_ticket(
         self,
         *,
         account: WeChatAccountRecord,
@@ -294,7 +1162,7 @@ class _FakeWeChatClient:
         _ = (account, token, peer_user_id, context_token)
         return "typing-ticket"
 
-    def send_typing(
+    async def send_typing(
         self,
         *,
         account: WeChatAccountRecord,
@@ -319,7 +1187,7 @@ class _FakeImToolService:
         self._send_text_error = send_text_error
         self.send_text_calls: list[dict[str, str | None]] = []
 
-    def send_text_to_wechat_peer(
+    async def send_text_to_wechat_peer(
         self,
         *,
         account_id: str,
@@ -429,33 +1297,221 @@ class _FakeGatewaySessionService:
         )
 
 
+class _FakeInboundQueueRepo:
+    def __init__(self) -> None:
+        self.records: dict[str, WeChatInboundQueueRecord] = {}
+
+    def create_or_get(
+        self,
+        record: WeChatInboundQueueRecord,
+    ) -> tuple[WeChatInboundQueueRecord, bool]:
+        for existing in self.records.values():
+            if (
+                existing.account_id == record.account_id
+                and existing.peer_user_id == record.peer_user_id
+                and existing.message_key == record.message_key
+            ):
+                return existing, False
+        self.records[record.inbound_queue_id] = record
+        return record, True
+
+    def get(self, inbound_queue_id: str) -> WeChatInboundQueueRecord | None:
+        return self.records.get(inbound_queue_id)
+
+    def get_by_message_key(
+        self,
+        *,
+        account_id: str,
+        peer_user_id: str,
+        message_key: str,
+    ) -> WeChatInboundQueueRecord:
+        for record in self.records.values():
+            if (
+                record.account_id == account_id
+                and record.peer_user_id == peer_user_id
+                and record.message_key == message_key
+            ):
+                return record
+        raise KeyError(message_key)
+
+    def get_latest_by_run_id(self, run_id: str) -> WeChatInboundQueueRecord | None:
+        matches = [
+            record
+            for record in self.records.values()
+            if str(record.run_id or "") == run_id
+        ]
+        if not matches:
+            return None
+        matches.sort(key=lambda item: item.updated_at, reverse=True)
+        return matches[0]
+
+    def update(self, record: WeChatInboundQueueRecord) -> WeChatInboundQueueRecord:
+        self.records[record.inbound_queue_id] = record
+        return record
+
+    def list_ready_to_start(
+        self,
+        *,
+        stale_before: datetime | None = None,
+    ) -> tuple[WeChatInboundQueueRecord, ...]:
+        ready = [
+            record
+            for record in self.records.values()
+            if record.status == WeChatInboundQueueStatus.QUEUED
+            or (
+                stale_before is not None
+                and record.status == WeChatInboundQueueStatus.STARTING
+                and record.updated_at <= stale_before
+            )
+        ]
+        ready.sort(key=lambda item: item.created_at)
+        return tuple(ready)
+
+    def claim_starting(
+        self,
+        *,
+        inbound_queue_id: str,
+        stale_before: datetime,
+    ) -> WeChatInboundQueueRecord | None:
+        record = self.records.get(inbound_queue_id)
+        if record is None:
+            return None
+        if record.status not in {
+            WeChatInboundQueueStatus.QUEUED,
+            WeChatInboundQueueStatus.STARTING,
+        }:
+            return None
+        if (
+            record.status == WeChatInboundQueueStatus.STARTING
+            and record.updated_at > stale_before
+        ):
+            return None
+        claimed = record.model_copy(
+            update={
+                "status": WeChatInboundQueueStatus.STARTING,
+                "last_error": None,
+                "updated_at": datetime.now(tz=timezone.utc),
+            }
+        )
+        self.records[inbound_queue_id] = claimed
+        return claimed
+
+    def requeue_if_starting(
+        self,
+        *,
+        inbound_queue_id: str,
+        last_error: str | None = None,
+    ) -> WeChatInboundQueueRecord | None:
+        record = self.records.get(inbound_queue_id)
+        if record is None or record.status != WeChatInboundQueueStatus.STARTING:
+            return None
+        updated = record.model_copy(
+            update={
+                "status": WeChatInboundQueueStatus.QUEUED,
+                "run_id": None,
+                "last_error": last_error,
+                "updated_at": datetime.now(tz=timezone.utc),
+                "completed_at": None,
+            }
+        )
+        self.records[inbound_queue_id] = updated
+        return updated
+
+    def count_non_terminal_ahead(self, inbound_queue_id: str) -> int:
+        current = self.records[inbound_queue_id]
+        ordered = list(self.records.values())
+        current_index = ordered.index(current)
+        return sum(
+            1
+            for record in ordered[:current_index]
+            if record.session_id == current.session_id
+            and record.status
+            in {
+                WeChatInboundQueueStatus.QUEUED,
+                WeChatInboundQueueStatus.STARTING,
+                WeChatInboundQueueStatus.WAITING_RESULT,
+            }
+        )
+
+    def has_non_terminal_item_for_run(self, run_id: str) -> bool:
+        return any(
+            str(record.run_id or "") == run_id
+            and record.status
+            in {
+                WeChatInboundQueueStatus.QUEUED,
+                WeChatInboundQueueStatus.STARTING,
+                WeChatInboundQueueStatus.WAITING_RESULT,
+            }
+            for record in self.records.values()
+        )
+
+
 class _FakeRunService:
     def __init__(self, events: tuple[RunEvent, ...]) -> None:
         self._events = events
         self._event_loop: asyncio.AbstractEventLoop | None = None
         self.created_intents: list[dict[str, str | bool]] = []
         self.ensured_run_ids: list[str] = []
+        self.user_questions: list[dict[str, JsonValue]] = []
+        self.answered_questions: list[
+            tuple[str, str, UserQuestionAnswerSubmission]
+        ] = []
+        self.answer_error: Exception | None = None
 
-    async def stream_run_events(self, run_id: str) -> AsyncIterator[RunEvent]:
-        for event in self._events:
+    @property
+    def bound_event_loop(self) -> asyncio.AbstractEventLoop | None:
+        return self._event_loop
+
+    async def stream_run_events(
+        self,
+        run_id: str,
+        after_event_id: int = 0,
+        *,
+        stop_on_pause: bool = True,
+    ) -> AsyncIterator[RunEvent]:
+        _ = stop_on_pause
+        for index, event in enumerate(self._events, start=1):
+            if index <= after_event_id:
+                continue
             assert event.run_id == run_id
-            yield event
+            yield event.model_copy(update={"event_id": index})
 
     def create_run(self, intent: object) -> tuple[str, str]:
         session_id = cast(str, getattr(intent, "session_id"))
         message = cast(str, getattr(intent, "intent"))
         yolo = cast(bool, getattr(intent, "yolo"))
+        shell_safety_policy_enabled = cast(
+            bool,
+            getattr(intent, "shell_safety_policy_enabled"),
+        )
         self.created_intents.append(
             {
                 "session_id": session_id,
                 "intent": message,
                 "yolo": yolo,
+                "shell_safety_policy_enabled": shell_safety_policy_enabled,
             }
         )
         return "run-created", "session-1"
 
     def ensure_run_started(self, run_id: str) -> None:
         self.ensured_run_ids.append(run_id)
+
+    def list_user_questions(self, run_id: str) -> list[dict[str, JsonValue]]:
+        _ = run_id
+        return self.user_questions
+
+    def answer_user_question(
+        self,
+        *,
+        run_id: str,
+        question_id: str,
+        answers: UserQuestionAnswerSubmission,
+    ) -> dict[str, JsonValue]:
+        if self.answer_error is not None:
+            raise self.answer_error
+        self.answered_questions.append((run_id, question_id, answers))
+        return {"run_id": run_id, "question_id": question_id}
 
 
 class _FakeSessionService:
@@ -481,6 +1537,7 @@ def _build_service(
     send_text_error: Exception | None = None,
     command_response: str | None = None,
     has_active_run: bool = False,
+    get_shell_safety_policy_enabled: Callable[[], bool] | None = None,
 ) -> tuple[
     WeChatGatewayService,
     _FakeGatewaySessionService,
@@ -503,7 +1560,7 @@ def _build_service(
         GatewaySessionService,
         gateway_session_service,
     )
-    service._run_service = cast(RunManager, run_service)
+    service._run_service = cast(SessionRunService, run_service)
     service._session_service = cast(
         SessionService,
         _FakeSessionService(has_active_run=has_active_run),
@@ -513,12 +1570,21 @@ def _build_service(
         ImSessionCommandService,
         command_service,
     )
+    service._inbound_queue_repo = cast(
+        WeChatInboundQueueRepository,
+        _FakeInboundQueueRepo(),
+    )
+    service._session_ingress_service = None
+    service._get_shell_safety_policy_enabled = get_shell_safety_policy_enabled or (
+        lambda: True
+    )
     service._status_lock = Lock()
     service._status_by_account = {}
     service._monitor_stop_events = {}
     service._monitor_threads = {}
     service._login_sessions = {}
     service._watched_runs = set()
+    service._drain_watched_runs = set()
     return (
         service,
         gateway_session_service,
@@ -555,3 +1621,92 @@ def _event(
         payload_json=json.dumps(payload, ensure_ascii=False),
         occurred_at=datetime.now(tz=timezone.utc),
     )
+
+
+def _user_question_record(
+    *,
+    question_id: str = "question-1",
+    run_id: str = "run-1",
+) -> dict[str, JsonValue]:
+    return {
+        "question_id": question_id,
+        "run_id": run_id,
+        "session_id": "session-1",
+        "task_id": "task-1",
+        "instance_id": "instance-1",
+        "role_id": "role-1",
+        "tool_name": "ask_question",
+        "questions": [
+            {
+                "question": "Pick a target",
+                "options": [{"label": "Ship"}, {"label": "Wait"}],
+            }
+        ],
+        "status": "requested",
+        "answers": [],
+        "created_at": "2026-05-12T00:00:00+00:00",
+        "updated_at": "2026-05-12T00:00:00+00:00",
+        "resolved_at": None,
+    }
+
+
+def test_wechat_account_update_input_rejects_empty_patch() -> None:
+    with pytest.raises(ValidationError, match="update must include at least one field"):
+        WeChatAccountUpdateInput()
+
+
+def test_wechat_account_update_input_trims_route_tag() -> None:
+    req = WeChatAccountUpdateInput(route_tag="  route-a  ")
+
+    assert req.route_tag == "route-a"
+
+
+def test_wechat_account_update_input_allows_blank_route_tag_to_clear_value() -> None:
+    req = WeChatAccountUpdateInput(route_tag="   ")
+
+    assert req.route_tag is None
+    assert "route_tag" in req.model_fields_set
+
+
+class _DeleteAccountRepository:
+    def __init__(self, account: WeChatAccountRecord) -> None:
+        self.account = account
+        self.deleted_account_ids: list[str] = []
+
+    def get_account(self, account_id: str) -> WeChatAccountRecord:
+        if account_id != self.account.account_id:
+            raise KeyError(account_id)
+        return self.account
+
+    def delete_account(self, account_id: str) -> None:
+        self.deleted_account_ids.append(account_id)
+
+
+class _DeleteSecretStore:
+    def __init__(self) -> None:
+        self.deleted_account_ids: list[str] = []
+
+    def delete_bot_token(self, config_dir: Path, account_id: str) -> None:
+        _ = config_dir
+        self.deleted_account_ids.append(account_id)
+
+
+def test_delete_account_rejects_enabled_account_without_force() -> None:
+    repository = _DeleteAccountRepository(_account())
+    secret_store = _DeleteSecretStore()
+    service = object.__new__(WeChatGatewayService)
+    service._repository = cast(WeChatAccountRepository, repository)
+    service._secret_store = cast(WeChatSecretStore, secret_store)
+    service._config_dir = Path("C:/config")
+    service._stop_account_worker = lambda account_id: None
+
+    with pytest.raises(
+        RuntimeError,
+        match="Cannot delete enabled WeChat account without force",
+    ):
+        service.delete_account("wx-account-1")
+
+    service.delete_account("wx-account-1", force=True)
+
+    assert repository.deleted_account_ids == ["wx-account-1"]
+    assert secret_store.deleted_account_ids == ["wx-account-1"]

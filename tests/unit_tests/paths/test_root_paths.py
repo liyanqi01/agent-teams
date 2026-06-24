@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 import subprocess
 
-from agent_teams.paths import root_paths
+from relay_teams.paths import root_paths
 
 
 def test_get_project_root_or_none_returns_git_root(
@@ -28,6 +28,13 @@ def test_get_project_root_or_none_returns_git_root(
         assert capture_output is True
         assert text is True
         assert timeout == 5.0
+        if cwd != str(tmp_path.resolve()):
+            return subprocess.CompletedProcess(
+                args=command,
+                returncode=1,
+                stdout="",
+                stderr="fatal: not a git repository",
+            )
         assert cwd == str(tmp_path.resolve())
         return subprocess.CompletedProcess(
             args=command,
@@ -208,11 +215,12 @@ def test_get_project_config_dir_uses_project_root_when_available(
     tmp_path: Path,
 ) -> None:
     user_home_dir = tmp_path / "home"
+    monkeypatch.delenv("RELAY_TEAMS_CONFIG_DIR", raising=False)
     monkeypatch.setattr(root_paths, "get_user_home_dir", lambda: user_home_dir)
 
     config_dir = root_paths.get_project_config_dir()
 
-    assert config_dir == user_home_dir / ".agent-teams"
+    assert config_dir == user_home_dir / ".relay-teams"
 
 
 def test_get_project_config_dir_falls_back_to_cwd_when_git_root_is_missing(
@@ -220,11 +228,12 @@ def test_get_project_config_dir_falls_back_to_cwd_when_git_root_is_missing(
     tmp_path: Path,
 ) -> None:
     user_home_dir = tmp_path / "home"
+    monkeypatch.delenv("RELAY_TEAMS_CONFIG_DIR", raising=False)
     monkeypatch.setattr(root_paths, "get_user_home_dir", lambda: user_home_dir)
 
     config_dir = root_paths.get_project_config_dir()
 
-    assert config_dir == user_home_dir / ".agent-teams"
+    assert config_dir == user_home_dir / ".relay-teams"
 
 
 def test_get_project_config_dir_prefers_cwd_local_config_over_git_root(
@@ -232,11 +241,12 @@ def test_get_project_config_dir_prefers_cwd_local_config_over_git_root(
     tmp_path: Path,
 ) -> None:
     user_home_dir = tmp_path / "home"
+    monkeypatch.delenv("RELAY_TEAMS_CONFIG_DIR", raising=False)
     monkeypatch.setattr(root_paths, "get_user_home_dir", lambda: user_home_dir)
 
     config_dir = root_paths.get_project_config_dir()
 
-    assert config_dir == user_home_dir / ".agent-teams"
+    assert config_dir == user_home_dir / ".relay-teams"
 
 
 def test_get_project_config_dir_uses_project_root_override() -> None:
@@ -244,7 +254,7 @@ def test_get_project_config_dir_uses_project_root_override() -> None:
 
     config_dir = root_paths.get_project_config_dir(project_root=user_home_dir)
 
-    assert config_dir == Path.home().resolve() / ".agent-teams"
+    assert config_dir == Path.home().resolve() / ".relay-teams"
 
 
 def test_get_user_home_dir_returns_resolved_home() -> None:
@@ -253,11 +263,12 @@ def test_get_user_home_dir_returns_resolved_home() -> None:
 
 def test_get_user_config_dir_uses_resolved_home(monkeypatch, tmp_path: Path) -> None:
     user_home_dir = tmp_path / "home"
+    monkeypatch.delenv("RELAY_TEAMS_CONFIG_DIR", raising=False)
     monkeypatch.setattr(root_paths, "get_user_home_dir", lambda: user_home_dir)
 
     config_dir = root_paths.get_user_config_dir()
 
-    assert config_dir == user_home_dir / ".agent-teams"
+    assert config_dir == user_home_dir / ".relay-teams"
 
 
 def test_get_user_config_dir_uses_user_home_override(tmp_path: Path) -> None:
@@ -265,7 +276,7 @@ def test_get_user_config_dir_uses_user_home_override(tmp_path: Path) -> None:
 
     config_dir = root_paths.get_user_config_dir(user_home_dir=user_home_dir)
 
-    assert config_dir == user_home_dir.resolve() / ".agent-teams"
+    assert config_dir == user_home_dir.resolve() / ".relay-teams"
 
 
 def test_get_project_config_dir_resolves_user_supplied_root(tmp_path: Path) -> None:
@@ -274,7 +285,117 @@ def test_get_project_config_dir_resolves_user_supplied_root(tmp_path: Path) -> N
 
     config_dir = root_paths.get_project_config_dir(project_root=unresolved_project_root)
 
-    assert config_dir == Path.home().resolve() / ".agent-teams"
+    assert config_dir == Path.home().resolve() / ".relay-teams"
+
+
+def test_get_app_config_dir_prefers_environment_variable(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    configured_dir = tmp_path / "runtime-config"
+    monkeypatch.setenv("RELAY_TEAMS_CONFIG_DIR", str(configured_dir))
+
+    assert root_paths.get_app_config_dir() == configured_dir.resolve()
+
+
+def test_get_app_config_dir_ignores_blank_environment_variable(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    user_home_dir = tmp_path / "home"
+    monkeypatch.setenv("RELAY_TEAMS_CONFIG_DIR", "   ")
+    monkeypatch.setattr(root_paths, "get_user_home_dir", lambda: user_home_dir)
+
+    assert root_paths.get_app_config_dir() == user_home_dir / ".relay-teams"
+
+
+def test_get_app_config_dir_expands_tilde_environment_variable(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    user_home_dir = tmp_path / "home"
+    user_home_dir.mkdir(parents=True)
+    monkeypatch.setenv("RELAY_TEAMS_CONFIG_DIR", "~/custom-config")
+    monkeypatch.setenv("HOME", str(user_home_dir))
+    monkeypatch.setenv("USERPROFILE", str(user_home_dir))
+    monkeypatch.setattr(root_paths, "get_user_home_dir", lambda: user_home_dir)
+
+    assert (
+        root_paths.get_app_config_dir() == (user_home_dir / "custom-config").resolve()
+    )
+
+
+def test_get_app_config_dir_override_returns_resolved_environment_value(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    configured_dir = tmp_path / "override-config"
+    monkeypatch.setenv("RELAY_TEAMS_CONFIG_DIR", str(configured_dir))
+
+    assert root_paths.get_app_config_dir_override() == configured_dir.resolve()
+
+
+def test_get_app_bin_dir_uses_app_config_dir_override(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    configured_dir = tmp_path / "override-config"
+    monkeypatch.setenv("RELAY_TEAMS_CONFIG_DIR", str(configured_dir))
+
+    assert root_paths.get_app_bin_dir() == configured_dir.resolve() / "bin"
+
+
+def test_get_app_config_file_path_uses_explicit_config_dir(tmp_path: Path) -> None:
+    config_dir = tmp_path / "config"
+
+    assert root_paths.get_app_config_file_path("model.json", config_dir=config_dir) == (
+        config_dir.resolve() / "model.json"
+    )
+
+
+def test_format_app_config_file_reference_uses_file_path_without_env_override(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delenv("RELAY_TEAMS_CONFIG_DIR", raising=False)
+    config_dir = tmp_path / "config"
+
+    assert (
+        root_paths.format_app_config_file_reference(
+            "model.json",
+            config_dir=config_dir,
+        )
+        == f'"{config_dir.resolve() / "model.json"}"'
+    )
+
+
+def test_format_app_config_file_reference_uses_file_path_with_env_override(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    configured_dir = tmp_path / "config"
+    monkeypatch.setenv("RELAY_TEAMS_CONFIG_DIR", str(configured_dir))
+
+    assert (
+        root_paths.format_app_config_file_reference("model.json")
+        == f'"{configured_dir.resolve() / "model.json"}"'
+    )
+
+
+def test_format_app_config_file_reference_preserves_tilde_env_override(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    user_home_dir = tmp_path / "home"
+    user_home_dir.mkdir(parents=True)
+    monkeypatch.setenv("RELAY_TEAMS_CONFIG_DIR", "~/custom-config")
+    monkeypatch.setenv("HOME", str(user_home_dir))
+    monkeypatch.setenv("USERPROFILE", str(user_home_dir))
+
+    assert (
+        root_paths.format_app_config_file_reference("model.json")
+        == f'"{(user_home_dir / "custom-config" / "model.json").resolve()}"'
+    )
 
 
 def test_resolve_start_dir_defaults_to_cwd(monkeypatch, tmp_path: Path) -> None:
@@ -303,3 +424,147 @@ def test_resolve_start_dir_uses_parent_for_file_path(tmp_path: Path) -> None:
     resolved = root_paths._resolve_start_dir(start_dir=file_path)
 
     assert resolved == nested_dir.resolve()
+
+
+def test_find_git_marker_root_uses_parent_for_file_path(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+    file_path = repo_dir / "source.py"
+    file_path.write_text("", encoding="utf-8")
+
+    def fake_run(
+        command: list[str],
+        *,
+        cwd: str,
+        check: bool,
+        capture_output: bool,
+        text: bool,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        _ = (check, capture_output, text, timeout)
+        assert command == ["git", "rev-parse", "--show-toplevel"]
+        assert cwd == str(repo_dir.resolve())
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout=f"{repo_dir}\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(root_paths.subprocess, "run", fake_run)
+
+    assert root_paths._find_git_marker_root(file_path) == repo_dir.resolve()
+
+
+def test_find_git_marker_root_ignores_configured_pytest_temp_dir(
+    tmp_path: Path,
+) -> None:
+    repo_dir = tmp_path / "repo"
+    pytest_dir = repo_dir / ".tmp" / "pytest" / "test-case"
+    pytest_dir.mkdir(parents=True)
+    (repo_dir / ".git").mkdir()
+
+    assert root_paths._find_git_marker_root(pytest_dir) is None
+
+
+def test_get_project_root_or_none_ignores_configured_pytest_temp_dir(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    repo_dir = tmp_path / "repo"
+    pytest_dir = repo_dir / ".tmp" / "pytest" / "test-case"
+    pytest_dir.mkdir(parents=True)
+    (repo_dir / ".git").mkdir()
+
+    def fake_run(
+        command: list[str],
+        *,
+        cwd: str,
+        check: bool,
+        capture_output: bool,
+        text: bool,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        _ = (command, cwd, check, capture_output, text, timeout)
+        raise AssertionError("pytest temp directories must not fall back to git")
+
+    monkeypatch.setattr(root_paths.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        root_paths,
+        "_is_valid_git_worktree_root",
+        lambda candidate: candidate.resolve() == repo_dir.resolve(),
+    )
+
+    assert root_paths.get_project_root_or_none(pytest_dir) is None
+
+
+def test_get_project_root_or_none_keeps_nested_repo_inside_pytest_temp_dir(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    repo_dir = tmp_path / "repo"
+    nested_repo_dir = repo_dir / ".tmp" / "pytest" / "test-case" / "fixture-repo"
+    start_dir = nested_repo_dir / "src"
+    start_dir.mkdir(parents=True)
+    (repo_dir / ".git").mkdir()
+    (nested_repo_dir / ".git").mkdir()
+
+    monkeypatch.setattr(
+        root_paths,
+        "_is_valid_git_worktree_root",
+        lambda candidate: candidate.resolve() == nested_repo_dir.resolve(),
+    )
+
+    assert root_paths.get_project_root_or_none(start_dir) == nested_repo_dir.resolve()
+
+
+def test_find_git_marker_root_ignores_legacy_pytest_temp_dir(
+    tmp_path: Path,
+) -> None:
+    repo_dir = tmp_path / "repo"
+    pytest_dir = repo_dir / ".pytest-tmp" / "test-case"
+    pytest_dir.mkdir(parents=True)
+    (repo_dir / ".git").mkdir()
+
+    assert root_paths._find_git_marker_root(pytest_dir) is None
+
+
+def test_find_git_marker_root_rejects_invalid_git_marker(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    (repo_dir / ".git").write_text("not a git marker", encoding="utf-8")
+
+    def fake_run(
+        command: list[str],
+        *,
+        cwd: str,
+        check: bool,
+        capture_output: bool,
+        text: bool,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        _ = (command, cwd, check, capture_output, text, timeout)
+        return subprocess.CompletedProcess(
+            args=["git", "rev-parse", "--show-toplevel"],
+            returncode=1,
+            stdout="",
+            stderr="fatal: not a git repository",
+        )
+
+    monkeypatch.setattr(root_paths.subprocess, "run", fake_run)
+
+    assert root_paths._find_git_marker_root(repo_dir) is None
+
+
+def test_find_git_marker_root_returns_none_without_marker(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    assert root_paths._find_git_marker_root(workspace) is None

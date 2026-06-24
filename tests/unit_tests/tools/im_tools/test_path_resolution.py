@@ -3,12 +3,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agent_teams.tools.im_tools.path_resolution import resolve_im_file_path
-from agent_teams.workspace import WorkspaceHandle
-from agent_teams.workspace.workspace_models import (
+from relay_teams.tools.im_tools.path_resolution import resolve_im_file_path
+from relay_teams.workspace import WorkspaceHandle
+from relay_teams.workspace.workspace_models import (
     WorkspaceLocations,
     WorkspaceRef,
-    default_workspace_profile,
+    build_local_workspace_mount,
 )
 
 
@@ -81,22 +81,48 @@ def test_resolve_im_file_path_expands_environment_variables_and_quotes(
     assert resolved == external_file.resolve()
 
 
+def test_resolve_im_file_path_expands_percent_variables_case_insensitively(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = _build_workspace_handle(tmp_path / "workspace")
+    external_dir = tmp_path / "external"
+    external_dir.mkdir(parents=True)
+    external_file = external_dir / "case-insensitive.txt"
+    external_file.write_text("notes", encoding="utf-8")
+    monkeypatch.setenv("IM_TEST_FILE_MIXED", str(external_file))
+
+    resolved = resolve_im_file_path(
+        file_path='"%im_test_file_mixed%"',
+        workspace=workspace,
+    )
+
+    assert resolved == external_file.resolve()
+
+
 def _build_workspace_handle(root_path: Path) -> WorkspaceHandle:
     root_path.mkdir(parents=True, exist_ok=True)
-    profile = default_workspace_profile()
+    tmp_root = root_path / ".tmp"
     return WorkspaceHandle(
         ref=WorkspaceRef(
             workspace_id="workspace",
             session_id="session",
             role_id="role",
             conversation_id="conversation",
-            profile=profile,
+            default_mount_name="default",
         ),
-        profile=profile,
+        mounts=(
+            build_local_workspace_mount(
+                mount_name="default",
+                root_path=root_path,
+            ),
+        ),
         locations=WorkspaceLocations(
             workspace_dir=root_path,
+            scope_root=root_path,
             execution_root=root_path,
-            readable_roots=(root_path,),
-            writable_roots=(root_path,),
+            tmp_root=tmp_root,
+            readable_roots=(root_path, tmp_root),
+            writable_roots=(root_path, tmp_root),
         ),
     )

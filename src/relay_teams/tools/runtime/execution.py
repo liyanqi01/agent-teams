@@ -1,0 +1,3595 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+from pydantic import BaseModel, JsonValue, ValidationError
+from pydantic_ai.messages import ToolReturn
+
+import asyncio
+import contextvars
+import inspect
+import json
+import logging
+import sqlite3
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+from hashlib import sha256
+from collections.abc import Awaitable, Callable, Mapping
+from datetime import datetime, timezone
+from enum import Enum
+from json import dumps
+from typing import (
+    Literal,
+    ParamSpec,
+    Protocol,
+    TypeVar,
+    cast,
+    get_args,
+    get_origin,
+    get_type_hints,
+    overload,
+    runtime_checkable,
+)
+from uuid import uuid4
+
+from relay_teams.audit import AuditEventCreate, AuditEventType, AuditService
+from relay_teams.logger import get_logger, log_event, log_tool_error
+from relay_teams.agent_runtimes.instances.models import (
+    AgentRuntimeRecord,
+    RuntimeToolSnapshotEntry,
+    RuntimeToolsSnapshot,
+)
+from relay_teams.media import ContentPart, TextContentPart, UserPromptContent
+from relay_teams.metrics.adapters import record_tool_execution_async
+from relay_teams.notifications import NotificationContext, NotificationType
+from relay_teams.paths import path_is_file, read_bytes_file
+from relay_teams.persistence import is_retryable_sqlite_error
+from relay_teams.agents.tasks.task_status_sanitizer import (
+    sanitize_task_status_payload,
+)
+from relay_teams.reminders import ToolResultObservation
+from relay_teams.roles.runtime_tools import (
+    runtime_denied_tools_for_role,
+    runtime_tools_for_role,
+)
+from relay_teams.roles.role_models import RoleDefinition
+from relay_teams.sessions.runs.enums import InjectionSource, RunEventType
+from relay_teams.sessions.runs.event_stream import publish_run_event_async
+from relay_teams.sessions.runs.run_models import RunEvent
+from relay_teams.sessions.runs.system_injection import SystemInjectionSink
+
+from relay_teams.tools.runtime.approval_ticket_repo import (
+    ApprovalTicketRecord,
+    ApprovalTicketStatus,
+    ApprovalTicketStatusConflictError,
+)
+from relay_teams.sessions.runs.run_runtime_repo import RunRuntimePhase, RunRuntimeStatus
+from relay_teams.trace import trace_span
+from relay_teams.tools.runtime.context import ToolContext
+from relay_teams.tools.runtime.guardrails import (
+    RuntimeGuardrailAction,
+    RuntimeGuardrailContext,
+    RuntimeGuardrailEvaluation,
+    RuntimeGuardrailFinding,
+    RuntimeGuardrailPolicy,
+    RuntimeGuardrailRuleType,
+    RuntimeGuardrailStatus,
+    evaluate_in_execution_guardrails,
+    evaluate_pre_execution_guardrails,
+    guardrail_findings_payload,
+    guardrail_meta_status,
+    record_runtime_guardrail_findings_async,
+    record_runtime_guardrail_tool_call_async,
+)
+from relay_teams.tools.runtime.models import (
+    ToolApprovalDecision,
+    ToolApprovalRequest,
+    ToolError,
+    ToolExecutionError,
+    ToolInternalRecord,
+    ToolRuntimeDecision,
+    ToolResultEnvelope,
+    ToolResultProjection,
+)
+from relay_teams.tools.runtime.policy import ToolApprovalPolicy
+from relay_teams.tools.runtime.persisted_state import (
+    ToolApprovalMode,
+    ToolApprovalStatus,
+    ToolExecutionStatus,
+    load_tool_call_state_async,
+    merge_tool_call_state_async,
+)
+from relay_teams.env.hook_runtime_env import (
+    reset_tool_hook_runtime_env,
+    set_tool_hook_runtime_env,
+)
+from relay_teams.hooks import (
+    HookDecisionBundle,
+    HookDecisionType,
+    HookEventName,
+    PermissionDeniedInput,
+    PermissionRequestInput,
+    PostToolUseFailureInput,
+    PostToolUseInput,
+    PreToolUseInput,
+)
+
+LOGGER = get_logger(__name__)
+ParamT = ParamSpec("ParamT")
+ResultT = TypeVar("ResultT")
+TOOL_ACTION_WORKER_COUNT = 16
+TOOL_STATE_WORKER_COUNT = 4
+TOOL_APPROVAL_WORKER_COUNT = 4
+PER_RUN_TOOL_ACTION_CONCURRENCY = 8
+GLOBAL_TOOL_ACTION_CONCURRENCY = 16
+_TOOL_ACTION_EXECUTOR = ThreadPoolExecutor(
+    max_workers=TOOL_ACTION_WORKER_COUNT,
+    thread_name_prefix="tool-action",
+)
+_TOOL_STATE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=TOOL_STATE_WORKER_COUNT,
+    thread_name_prefix="tool-state",
+)
+_TOOL_APPROVAL_EXECUTOR = ThreadPoolExecutor(
+    max_workers=TOOL_APPROVAL_WORKER_COUNT,
+    thread_name_prefix="tool-approval",
+)
+_GLOBAL_TOOL_ACTION_SEMAPHORE = asyncio.Semaphore(GLOBAL_TOOL_ACTION_CONCURRENCY)
+_RUN_TOOL_ACTION_GATES_LOCK = threading.Lock()
+_RUN_TOOL_ACTION_GATES: dict[str, _RunToolActionGate] = {}
+_AUDITED_FILE_WRITE_TOOLS = frozenset({"write", "write_tmp", "edit", "notebook_edit"})
+_AUDITED_TOOL_NAMES = _AUDITED_FILE_WRITE_TOOLS | frozenset(
+    {"shell", "orch_dispatch_task"}
+)
+_AUDIT_REASON_LIMIT = 4_000
+
+
+class _RunToolActionGate:
+    def __init__(self) -> None:
+        self.semaphore = asyncio.Semaphore(PER_RUN_TOOL_ACTION_CONCURRENCY)
+        self.ref_count = 0
+
+
+async def _run_tool_state_work(
+    function: Callable[ParamT, ResultT],
+    /,
+    *args: ParamT.args,
+    **kwargs: ParamT.kwargs,
+) -> ResultT:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _TOOL_STATE_EXECUTOR,
+        partial(function, *args, **kwargs),
+    )
+
+
+async def _run_tool_approval_work(
+    function: Callable[ParamT, ResultT],
+    /,
+    *args: ParamT.args,
+    **kwargs: ParamT.kwargs,
+) -> ResultT:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _TOOL_APPROVAL_EXECUTOR,
+        partial(function, *args, **kwargs),
+    )
+
+
+@runtime_checkable
+class _AsyncToolResultReminderService(Protocol):
+    async def observe_tool_result_async(
+        self, observation: ToolResultObservation
+    ) -> object:
+        pass
+
+
+@runtime_checkable
+class _AsyncRunRuntimeRepository(Protocol):
+    async def ensure_async(
+        self,
+        *,
+        run_id: str,
+        session_id: str,
+        root_task_id: str | None = None,
+        status: RunRuntimeStatus = RunRuntimeStatus.QUEUED,
+        phase: RunRuntimePhase = RunRuntimePhase.IDLE,
+    ) -> object:
+        pass
+
+    @staticmethod
+    async def update_async(run_id: str, **changes: object) -> object:
+        pass
+
+
+@runtime_checkable
+class _RuntimeToolsAgentRepository(Protocol):
+    @staticmethod
+    async def get_instance_async(instance_id: str) -> AgentRuntimeRecord:
+        raise NotImplementedError
+
+
+# noinspection PyUnusedLocal,PyTypeHints
+@overload
+async def execute_tool(
+    ctx: ToolContext,
+    *,
+    tool_name: str,
+    args_summary: dict[str, JsonValue],
+    action: Callable[[dict[str, JsonValue]], object | Awaitable[object]]
+    | Callable[[], object | Awaitable[object]]
+    | object,
+    tool_input: dict[str, JsonValue] | None = None,
+    approval_request: ToolApprovalRequest | None = None,
+    approval_request_factory: Callable[
+        [dict[str, JsonValue]], ToolApprovalRequest | None
+    ]
+    | None = None,
+    approval_args_summary: dict[str, JsonValue] | None = None,
+    approval_args_summary_factory: Callable[
+        [dict[str, JsonValue]], dict[str, JsonValue] | None
+    ]
+    | None = None,
+    keep_approval_ticket_reusable: bool = False,
+    force_approval: bool = False,
+    allow_tool_return: Literal[False] = False,
+) -> dict[str, JsonValue]: ...
+
+
+# noinspection PyUnusedLocal,PyTypeHints
+@overload
+async def execute_tool(
+    ctx: ToolContext,
+    *,
+    tool_name: str,
+    args_summary: dict[str, JsonValue],
+    action: Callable[[dict[str, JsonValue]], object | Awaitable[object]]
+    | Callable[[], object | Awaitable[object]]
+    | object,
+    tool_input: dict[str, JsonValue] | None = None,
+    approval_request: ToolApprovalRequest | None = None,
+    approval_request_factory: Callable[
+        [dict[str, JsonValue]], ToolApprovalRequest | None
+    ]
+    | None = None,
+    approval_args_summary: dict[str, JsonValue] | None = None,
+    approval_args_summary_factory: Callable[
+        [dict[str, JsonValue]], dict[str, JsonValue] | None
+    ]
+    | None = None,
+    keep_approval_ticket_reusable: bool = False,
+    force_approval: bool = False,
+    allow_tool_return: Literal[True] = True,
+) -> ToolReturn | dict[str, JsonValue]: ...
+
+
+# noinspection PyUnusedLocal,PyTypeHints,PyRedeclaration
+async def execute_tool(
+    ctx: ToolContext,
+    *,
+    tool_name: str,
+    args_summary: dict[str, JsonValue],
+    action: Callable[[dict[str, JsonValue]], object | Awaitable[object]]
+    | Callable[[], object | Awaitable[object]]
+    | object,
+    tool_input: dict[str, JsonValue] | None = None,
+    approval_request: ToolApprovalRequest | None = None,
+    approval_request_factory: Callable[
+        [dict[str, JsonValue]], ToolApprovalRequest | None
+    ]
+    | None = None,
+    approval_args_summary: dict[str, JsonValue] | None = None,
+    approval_args_summary_factory: Callable[
+        [dict[str, JsonValue]], dict[str, JsonValue] | None
+    ]
+    | None = None,
+    keep_approval_ticket_reusable: bool = False,
+    force_approval: bool = False,
+    allow_tool_return: bool = False,
+) -> ToolReturn | dict[str, JsonValue]:
+    """Run a tool action with approval, logging, and normalized envelopes."""
+    tool_call_id = ctx.tool_call_id or f"toolcall_{uuid4().hex[:12]}"
+    with trace_span(
+        LOGGER,
+        component="tools.runtime",
+        operation="execute_tool",
+        attributes={"tool_name": tool_name},
+        trace_id=ctx.deps.trace_id,
+        run_id=ctx.deps.run_id,
+        task_id=ctx.deps.task_id,
+        session_id=ctx.deps.session_id,
+        instance_id=ctx.deps.instance_id,
+        role_id=ctx.deps.role_id,
+        tool_call_id=tool_call_id,
+    ):
+        started = time.perf_counter()
+        log_event(
+            LOGGER,
+            logging.DEBUG,
+            event="tool.call.started",
+            message="Tool call started",
+            payload={
+                "tool_name": tool_name,
+                "args": args_summary,
+                "instance_id": ctx.deps.instance_id,
+                "role_id": ctx.deps.role_id,
+            },
+        )
+        meta: dict[str, JsonValue] = {}
+        effective_tool_input = dict(args_summary if tool_input is None else tool_input)
+        _raise_if_stopped(ctx)
+        role_contract_error = _apply_role_contract_check(ctx=ctx, tool_name=tool_name)
+        if role_contract_error is not None:
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            meta["duration_ms"] = elapsed_ms
+            meta["approval_status"] = "denied_by_policy"
+            meta["runtime_policy_decision"] = "deny"
+            meta["role_id"] = ctx.deps.role_id
+            meta["tool_name"] = tool_name
+            envelope = _visible_envelope(
+                ok=False,
+                error=role_contract_error,
+                meta=meta,
+            )
+            await _observe_tool_result_reminders_async(
+                ctx=ctx,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                envelope=envelope,
+            )
+            await _persist_and_publish_tool_result_async(
+                ctx=ctx,
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                args_summary=args_summary,
+                visible_envelope=envelope,
+                internal_data=None,
+                runtime_meta=meta,
+                execution_status=ToolExecutionStatus.FAILED,
+            )
+            await _record_tool_metrics_async(
+                ctx=ctx,
+                tool_name=tool_name,
+                duration_ms=elapsed_ms,
+                success=False,
+            )
+            return envelope
+        requested_force_approval = force_approval
+        hook_force_approval = False
+        (
+            effective_tool_input,
+            pre_tool_error,
+            hook_force_approval,
+        ) = await _apply_pre_tool_hooks(
+            ctx=ctx,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            tool_input=effective_tool_input,
+        )
+        args_summary = dict(effective_tool_input)
+        pre_guardrail_error = await _apply_pre_execution_guardrails(
+            ctx=ctx,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            tool_input=effective_tool_input,
+            meta=meta,
+        )
+        if pre_tool_error is None and pre_guardrail_error is not None:
+            pre_tool_error = pre_guardrail_error
+        reusable_result = await _reusable_tool_result_async(
+            ctx=ctx,
+            args_preview=_safe_json(args_summary),
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            allow_tool_return=allow_tool_return,
+        )
+        if pre_tool_error is None and reusable_result is not None:
+            log_event(
+                LOGGER,
+                logging.INFO,
+                event="tool.call.reused_result",
+                message="Reused persisted tool result for duplicate tool call",
+                payload={
+                    "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "instance_id": ctx.deps.instance_id,
+                    "role_id": ctx.deps.role_id,
+                },
+            )
+            return reusable_result
+        resolved_approval_request = (
+            approval_request_factory(effective_tool_input)
+            if approval_request_factory is not None
+            else approval_request
+        )
+        resolved_approval_args_summary = (
+            approval_args_summary_factory(effective_tool_input)
+            if approval_args_summary_factory is not None
+            else approval_args_summary
+        )
+        if pre_tool_error is not None:
+            approval_ticket_id = None
+            approval_error = pre_tool_error
+        else:
+            approval_ticket_id, approval_error = await _handle_tool_approval(
+                ctx=ctx,
+                tool_name=tool_name,
+                args_summary=args_summary,
+                approval_args_summary=resolved_approval_args_summary,
+                meta=meta,
+                tool_call_id=tool_call_id,
+                approval_request=resolved_approval_request,
+                force_approval=requested_force_approval or hook_force_approval,
+            )
+        if approval_error is not None:
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            meta["duration_ms"] = elapsed_ms
+            envelope = _visible_envelope(
+                ok=False,
+                error=approval_error,
+                meta=meta,
+            )
+            await _observe_tool_result_reminders_async(
+                ctx=ctx,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                envelope=envelope,
+            )
+            await _record_security_audit_event_async(
+                ctx=ctx,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                tool_input=effective_tool_input,
+                visible_envelope=envelope,
+                internal_data=None,
+                execution_status=ToolExecutionStatus.FAILED,
+            )
+            await _persist_and_publish_tool_result_async(
+                ctx=ctx,
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                args_summary=args_summary,
+                visible_envelope=envelope,
+                internal_data=None,
+                runtime_meta=meta,
+                execution_status=ToolExecutionStatus.FAILED,
+            )
+            await _record_tool_metrics_async(
+                ctx=ctx,
+                tool_name=tool_name,
+                duration_ms=elapsed_ms,
+                success=False,
+            )
+            return envelope
+
+        await _ensure_run_runtime_async(ctx=ctx)
+        await _update_run_runtime_async(
+            ctx=ctx,
+            status=RunRuntimeStatus.RUNNING,
+            phase=RunRuntimePhase.COORDINATOR_RUNNING
+            if ctx.deps.role_registry.is_coordinator_role(ctx.deps.role_id)
+            else RunRuntimePhase.SUBAGENT_RUNNING,
+            active_instance_id=ctx.deps.instance_id,
+            active_task_id=ctx.deps.task_id,
+            active_role_id=ctx.deps.role_id,
+            active_subagent_instance_id=(
+                None
+                if ctx.deps.role_registry.is_coordinator_role(ctx.deps.role_id)
+                else ctx.deps.instance_id
+            ),
+            last_error=None,
+        )
+        try:
+            await _mark_tool_running_async(
+                ctx=ctx,
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                args_summary=args_summary,
+                runtime_meta=meta,
+            )
+        except Exception as exc:
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                event="tool.running_state_persist_failed",
+                message=(
+                    "Tool call will run, but its pre-run recovery state could "
+                    "not be persisted"
+                ),
+                payload={
+                    "run_id": ctx.deps.run_id,
+                    "task_id": ctx.deps.task_id,
+                    "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+
+        try:
+            _raise_if_stopped(ctx)
+            hook_env_token = set_tool_hook_runtime_env(ctx.deps.hook_runtime_env)
+            try:
+                result = await _invoke_tool_action_with_limits(
+                    ctx=ctx,
+                    action=action,
+                    tool_input=effective_tool_input,
+                )
+            finally:
+                reset_tool_hook_runtime_env(hook_env_token)
+            _raise_if_stopped(ctx)
+            visible_data, internal_data, tool_content_parts = _normalize_result_payload(
+                result
+            )
+
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            meta["duration_ms"] = elapsed_ms
+
+            log_event(
+                LOGGER,
+                logging.DEBUG,
+                event="tool.call.completed",
+                message="Tool call completed",
+                duration_ms=elapsed_ms,
+                payload={"tool_name": tool_name},
+            )
+
+            envelope = _visible_envelope(
+                ok=True,
+                data=visible_data,
+                meta=meta,
+            )
+            tool_return_content: UserPromptContent | None = None
+            if tool_content_parts:
+                if not allow_tool_return:
+                    raise ValueError(
+                        f"Tool {tool_name} produced model content without enabling tool returns."
+                    )
+                tool_return_content = _tool_return_content(
+                    ctx=ctx,
+                    tool_name=tool_name,
+                    tool_content_parts=tool_content_parts,
+                )
+
+            envelope = await _apply_post_tool_hooks(
+                ctx=ctx,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                args_summary=args_summary,
+                envelope=envelope,
+            )
+            envelope = await _apply_in_execution_guardrails(
+                ctx=ctx,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                tool_input=effective_tool_input,
+                envelope=envelope,
+            )
+            final_success = not _visible_tool_result_is_error(envelope)
+            execution_status = (
+                ToolExecutionStatus.COMPLETED
+                if final_success
+                else ToolExecutionStatus.FAILED
+            )
+            await _observe_tool_result_reminders_async(
+                ctx=ctx,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                envelope=envelope,
+            )
+            await _persist_and_publish_tool_result_async(
+                ctx=ctx,
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                args_summary=args_summary,
+                visible_envelope=envelope,
+                internal_data=internal_data if final_success else None,
+                runtime_meta=meta,
+                execution_status=execution_status,
+                tool_content_parts=tool_content_parts if final_success else (),
+            )
+            await _record_tool_metrics_async(
+                ctx=ctx,
+                tool_name=tool_name,
+                duration_ms=elapsed_ms,
+                success=final_success,
+            )
+            if approval_ticket_id and not keep_approval_ticket_reusable:
+                await ctx.deps.approval_ticket_repo.mark_completed_async(
+                    approval_ticket_id
+                )
+            await _record_security_audit_event_async(
+                ctx=ctx,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                tool_input=effective_tool_input,
+                visible_envelope=envelope,
+                internal_data=internal_data,
+                execution_status=execution_status,
+            )
+            if final_success and tool_return_content is not None:
+                return ToolReturn(
+                    return_value=envelope,
+                    content=tool_return_content,
+                )
+            return envelope
+        except Exception as exc:
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            meta["duration_ms"] = elapsed_ms
+            error = _error_payload(exc)
+            if error.details:
+                meta["error_details"] = dict(error.details)
+
+            compact = json.dumps(
+                {
+                    "tool": tool_name,
+                    "type": error.type,
+                    "message": error.message,
+                    "details": error.details,
+                },
+                ensure_ascii=False,
+            )
+            log_tool_error(ctx.deps.role_id, compact)
+            log_event(
+                LOGGER,
+                logging.ERROR,
+                event="tool.call.failed",
+                message="Tool call failed",
+                duration_ms=elapsed_ms,
+                payload={
+                    "tool_name": tool_name,
+                    "error_type": error.type,
+                    "retryable": error.retryable,
+                    "details": error.details,
+                },
+            )
+            envelope = _visible_envelope(
+                ok=False,
+                error=error,
+                meta=meta,
+            )
+            envelope = await _apply_post_tool_failure_hooks(
+                ctx=ctx,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                args_summary=args_summary,
+                envelope=envelope,
+            )
+            envelope = await _apply_in_execution_guardrails(
+                ctx=ctx,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                tool_input=effective_tool_input,
+                envelope=envelope,
+            )
+            await _observe_tool_result_reminders_async(
+                ctx=ctx,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                envelope=envelope,
+            )
+            await _record_security_audit_event_async(
+                ctx=ctx,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                tool_input=effective_tool_input,
+                visible_envelope=envelope,
+                internal_data=None,
+                execution_status=ToolExecutionStatus.FAILED,
+            )
+            await _persist_and_publish_tool_result_async(
+                ctx=ctx,
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                args_summary=args_summary,
+                visible_envelope=envelope,
+                internal_data=None,
+                runtime_meta=meta,
+                execution_status=ToolExecutionStatus.FAILED,
+            )
+            await _record_tool_metrics_async(
+                ctx=ctx,
+                tool_name=tool_name,
+                duration_ms=elapsed_ms,
+                success=False,
+            )
+            if approval_ticket_id and not keep_approval_ticket_reusable:
+                await ctx.deps.approval_ticket_repo.mark_completed_async(
+                    approval_ticket_id
+                )
+            return envelope
+
+
+# noinspection PyUnusedLocal,PyTypeHints
+@overload
+async def execute_tool_call(
+    ctx: ToolContext,
+    *,
+    tool_name: str,
+    args_summary: dict[str, JsonValue],
+    action: Callable[..., object | Awaitable[object]] | object,
+    raw_args: Mapping[str, object] | None = None,
+    args_exclude: tuple[str, ...] = ("ctx",),
+    approval_request: ToolApprovalRequest | None = None,
+    approval_request_factory: Callable[
+        [dict[str, JsonValue]], ToolApprovalRequest | None
+    ]
+    | None = None,
+    approval_args_summary: dict[str, JsonValue] | None = None,
+    approval_args_summary_factory: Callable[
+        [dict[str, JsonValue]], dict[str, JsonValue] | None
+    ]
+    | None = None,
+    keep_approval_ticket_reusable: bool = False,
+    force_approval: bool = False,
+    allow_tool_return: Literal[False] = False,
+) -> dict[str, JsonValue]: ...
+
+
+# noinspection PyUnusedLocal,PyTypeHints
+@overload
+async def execute_tool_call(
+    ctx: ToolContext,
+    *,
+    tool_name: str,
+    args_summary: dict[str, JsonValue],
+    action: Callable[..., object | Awaitable[object]] | object,
+    raw_args: Mapping[str, object] | None = None,
+    args_exclude: tuple[str, ...] = ("ctx",),
+    approval_request: ToolApprovalRequest | None = None,
+    approval_request_factory: Callable[
+        [dict[str, JsonValue]], ToolApprovalRequest | None
+    ]
+    | None = None,
+    approval_args_summary: dict[str, JsonValue] | None = None,
+    approval_args_summary_factory: Callable[
+        [dict[str, JsonValue]], dict[str, JsonValue] | None
+    ]
+    | None = None,
+    keep_approval_ticket_reusable: bool = False,
+    force_approval: bool = False,
+    allow_tool_return: Literal[True] = True,
+) -> ToolReturn | dict[str, JsonValue]: ...
+
+
+# noinspection PyUnusedLocal,PyTypeHints,PyRedeclaration
+async def execute_tool_call(
+    ctx: ToolContext,
+    *,
+    tool_name: str,
+    args_summary: dict[str, JsonValue],
+    action: Callable[..., object | Awaitable[object]] | object,
+    raw_args: Mapping[str, object] | None = None,
+    args_exclude: tuple[str, ...] = ("ctx",),
+    approval_request: ToolApprovalRequest | None = None,
+    approval_request_factory: Callable[
+        [dict[str, JsonValue]], ToolApprovalRequest | None
+    ]
+    | None = None,
+    approval_args_summary: dict[str, JsonValue] | None = None,
+    approval_args_summary_factory: Callable[
+        [dict[str, JsonValue]], dict[str, JsonValue] | None
+    ]
+    | None = None,
+    keep_approval_ticket_reusable: bool = False,
+    force_approval: bool = False,
+    allow_tool_return: bool = False,
+) -> ToolReturn | dict[str, JsonValue]:
+    """Run a tool through the hook-aware runtime using natural Python params.
+
+    Tool authors should prefer this wrapper for new tools:
+    - keep ``action`` as a normal callable with named parameters that match the tool
+    - pass ``raw_args=locals()`` from the tool body so hooks can rewrite the live input
+    - keep ``args_summary`` limited to approval and observability data, not full payloads
+
+    ``execute_tool()`` remains available for compatibility, but ``execute_tool_call()``
+    is the default authoring path because it centralizes hook input capture, argument
+    binding, and runtime env propagation.
+    """
+    tool_input = (
+        None
+        if raw_args is None
+        else _capture_tool_input(
+            raw_args=raw_args,
+            action=action,
+            exclude=args_exclude,
+        )
+    )
+    if allow_tool_return:
+        return await execute_tool(
+            ctx,
+            tool_name=tool_name,
+            args_summary=args_summary,
+            action=action,
+            tool_input=tool_input,
+            approval_request=approval_request,
+            approval_request_factory=approval_request_factory,
+            approval_args_summary=approval_args_summary,
+            approval_args_summary_factory=approval_args_summary_factory,
+            keep_approval_ticket_reusable=keep_approval_ticket_reusable,
+            force_approval=force_approval,
+            allow_tool_return=True,
+        )
+    return await execute_tool(
+        ctx,
+        tool_name=tool_name,
+        args_summary=args_summary,
+        action=action,
+        tool_input=tool_input,
+        approval_request=approval_request,
+        approval_request_factory=approval_request_factory,
+        approval_args_summary=approval_args_summary,
+        approval_args_summary_factory=approval_args_summary_factory,
+        keep_approval_ticket_reusable=keep_approval_ticket_reusable,
+        force_approval=force_approval,
+        allow_tool_return=False,
+    )
+
+
+async def _reusable_tool_result_async(
+    *,
+    ctx: ToolContext,
+    args_preview: str,
+    tool_call_id: str,
+    tool_name: str,
+    allow_tool_return: bool,
+) -> (ToolReturn | dict[str, JsonValue]) | None:
+    state = await load_tool_call_state_async(
+        shared_store=ctx.deps.shared_store,
+        task_id=ctx.deps.task_id,
+        tool_call_id=tool_call_id,
+    )
+    if state is None or state.tool_name != tool_name:
+        return None
+    if state.args_preview != args_preview:
+        return None
+    if not _state_matches_runtime_scope(ctx=ctx, state_run_id=state.run_id):
+        return None
+    if state.execution_status not in {
+        ToolExecutionStatus.COMPLETED,
+        ToolExecutionStatus.FAILED,
+    }:
+        return None
+    result_envelope = state.result_envelope
+    if not isinstance(result_envelope, dict):
+        return None
+    try:
+        record = ToolInternalRecord.model_validate(result_envelope)
+    except ValidationError:
+        record = None
+    if record is not None:
+        visible_result = _normalize_json_object(
+            record.visible_result.model_dump(mode="json")
+        )
+        if record.tool_content_parts and allow_tool_return:
+            try:
+                tool_return_content = _tool_return_content(
+                    ctx=ctx,
+                    tool_name=tool_name,
+                    tool_content_parts=tuple(record.tool_content_parts),
+                )
+            except Exception as exc:
+                return _visible_envelope(
+                    ok=False,
+                    error=_error_payload(exc),
+                    meta={"reused_tool_call": True},
+                )
+            return ToolReturn(
+                return_value=visible_result,
+                content=tool_return_content,
+            )
+        return visible_result
+    visible_result = result_envelope.get("visible_result")
+    if isinstance(visible_result, dict):
+        return _normalize_json_object(visible_result)
+    return _normalize_json_object(result_envelope)
+
+
+def _state_matches_runtime_scope(
+    *,
+    ctx: ToolContext,
+    state_run_id: str,
+) -> bool:
+    return not state_run_id or state_run_id == ctx.deps.run_id
+
+
+async def _record_tool_metrics_async(
+    *,
+    ctx: ToolContext,
+    tool_name: str,
+    duration_ms: int,
+    success: bool,
+) -> None:
+    metric_recorder = getattr(ctx.deps, "metric_recorder", None)
+    mcp_registry = getattr(ctx.deps, "mcp_registry", None)
+    if metric_recorder is None or mcp_registry is None:
+        return
+    await record_tool_execution_async(
+        metric_recorder,
+        mcp_registry=mcp_registry,
+        workspace_id=ctx.deps.workspace_id,
+        session_id=ctx.deps.session_id,
+        run_id=ctx.deps.run_id,
+        instance_id=ctx.deps.instance_id,
+        role_id=ctx.deps.role_id,
+        tool_name=tool_name,
+        duration_ms=duration_ms,
+        success=success,
+    )
+
+
+async def _record_security_audit_event_async(
+    *,
+    ctx: ToolContext,
+    tool_name: str,
+    tool_call_id: str,
+    tool_input: dict[str, JsonValue],
+    visible_envelope: dict[str, JsonValue],
+    internal_data: JsonValue | None,
+    execution_status: ToolExecutionStatus,
+) -> None:
+    if tool_name not in _AUDITED_TOOL_NAMES:
+        return
+    service = _audit_service(ctx)
+    if service is None:
+        return
+    event = await _build_security_audit_event_async(
+        ctx=ctx,
+        tool_name=tool_name,
+        tool_call_id=tool_call_id,
+        tool_input=tool_input,
+        visible_envelope=visible_envelope,
+        internal_data=internal_data,
+        execution_status=execution_status,
+    )
+    if event is None:
+        return
+    try:
+        await service.record_event_async(event)
+    except Exception as exc:
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            event="security.audit.record_failed",
+            message="Security audit event could not be recorded",
+            payload={
+                "tool_name": tool_name,
+                "tool_call_id": tool_call_id,
+                "audit_event_type": event.event_type.value,
+                "run_id": ctx.deps.run_id,
+                "task_id": ctx.deps.task_id,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+        )
+
+
+def _audit_service(ctx: ToolContext) -> AuditService | None:
+    return ctx.deps.audit_service
+
+
+async def _build_security_audit_event_async(
+    *,
+    ctx: ToolContext,
+    tool_name: str,
+    tool_call_id: str,
+    tool_input: dict[str, JsonValue],
+    visible_envelope: dict[str, JsonValue],
+    internal_data: JsonValue | None,
+    execution_status: ToolExecutionStatus,
+) -> AuditEventCreate | None:
+    if tool_name in _AUDITED_FILE_WRITE_TOOLS:
+        return await _build_file_write_audit_event_async(
+            ctx=ctx,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            tool_input=tool_input,
+            visible_envelope=visible_envelope,
+            internal_data=internal_data,
+            execution_status=execution_status,
+        )
+    if tool_name == "shell":
+        return _build_shell_command_audit_event(
+            ctx=ctx,
+            tool_call_id=tool_call_id,
+            tool_input=tool_input,
+            visible_envelope=visible_envelope,
+            execution_status=execution_status,
+        )
+    if tool_name == "orch_dispatch_task":
+        return _build_coordinator_decision_audit_event(
+            ctx=ctx,
+            tool_call_id=tool_call_id,
+            tool_input=tool_input,
+            visible_envelope=visible_envelope,
+            execution_status=execution_status,
+        )
+    return None
+
+
+async def _build_file_write_audit_event_async(
+    *,
+    ctx: ToolContext,
+    tool_name: str,
+    tool_call_id: str,
+    tool_input: dict[str, JsonValue],
+    visible_envelope: dict[str, JsonValue],
+    internal_data: JsonValue | None,
+    execution_status: ToolExecutionStatus,
+) -> AuditEventCreate | None:
+    target = _file_write_target(tool_name, tool_input, internal_data)
+    if target is None:
+        return None
+    content_digest, content_size_bytes, digest_error = await asyncio.to_thread(
+        _workspace_file_digest,
+        ctx=ctx,
+        logical_path=target,
+    )
+    metadata = _base_audit_metadata(
+        tool_name=tool_name,
+        visible_envelope=visible_envelope,
+        execution_status=execution_status,
+    )
+    if digest_error is not None:
+        metadata["content_digest_error"] = digest_error
+    _add_file_write_metadata(
+        metadata=metadata,
+        tool_name=tool_name,
+        tool_input=tool_input,
+        internal_data=internal_data,
+    )
+    return AuditEventCreate(
+        event_type=AuditEventType.FILE_WRITE,
+        trace_id=ctx.deps.trace_id,
+        run_id=ctx.deps.run_id,
+        session_id=ctx.deps.session_id,
+        task_id=ctx.deps.task_id,
+        instance_id=ctx.deps.instance_id,
+        role_id=ctx.deps.role_id,
+        tool_call_id=tool_call_id,
+        action=_file_write_action(tool_name),
+        target=target,
+        content_digest=content_digest,
+        content_size_bytes=content_size_bytes,
+        outcome=_audit_outcome(
+            visible_envelope=visible_envelope,
+            execution_status=execution_status,
+        ),
+        metadata=metadata,
+    )
+
+
+def _build_shell_command_audit_event(
+    *,
+    ctx: ToolContext,
+    tool_call_id: str,
+    tool_input: dict[str, JsonValue],
+    visible_envelope: dict[str, JsonValue],
+    execution_status: ToolExecutionStatus,
+) -> AuditEventCreate | None:
+    command = _string_value(tool_input.get("command"))
+    if command is None:
+        return None
+    metadata = _base_audit_metadata(
+        tool_name="shell",
+        visible_envelope=visible_envelope,
+        execution_status=execution_status,
+    )
+    _copy_json_metadata(metadata, tool_input, "workdir")
+    _copy_json_metadata(metadata, tool_input, "background")
+    _copy_json_metadata(metadata, tool_input, "tty")
+    _copy_json_metadata(metadata, tool_input, "yield_time_ms")
+    _copy_json_metadata(metadata, tool_input, "timeout_ms")
+    _copy_result_metadata(metadata, visible_envelope, "status")
+    _copy_result_metadata(metadata, visible_envelope, "exit_code")
+    return AuditEventCreate(
+        event_type=AuditEventType.SHELL_COMMAND,
+        trace_id=ctx.deps.trace_id,
+        run_id=ctx.deps.run_id,
+        session_id=ctx.deps.session_id,
+        task_id=ctx.deps.task_id,
+        instance_id=ctx.deps.instance_id,
+        role_id=ctx.deps.role_id,
+        tool_call_id=tool_call_id,
+        action="execute_shell_command",
+        target=_truncate_text(command, 200)[0],
+        command=command,
+        outcome=_audit_outcome(
+            visible_envelope=visible_envelope,
+            execution_status=execution_status,
+        ),
+        metadata=metadata,
+    )
+
+
+def _build_coordinator_decision_audit_event(
+    *,
+    ctx: ToolContext,
+    tool_call_id: str,
+    tool_input: dict[str, JsonValue],
+    visible_envelope: dict[str, JsonValue],
+    execution_status: ToolExecutionStatus,
+) -> AuditEventCreate | None:
+    task_id = _string_value(tool_input.get("task_id"))
+    selected_role_id = _string_value(tool_input.get("role_id"))
+    if task_id is None or selected_role_id is None:
+        return None
+    prompt = _string_value(tool_input.get("prompt")) or ""
+    reason_source = (
+        prompt.strip()
+        or "Coordinator dispatched task with the default execution prompt."
+    )
+    decision_reason, reason_truncated = _truncate_text(
+        reason_source,
+        _AUDIT_REASON_LIMIT,
+    )
+    metadata = _base_audit_metadata(
+        tool_name="orch_dispatch_task",
+        visible_envelope=visible_envelope,
+        execution_status=execution_status,
+    )
+    metadata["dispatched_task_id"] = task_id
+    metadata["selected_role_id"] = selected_role_id
+    metadata["decision_reason_digest"] = _text_digest(reason_source)
+    metadata["decision_reason_length"] = len(reason_source)
+    metadata["decision_reason_truncated"] = reason_truncated
+    return AuditEventCreate(
+        event_type=AuditEventType.COORDINATOR_DECISION,
+        trace_id=ctx.deps.trace_id,
+        run_id=ctx.deps.run_id,
+        session_id=ctx.deps.session_id,
+        task_id=ctx.deps.task_id,
+        instance_id=ctx.deps.instance_id,
+        role_id=ctx.deps.role_id,
+        tool_call_id=tool_call_id,
+        action="dispatch_task",
+        target=f"task:{task_id}->role:{selected_role_id}",
+        decision_reason=decision_reason,
+        outcome=_audit_outcome(
+            visible_envelope=visible_envelope,
+            execution_status=execution_status,
+        ),
+        metadata=metadata,
+    )
+
+
+def _base_audit_metadata(
+    *,
+    tool_name: str,
+    visible_envelope: dict[str, JsonValue],
+    execution_status: ToolExecutionStatus,
+) -> dict[str, JsonValue]:
+    metadata: dict[str, JsonValue] = {
+        "tool_name": tool_name,
+        "execution_status": execution_status.value,
+        "tool_ok": visible_envelope.get("ok") is True,
+    }
+    error_type = _visible_error_type(visible_envelope)
+    if error_type is not None:
+        metadata["error_type"] = error_type
+    return metadata
+
+
+def _audit_outcome(
+    *,
+    visible_envelope: dict[str, JsonValue],
+    execution_status: ToolExecutionStatus,
+) -> str:
+    if visible_envelope.get("ok") is True and execution_status == (
+        ToolExecutionStatus.COMPLETED
+    ):
+        return "completed"
+    return "failed"
+
+
+def _visible_error_type(visible_envelope: dict[str, JsonValue]) -> str | None:
+    error = visible_envelope.get("error")
+    if not isinstance(error, dict):
+        return None
+    value = error.get("type")
+    return value if isinstance(value, str) and value else None
+
+
+def _copy_json_metadata(
+    metadata: dict[str, JsonValue],
+    source: dict[str, JsonValue],
+    key: str,
+) -> None:
+    if key in source:
+        metadata[key] = source[key]
+
+
+def _copy_result_metadata(
+    metadata: dict[str, JsonValue],
+    visible_envelope: dict[str, JsonValue],
+    key: str,
+) -> None:
+    data = visible_envelope.get("data")
+    if not isinstance(data, dict):
+        return
+    value = data.get(key)
+    if value is not None:
+        metadata[key] = _normalize_json_value(value)
+
+
+def _add_file_write_metadata(
+    *,
+    metadata: dict[str, JsonValue],
+    tool_name: str,
+    tool_input: dict[str, JsonValue],
+    internal_data: JsonValue | None,
+) -> None:
+    content_field = _file_content_input_field(tool_name)
+    if content_field is not None:
+        content = _string_value(tool_input.get(content_field))
+        if content is not None:
+            metadata["input_content_digest"] = _text_digest(content)
+            metadata["input_content_length"] = len(content)
+    if isinstance(internal_data, dict):
+        created = internal_data.get("created")
+        if isinstance(created, bool):
+            metadata["created"] = created
+        diff_summary = internal_data.get("diff_summary")
+        if isinstance(diff_summary, str) and diff_summary:
+            metadata["diff_summary"] = diff_summary
+
+
+def _file_content_input_field(tool_name: str) -> str | None:
+    if tool_name in {"write", "write_tmp"}:
+        return "content"
+    if tool_name == "edit":
+        return "new_string"
+    if tool_name == "notebook_edit":
+        return "new_source"
+    return None
+
+
+def _file_write_target(
+    tool_name: str,
+    tool_input: dict[str, JsonValue],
+    internal_data: JsonValue | None,
+) -> str | None:
+    if tool_name == "write_tmp":
+        internal_path = _internal_data_text(internal_data, "path")
+        if internal_path is not None:
+            return internal_path
+        raw_tmp_path = _string_value(tool_input.get("path"))
+        if raw_tmp_path is None:
+            return None
+        if raw_tmp_path == "tmp" or raw_tmp_path.startswith(("tmp/", "tmp\\")):
+            return raw_tmp_path
+        return f"tmp/{raw_tmp_path}"
+    return _string_value(tool_input.get("path")) or _internal_data_text(
+        internal_data,
+        "path",
+    )
+
+
+def _file_write_action(tool_name: str) -> str:
+    if tool_name == "edit":
+        return "edit_file"
+    if tool_name == "notebook_edit":
+        return "edit_notebook"
+    if tool_name == "write_tmp":
+        return "write_tmp_file"
+    return "write_file"
+
+
+def _workspace_file_digest(
+    *,
+    ctx: ToolContext,
+    logical_path: str,
+) -> tuple[str | None, int | None, str | None]:
+    try:
+        file_path = ctx.deps.workspace.resolve_path(logical_path, write=False)
+        if not path_is_file(file_path):
+            return None, None, "target is not a file"
+        content = read_bytes_file(file_path)
+    except Exception as exc:
+        return None, None, f"{type(exc).__name__}: {exc}"
+    return f"sha256:{sha256(content).hexdigest()}", len(content), None
+
+
+def _internal_data_text(internal_data: JsonValue | None, key: str) -> str | None:
+    if not isinstance(internal_data, dict):
+        return None
+    return _string_value(internal_data.get(key))
+
+
+def _string_value(value: JsonValue | None) -> str | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped if stripped else None
+
+
+def _text_digest(value: str) -> str:
+    return f"sha256:{sha256(value.encode('utf-8')).hexdigest()}"
+
+
+def _truncate_text(value: str, limit: int) -> tuple[str, bool]:
+    if len(value) <= limit:
+        return value, False
+    return value[:limit], True
+
+
+async def _ensure_run_runtime_async(
+    *,
+    ctx: ToolContext,
+    status: RunRuntimeStatus = RunRuntimeStatus.QUEUED,
+    phase: RunRuntimePhase = RunRuntimePhase.IDLE,
+) -> None:
+    repository = ctx.deps.run_runtime_repo
+    if isinstance(repository, _AsyncRunRuntimeRepository):
+        _ = await repository.ensure_async(
+            run_id=ctx.deps.run_id,
+            session_id=ctx.deps.session_id,
+            root_task_id=ctx.deps.task_id,
+            status=status,
+            phase=phase,
+        )
+        return
+    ensure_kwargs: dict[str, object] = {
+        "run_id": ctx.deps.run_id,
+        "session_id": ctx.deps.session_id,
+        "root_task_id": ctx.deps.task_id,
+    }
+    if status != RunRuntimeStatus.QUEUED:
+        ensure_kwargs["status"] = status
+    if phase != RunRuntimePhase.IDLE:
+        ensure_kwargs["phase"] = phase
+    _ = await _run_tool_state_work(repository.ensure, **ensure_kwargs)
+
+
+async def _update_run_runtime_async(
+    *,
+    ctx: ToolContext,
+    **changes: object,
+) -> None:
+    repository = ctx.deps.run_runtime_repo
+    if isinstance(repository, _AsyncRunRuntimeRepository):
+        _ = await repository.update_async(ctx.deps.run_id, **changes)
+        return
+    _ = await _run_tool_state_work(repository.update, ctx.deps.run_id, **changes)
+
+
+async def _publish_tool_result_event_async(
+    *,
+    ctx: ToolContext,
+    tool_call_id: str,
+    tool_name: str,
+    visible_envelope: dict[str, JsonValue],
+) -> int:
+    result_payload = cast(
+        JsonValue,
+        sanitize_task_status_payload(visible_envelope),
+    )
+    is_error = _visible_tool_result_is_error(visible_envelope)
+    return await publish_run_event_async(
+        ctx.deps.run_event_hub,
+        RunEvent(
+            session_id=ctx.deps.session_id,
+            run_id=ctx.deps.run_id,
+            trace_id=ctx.deps.trace_id,
+            task_id=ctx.deps.task_id,
+            instance_id=ctx.deps.instance_id,
+            role_id=ctx.deps.role_id,
+            event_type=RunEventType.TOOL_RESULT,
+            payload_json=dumps(
+                {
+                    "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "result": result_payload,
+                    "error": is_error,
+                    "role_id": ctx.deps.role_id,
+                    "instance_id": ctx.deps.instance_id,
+                }
+            ),
+        ),
+    )
+
+
+def _mark_tool_result_event_state(
+    *,
+    runtime_meta: dict[str, JsonValue],
+    visible_envelope: dict[str, JsonValue],
+    published: bool,
+) -> None:
+    runtime_meta["tool_result_durably_recorded"] = True
+    runtime_meta["tool_result_event_published"] = published
+    raw_meta = visible_envelope.get("meta")
+    envelope_meta = (
+        dict(cast(dict[str, JsonValue], raw_meta)) if isinstance(raw_meta, dict) else {}
+    )
+    envelope_meta["tool_result_durably_recorded"] = True
+    envelope_meta["tool_result_event_published"] = published
+    visible_envelope["meta"] = envelope_meta
+
+
+def _visible_tool_result_is_error(visible_envelope: dict[str, JsonValue]) -> bool:
+    if visible_envelope.get("ok") is False:
+        return True
+    data = visible_envelope.get("data")
+    if not isinstance(data, dict):
+        return False
+    status = data.get("status")
+    if isinstance(status, str) and status.strip().lower() in {"failed", "error"}:
+        return True
+    exit_code = data.get("exit_code")
+    return type(exit_code) is int and exit_code != 0
+
+
+async def _persist_and_publish_tool_result_async(
+    *,
+    ctx: ToolContext,
+    tool_call_id: str,
+    tool_name: str,
+    args_summary: dict[str, JsonValue],
+    visible_envelope: dict[str, JsonValue],
+    internal_data: JsonValue | None,
+    runtime_meta: dict[str, JsonValue],
+    execution_status: ToolExecutionStatus,
+    tool_content_parts: tuple[ContentPart, ...] = (),
+) -> None:
+    _mark_tool_result_event_state(
+        runtime_meta=runtime_meta,
+        visible_envelope=visible_envelope,
+        published=False,
+    )
+    await _persist_tool_record_async(
+        ctx=ctx,
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+        args_summary=args_summary,
+        visible_envelope=visible_envelope,
+        internal_data=internal_data,
+        runtime_meta=runtime_meta,
+        execution_status=execution_status,
+        tool_content_parts=tool_content_parts,
+    )
+    _mark_tool_result_event_state(
+        runtime_meta=runtime_meta,
+        visible_envelope=visible_envelope,
+        published=True,
+    )
+    result_event_id = await _publish_tool_result_event_async(
+        ctx=ctx,
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+        visible_envelope=visible_envelope,
+    )
+    try:
+        await _persist_tool_record_async(
+            ctx=ctx,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            args_summary=args_summary,
+            visible_envelope=visible_envelope,
+            internal_data=internal_data,
+            runtime_meta=runtime_meta,
+            execution_status=execution_status,
+            tool_content_parts=tool_content_parts,
+            result_event_id=result_event_id,
+        )
+    except Exception as exc:
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            event="tool.result_linkage_persist_failed",
+            message=(
+                "Tool result event was published, but the result linkage state "
+                "could not be updated"
+            ),
+            payload={
+                "run_id": ctx.deps.run_id,
+                "task_id": ctx.deps.task_id,
+                "tool_name": tool_name,
+                "tool_call_id": tool_call_id,
+                "result_event_id": result_event_id,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+        )
+
+
+async def _mark_tool_running_async(
+    *,
+    ctx: ToolContext,
+    tool_call_id: str,
+    tool_name: str,
+    args_summary: dict[str, JsonValue],
+    runtime_meta: dict[str, JsonValue],
+) -> None:
+    current_state = await load_tool_call_state_async(
+        shared_store=ctx.deps.shared_store,
+        task_id=ctx.deps.task_id,
+        tool_call_id=tool_call_id,
+    )
+    existing_call_state = (
+        dict(current_state.call_state) if current_state is not None else {}
+    )
+    await merge_tool_call_state_async(
+        shared_store=ctx.deps.shared_store,
+        task_id=ctx.deps.task_id,
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+        run_id=ctx.deps.run_id,
+        session_id=ctx.deps.session_id,
+        instance_id=ctx.deps.instance_id,
+        role_id=ctx.deps.role_id,
+        args_preview=_safe_json(args_summary),
+        run_yolo=bool(runtime_meta.get("run_yolo") is True),
+        approval_mode=_approval_mode_from_meta(runtime_meta),
+        approval_status=_approval_status_from_meta(runtime_meta),
+        execution_status=ToolExecutionStatus.RUNNING,
+        call_state=existing_call_state,
+        started_at=datetime.now(tz=timezone.utc).isoformat(),
+    )
+
+
+def _error_payload(exc: Exception) -> ToolError:
+    if isinstance(exc, ToolExecutionError):
+        return ToolError(
+            type=exc.error_type,
+            message=str(exc) or exc.__class__.__name__,
+            retryable=exc.retryable,
+            details=exc.details,
+        )
+
+    err_type = "internal_error"
+    retryable = False
+    message = str(exc) or exc.__class__.__name__
+
+    if isinstance(exc, ValueError):
+        err_type = "validation_error"
+        retryable = False
+    elif isinstance(exc, KeyError):
+        err_type = "not_found"
+        retryable = True
+    elif isinstance(exc, PermissionError):
+        err_type = "permission_error"
+        retryable = True
+    elif isinstance(exc, sqlite3.OperationalError) and is_retryable_sqlite_error(exc):
+        retryable = True
+
+    return ToolError(
+        type=err_type,
+        message=message,
+        retryable=retryable,
+    )
+
+
+def _normalize_result_payload(
+    result: object,
+) -> tuple[JsonValue | None, JsonValue | None, tuple[ContentPart, ...]]:
+    if isinstance(result, ToolResultProjection):
+        return (
+            _normalize_json_value(result.visible_data),
+            _normalize_json_value(result.internal_data),
+            tuple(result.tool_content_parts),
+        )
+    normalized = _normalize_json_value(result)
+    return normalized, normalized, ()
+
+
+def _normalize_json_object(value: object) -> dict[str, JsonValue]:
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, JsonValue] = {}
+    for key, item in value.items():
+        normalized[str(key)] = _normalize_json_value(item)
+    return normalized
+
+
+# noinspection PyTypeHints
+def _tool_return_content(
+    *,
+    ctx: ToolContext,
+    tool_name: str,
+    tool_content_parts: tuple[ContentPart, ...],
+) -> UserPromptContent:
+    if not tool_content_parts:
+        return ""
+    if all(isinstance(part, TextContentPart) for part in tool_content_parts):
+        return "\n\n".join(
+            part.text
+            for part in tool_content_parts
+            if isinstance(part, TextContentPart)
+        ).strip()
+    media_asset_service = ctx.deps.media_asset_service
+    if media_asset_service is None:
+        raise ValueError(
+            f"Tool {tool_name} returned media content without media asset support."
+        )
+    provider_content = media_asset_service.to_provider_user_prompt_content(
+        parts=tool_content_parts
+    )
+    hydrated_content = media_asset_service.hydrate_user_prompt_content(
+        content=provider_content
+    )
+    if isinstance(hydrated_content, str):
+        return hydrated_content
+    return tuple(hydrated_content)
+
+
+def _safe_json(value: object) -> str:
+    try:
+        text = json.dumps(value, ensure_ascii=False, default=str)
+    except TypeError:
+        text = str(value)
+    if len(text) > 500:
+        return text[:500] + "...(truncated)"
+    return text
+
+
+def _normalize_json_value(value: object) -> JsonValue:
+    if isinstance(value, Enum):
+        return _normalize_json_value(value.value)
+    if isinstance(value, BaseModel):
+        return cast(JsonValue, value.model_dump(mode="json"))
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, list):
+        items = cast(list[object], value)
+        return [_normalize_json_value(item) for item in items]
+    if isinstance(value, tuple):
+        items = cast(tuple[object, ...], value)
+        return [_normalize_json_value(item) for item in items]
+    if isinstance(value, dict):
+        return _normalize_json_object(value)
+    return str(value)
+
+
+async def _invoke_tool_action_with_limits(
+    *,
+    ctx: ToolContext,
+    action: Callable[..., object | Awaitable[object]] | object,
+    tool_input: dict[str, JsonValue],
+) -> object:
+    run_gate = _retain_run_tool_action_gate(ctx.deps.run_id)
+    queued_at = time.perf_counter()
+    try:
+        async with run_gate.semaphore:
+            async with _GLOBAL_TOOL_ACTION_SEMAPHORE:
+                wait_ms = int((time.perf_counter() - queued_at) * 1000)
+                if wait_ms >= 250:
+                    log_event(
+                        LOGGER,
+                        logging.DEBUG,
+                        event="tool.action.queue_wait",
+                        message="Tool action waited for execution capacity",
+                        duration_ms=wait_ms,
+                        payload={
+                            "run_id": ctx.deps.run_id,
+                            "session_id": ctx.deps.session_id,
+                            "tool_call_id": ctx.tool_call_id,
+                        },
+                    )
+                return await _invoke_tool_action_async(
+                    action=action,
+                    tool_input=tool_input,
+                )
+    finally:
+        _release_run_tool_action_gate(ctx.deps.run_id, run_gate)
+
+
+def _retain_run_tool_action_gate(run_id: str) -> _RunToolActionGate:
+    with _RUN_TOOL_ACTION_GATES_LOCK:
+        gate = _RUN_TOOL_ACTION_GATES.get(run_id)
+        if gate is None:
+            gate = _RunToolActionGate()
+            _RUN_TOOL_ACTION_GATES[run_id] = gate
+        gate.ref_count += 1
+        return gate
+
+
+def _release_run_tool_action_gate(run_id: str, gate: _RunToolActionGate) -> None:
+    with _RUN_TOOL_ACTION_GATES_LOCK:
+        current = _RUN_TOOL_ACTION_GATES.get(run_id)
+        if current is not gate:
+            return
+        gate.ref_count = max(0, gate.ref_count - 1)
+        if gate.ref_count == 0:
+            del _RUN_TOOL_ACTION_GATES[run_id]
+
+
+async def _invoke_tool_action_async(
+    *,
+    action: Callable[..., object | Awaitable[object]] | object,
+    tool_input: dict[str, JsonValue],
+) -> object:
+    if not callable(action):
+        return action
+    if inspect.iscoroutinefunction(action):
+        result = _invoke_tool_action(action=action, tool_input=tool_input)
+    else:
+        loop = asyncio.get_running_loop()
+        context = contextvars.copy_context()
+
+        def _invoke_in_context() -> object | Awaitable[object]:
+            return context.run(
+                _invoke_tool_action,
+                action=action,
+                tool_input=tool_input,
+            )
+
+        result = await loop.run_in_executor(_TOOL_ACTION_EXECUTOR, _invoke_in_context)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+def _invoke_tool_action(
+    *,
+    action: Callable[..., object | Awaitable[object]] | object,
+    tool_input: dict[str, JsonValue],
+) -> object | Awaitable[object]:
+    if not callable(action):
+        return action
+    signature = inspect.signature(action)
+    parameters = list(signature.parameters.values())
+    if not parameters:
+        no_arg_action = cast(Callable[[], object | Awaitable[object]], action)
+        return no_arg_action()
+    if _uses_tool_input_dict(parameters):
+        input_action = cast(
+            Callable[[dict[str, JsonValue]], object | Awaitable[object]],
+            action,
+        )
+        return input_action(tool_input)
+    kwargs = _bind_tool_action_kwargs(
+        parameters=parameters,
+        tool_input=tool_input,
+        resolved_annotations=_resolve_tool_action_annotations(action),
+    )
+    named_action = cast(Callable[..., object | Awaitable[object]], action)
+    return named_action(**kwargs)
+
+
+def _capture_tool_input(
+    *,
+    raw_args: Mapping[str, object],
+    action: Callable[..., object | Awaitable[object]] | object,
+    exclude: tuple[str, ...],
+) -> dict[str, JsonValue]:
+    excluded = set(exclude)
+    parameter_names = _tool_input_parameter_names(action)
+    result: dict[str, JsonValue] = {}
+    for name, value in raw_args.items():
+        if name in excluded or name.startswith("_"):
+            continue
+        if parameter_names is not None and name not in parameter_names:
+            continue
+        result[name] = _normalize_json_value(value)
+    return result
+
+
+def _tool_input_parameter_names(
+    action: Callable[..., object | Awaitable[object]] | object,
+) -> set[str] | None:
+    if not callable(action):
+        return None
+    parameters = list(inspect.signature(action).parameters.values())
+    if not parameters or _uses_tool_input_dict(parameters):
+        return None
+    names: set[str] = set()
+    for parameter in parameters:
+        if parameter.kind in {
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        }:
+            names.add(parameter.name)
+    return names
+
+
+def _uses_tool_input_dict(parameters: list[inspect.Parameter]) -> bool:
+    if len(parameters) != 1:
+        return False
+    parameter = parameters[0]
+    return parameter.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    } and parameter.name in {"tool_input", "args", "tool_args"}
+
+
+def _bind_tool_action_kwargs(
+    *,
+    parameters: list[inspect.Parameter],
+    tool_input: dict[str, JsonValue],
+    resolved_annotations: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    kwargs: dict[str, object] = {}
+    for parameter in parameters:
+        if parameter.kind == inspect.Parameter.VAR_KEYWORD:
+            kwargs.update(tool_input)
+            continue
+        if parameter.kind not in {
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        }:
+            raise TypeError(
+                f"Unsupported tool action parameter kind: {parameter.kind.value}"
+            )
+        if parameter.name not in tool_input:
+            continue
+        kwargs[parameter.name] = _coerce_tool_argument_for_parameter(
+            value=tool_input[parameter.name],
+            parameter=parameter,
+            annotation=_resolved_parameter_annotation(
+                parameter=parameter,
+                resolved_annotations=resolved_annotations,
+            ),
+        )
+    return kwargs
+
+
+def _coerce_tool_argument_for_parameter(
+    *,
+    value: JsonValue,
+    parameter: inspect.Parameter,
+    annotation: object,
+) -> object:
+    if value is None:
+        return None
+    model_list_type = _resolve_pydantic_model_list_type(annotation)
+    if model_list_type is not None and isinstance(value, list):
+        return [model_list_type.model_validate(item) for item in value]
+    model_type = _resolve_pydantic_model_type(annotation)
+    if model_type is not None and isinstance(value, dict):
+        return model_type.model_validate(value)
+    enum_type = _resolve_enum_type(annotation=annotation, parameter=parameter)
+    if enum_type is not None and isinstance(value, str):
+        return enum_type(value)
+    if _parameter_accepts_type(
+        annotation=annotation, parameter=parameter, expected_type=bool
+    ):
+        return _coerce_bool(value)
+    if _parameter_accepts_type(
+        annotation=annotation, parameter=parameter, expected_type=int
+    ):
+        return _coerce_int(value)
+    if _parameter_accepts_type(
+        annotation=annotation, parameter=parameter, expected_type=float
+    ):
+        return _coerce_float(value)
+    if _parameter_accepts_type(
+        annotation=annotation, parameter=parameter, expected_type=str
+    ):
+        return str(value)
+    if _parameter_accepts_type(
+        annotation=annotation, parameter=parameter, expected_type=tuple
+    ) and isinstance(value, list):
+        return tuple(value)
+    if _parameter_accepts_type(
+        annotation=annotation, parameter=parameter, expected_type=list
+    ) and isinstance(value, tuple):
+        return list(value)
+    return value
+
+
+def _parameter_accepts_type(
+    *,
+    annotation: object,
+    parameter: inspect.Parameter,
+    expected_type: type[object],
+) -> bool:
+    if annotation is not inspect._empty and _annotation_contains_type(
+        annotation=annotation,
+        expected_type=expected_type,
+    ):
+        return True
+    default = parameter.default
+    if default is inspect._empty or default is None:
+        return False
+    return isinstance(default, expected_type)
+
+
+def _annotation_contains_type(
+    *,
+    annotation: object,
+    expected_type: type[object],
+) -> bool:
+    if annotation is expected_type:
+        return True
+    origin = get_origin(annotation)
+    if origin is None:
+        return False
+    return any(
+        item is expected_type for item in get_args(annotation) if item is not type(None)
+    )
+
+
+def _resolve_pydantic_model_list_type(
+    annotation: object,
+) -> type[BaseModel] | None:
+    origin = get_origin(annotation)
+    if origin not in {list, tuple}:
+        return None
+    for item in get_args(annotation):
+        if inspect.isclass(item) and issubclass(item, BaseModel):
+            return cast(type[BaseModel], item)
+    return None
+
+
+def _resolve_pydantic_model_type(
+    annotation: object,
+) -> type[BaseModel] | None:
+    if inspect.isclass(annotation) and issubclass(annotation, BaseModel):
+        return cast(type[BaseModel], annotation)
+    origin = get_origin(annotation)
+    if origin is None:
+        return None
+    for item in get_args(annotation):
+        if item is type(None):
+            continue
+        if inspect.isclass(item) and issubclass(item, BaseModel):
+            return cast(type[BaseModel], item)
+    return None
+
+
+def _resolve_enum_type(
+    *,
+    annotation: object,
+    parameter: inspect.Parameter,
+) -> type[Enum] | None:
+    if annotation is not inspect._empty:
+        candidate = _enum_type_from_annotation(annotation)
+        if candidate is not None:
+            return candidate
+    default = parameter.default
+    if default is inspect._empty or not isinstance(default, Enum):
+        return None
+    return type(default)
+
+
+def _enum_type_from_annotation(annotation: object) -> type[Enum] | None:
+    if inspect.isclass(annotation) and issubclass(annotation, Enum):
+        return cast(type[Enum], annotation)
+    origin = get_origin(annotation)
+    if origin is None:
+        return None
+    for item in get_args(annotation):
+        if item is type(None):
+            continue
+        if inspect.isclass(item) and issubclass(item, Enum):
+            return cast(type[Enum], item)
+    return None
+
+
+def _resolve_tool_action_annotations(
+    action: Callable[..., object | Awaitable[object]] | object,
+) -> dict[str, object]:
+    if not callable(action):
+        return {}
+    try:
+        return get_type_hints(action)
+    except (AttributeError, NameError, TypeError):
+        return {}
+
+
+def _resolved_parameter_annotation(
+    *,
+    parameter: inspect.Parameter,
+    resolved_annotations: Mapping[str, object] | None,
+) -> object:
+    if resolved_annotations is None:
+        return parameter.annotation
+    return resolved_annotations.get(parameter.name, parameter.annotation)
+
+
+def _coerce_bool(value: JsonValue) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return bool(value)
+
+
+def _coerce_int(value: JsonValue) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped:
+            return int(stripped)
+    raise ValueError(f"Cannot coerce tool argument to int: {value!r}")
+
+
+def _coerce_float(value: JsonValue) -> float:
+    if isinstance(value, bool):
+        return float(int(value))
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped:
+            return float(stripped)
+    raise ValueError(f"Cannot coerce tool argument to float: {value!r}")
+
+
+def _apply_role_contract_check(
+    *,
+    ctx: ToolContext,
+    tool_name: str,
+) -> ToolError | None:
+    role: RoleDefinition | None = None
+    resolver = getattr(ctx.deps, "runtime_role_resolver", None)
+    if resolver is not None:
+        try:
+            role = resolver.get_effective_role(run_id=None, role_id=ctx.deps.role_id)
+        except (KeyError, ValueError, RuntimeError):
+            role = None
+    if role is None:
+        role_registry = getattr(ctx.deps, "role_registry", None)
+        if role_registry is None:
+            return None
+        try:
+            role = role_registry.get(ctx.deps.role_id)
+        except (KeyError, ValueError):
+            return None
+    if role is None:
+        return None
+    denied_tools = runtime_denied_tools_for_role(role)
+    if not denied_tools or tool_name not in denied_tools:
+        return None
+    log_event(
+        LOGGER,
+        logging.WARNING,
+        event="tool.role_contract.denied",
+        message="Tool call denied by role contract",
+        payload={
+            "role_id": ctx.deps.role_id,
+            "tool_name": tool_name,
+        },
+    )
+    return ToolError(
+        type="tool_policy_denied",
+        message=(
+            f"Tool '{tool_name}' is denied for role "
+            f"'{ctx.deps.role_id}' by role contract invariant"
+        ),
+        retryable=False,
+    )
+
+
+def _raise_if_stopped(ctx: ToolContext) -> None:
+    ctx.deps.run_control_manager.raise_if_cancelled(
+        run_id=ctx.deps.run_id,
+        instance_id=ctx.deps.instance_id,
+    )
+
+
+async def _apply_pre_tool_hooks(
+    *,
+    ctx: ToolContext,
+    tool_name: str,
+    tool_call_id: str,
+    tool_input: dict[str, JsonValue],
+) -> tuple[dict[str, JsonValue], ToolError | None, bool]:
+    hook_service = getattr(ctx.deps, "hook_service", None)
+    if hook_service is None:
+        return tool_input, None, False
+    bundle = await hook_service.execute(
+        event_input=PreToolUseInput(
+            event_name=HookEventName.PRE_TOOL_USE,
+            session_id=ctx.deps.session_id,
+            run_id=ctx.deps.run_id,
+            trace_id=ctx.deps.trace_id,
+            task_id=ctx.deps.task_id,
+            instance_id=ctx.deps.instance_id,
+            role_id=ctx.deps.role_id,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            tool_input=tool_input,
+        ),
+        run_event_hub=ctx.deps.run_event_hub,
+    )
+    if bundle.decision == HookDecisionType.DENY:
+        await _apply_permission_denied_hooks(
+            ctx=ctx,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            tool_input=tool_input,
+            denial_source="pre_tool_hook",
+            denial_reason=bundle.reason,
+            approval_status="hook_denied",
+        )
+        return (
+            tool_input,
+            ToolError(
+                type="hook_denied",
+                message=bundle.reason or "Tool call denied by runtime hooks.",
+                retryable=False,
+            ),
+            False,
+        )
+    next_args = tool_input
+    if isinstance(bundle.updated_input, dict):
+        next_args = _normalize_json_object(bundle.updated_input)
+    return next_args, None, bundle.decision == HookDecisionType.ASK
+
+
+async def _apply_pre_execution_guardrails(
+    *,
+    ctx: ToolContext,
+    tool_name: str,
+    tool_call_id: str,
+    tool_input: dict[str, JsonValue],
+    meta: dict[str, JsonValue],
+) -> ToolError | None:
+    policy = ctx.deps.tool_approval_policy
+    guardrail_policy = _guardrail_policy_from_runtime_policy(policy)
+    if not guardrail_policy.enabled:
+        return None
+    context = _runtime_guardrail_context(
+        ctx=ctx,
+        tool_name=tool_name,
+        tool_call_id=tool_call_id,
+    )
+    call_count = await _record_guardrail_tool_call_count(
+        ctx=ctx,
+        context=context,
+    )
+    allowed_tools: tuple[str, ...] | None = None
+    denied_tools: tuple[str, ...] = ()
+    if isinstance(policy, ToolApprovalPolicy):
+        allowed_tools = await _allowed_tools_for_runtime_policy(ctx=ctx)
+        denied_tools = tuple(sorted(policy.denied_tools))
+    evaluation = evaluate_pre_execution_guardrails(
+        policy=guardrail_policy,
+        context=context,
+        tool_input=tool_input,
+        allowed_tools=allowed_tools,
+        denied_tools=denied_tools,
+        call_count=call_count,
+    )
+    if not evaluation.findings:
+        return None
+    _apply_guardrail_findings_to_meta(meta=meta, evaluation=evaluation)
+    await _record_and_publish_guardrail_findings_async(
+        ctx=ctx,
+        context=context,
+        findings=evaluation.findings,
+    )
+    if not evaluation.blocked:
+        return None
+    denial = _first_guardrail_block(evaluation.findings)
+    meta["approval_required"] = False
+    meta["approval_mode"] = ToolApprovalMode.POLICY_EXEMPT.value
+    meta["approval_status"] = (
+        "denied_by_policy"
+        if _guardrail_block_is_policy_boundary(denial)
+        else "denied_by_guardrail"
+    )
+    meta["runtime_policy_decision"] = ToolRuntimeDecision.DENY.value
+    meta["runtime_policy_reason"] = denial.message
+    return ToolError(
+        type=_guardrail_denial_error_type(denial),
+        message=denial.message,
+        retryable=False,
+        details=denial.details,
+    )
+
+
+async def _apply_in_execution_guardrails(
+    *,
+    ctx: ToolContext,
+    tool_name: str,
+    tool_call_id: str,
+    tool_input: dict[str, JsonValue],
+    envelope: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    policy = ctx.deps.tool_approval_policy
+    guardrail_policy = _guardrail_policy_from_runtime_policy(policy)
+    if not guardrail_policy.enabled:
+        return envelope
+    context = _runtime_guardrail_context(
+        ctx=ctx,
+        tool_name=tool_name,
+        tool_call_id=tool_call_id,
+    )
+    evaluation = evaluate_in_execution_guardrails(
+        policy=guardrail_policy,
+        context=context,
+        tool_input=tool_input,
+        result_envelope=envelope,
+    )
+    if not evaluation.findings:
+        return envelope
+    meta = _envelope_meta(envelope)
+    _apply_guardrail_findings_to_meta(meta=meta, evaluation=evaluation)
+    envelope["meta"] = meta
+    await _record_and_publish_guardrail_findings_async(
+        ctx=ctx,
+        context=context,
+        findings=evaluation.findings,
+    )
+    if not evaluation.blocked:
+        return envelope
+    denial = _first_guardrail_block(evaluation.findings)
+    return _visible_envelope(
+        ok=False,
+        error=ToolError(
+            type=_guardrail_denial_error_type(denial),
+            message=denial.message,
+            retryable=False,
+            details=denial.details,
+        ),
+        meta=meta,
+    )
+
+
+async def _record_guardrail_tool_call_count(
+    *,
+    ctx: ToolContext,
+    context: RuntimeGuardrailContext,
+) -> int:
+    try:
+        return await record_runtime_guardrail_tool_call_async(
+            shared_store=ctx.deps.shared_store,
+            context=context,
+        )
+    except Exception as exc:
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            event="runtime_guardrail.state_update_failed",
+            message="Runtime guardrail could not record tool call count",
+            payload={
+                "run_id": ctx.deps.run_id,
+                "task_id": ctx.deps.task_id,
+                "tool_name": context.tool_name,
+                "tool_call_id": context.tool_call_id,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+        )
+        return 1
+
+
+async def _record_and_publish_guardrail_findings_async(
+    *,
+    ctx: ToolContext,
+    context: RuntimeGuardrailContext,
+    findings: tuple[RuntimeGuardrailFinding, ...],
+) -> None:
+    try:
+        _ = await record_runtime_guardrail_findings_async(
+            shared_store=ctx.deps.shared_store,
+            context=context,
+            findings=findings,
+        )
+    except Exception as exc:
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            event="runtime_guardrail.finding_persist_failed",
+            message="Runtime guardrail finding could not be persisted",
+            payload={
+                "run_id": ctx.deps.run_id,
+                "task_id": ctx.deps.task_id,
+                "tool_name": context.tool_name,
+                "tool_call_id": context.tool_call_id,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+        )
+    try:
+        await publish_run_event_async(
+            ctx.deps.run_event_hub,
+            RunEvent(
+                session_id=ctx.deps.session_id,
+                run_id=ctx.deps.run_id,
+                trace_id=ctx.deps.trace_id,
+                task_id=ctx.deps.task_id,
+                instance_id=ctx.deps.instance_id,
+                role_id=ctx.deps.role_id,
+                event_type=RunEventType.RUNTIME_GUARDRAIL_ALERT,
+                payload_json=dumps(
+                    {
+                        "tool_name": context.tool_name,
+                        "tool_call_id": context.tool_call_id,
+                        "findings": guardrail_findings_payload(findings),
+                    },
+                    ensure_ascii=False,
+                ),
+            ),
+        )
+    except Exception as exc:
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            event="runtime_guardrail.alert_publish_failed",
+            message="Runtime guardrail alert event could not be published",
+            payload={
+                "run_id": ctx.deps.run_id,
+                "task_id": ctx.deps.task_id,
+                "tool_name": context.tool_name,
+                "tool_call_id": context.tool_call_id,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+        )
+
+
+def _runtime_guardrail_context(
+    *,
+    ctx: ToolContext,
+    tool_name: str,
+    tool_call_id: str,
+) -> RuntimeGuardrailContext:
+    return RuntimeGuardrailContext(
+        run_id=ctx.deps.run_id,
+        session_id=ctx.deps.session_id,
+        task_id=ctx.deps.task_id,
+        instance_id=ctx.deps.instance_id,
+        role_id=ctx.deps.role_id,
+        tool_name=tool_name,
+        tool_call_id=tool_call_id,
+        session_mode=ctx.deps.session_mode,
+        run_kind=ctx.deps.run_kind,
+    )
+
+
+def _guardrail_policy_from_runtime_policy(
+    policy: object,
+) -> RuntimeGuardrailPolicy:
+    if isinstance(policy, ToolApprovalPolicy):
+        return policy.guardrails
+    return RuntimeGuardrailPolicy(enabled=False)
+
+
+def _apply_guardrail_findings_to_meta(
+    *,
+    meta: dict[str, JsonValue],
+    evaluation: RuntimeGuardrailEvaluation,
+) -> None:
+    findings = tuple(
+        finding
+        for finding in evaluation.findings
+        if finding.action != RuntimeGuardrailAction.ALLOW
+    )
+    if not findings:
+        return
+    new_blocked = evaluation.blocked_count
+    new_warnings = evaluation.warning_count
+    new_status = guardrail_meta_status(findings).value
+    new_payload = guardrail_findings_payload(findings)
+    existing_blocked = meta.get("runtime_guardrail_blocked_count")
+    existing_warnings = meta.get("runtime_guardrail_warning_count")
+    existing_findings = meta.get("runtime_guardrail_findings")
+    existing_status = meta.get("runtime_guardrail_status")
+    if isinstance(existing_blocked, int):
+        meta["runtime_guardrail_blocked_count"] = existing_blocked + new_blocked
+    else:
+        meta["runtime_guardrail_blocked_count"] = new_blocked
+    if isinstance(existing_warnings, int):
+        meta["runtime_guardrail_warning_count"] = existing_warnings + new_warnings
+    else:
+        meta["runtime_guardrail_warning_count"] = new_warnings
+    if isinstance(existing_findings, list):
+        existing_list: list[JsonValue] = existing_findings
+        meta["runtime_guardrail_findings"] = existing_list + new_payload
+    else:
+        meta["runtime_guardrail_findings"] = new_payload
+    if isinstance(existing_status, str) and existing_status != new_status:
+        _status_severity: dict[str, int] = {
+            RuntimeGuardrailStatus.BLOCKED.value: 3,
+            RuntimeGuardrailStatus.WARNING.value: 2,
+            RuntimeGuardrailStatus.PASSED.value: 1,
+        }
+        existing_rank = _status_severity.get(existing_status, 0)
+        new_rank = _status_severity.get(new_status, 0)
+        meta["runtime_guardrail_status"] = (
+            new_status if new_rank > existing_rank else existing_status
+        )
+    else:
+        meta["runtime_guardrail_status"] = new_status
+
+
+def _first_guardrail_block(
+    findings: tuple[RuntimeGuardrailFinding, ...],
+) -> RuntimeGuardrailFinding:
+    for finding in findings:
+        if finding.action == RuntimeGuardrailAction.DENY:
+            return finding
+    raise RuntimeError("Expected a runtime guardrail denial finding")
+
+
+def _guardrail_block_is_policy_boundary(finding: RuntimeGuardrailFinding) -> bool:
+    return finding.rule_type in {
+        RuntimeGuardrailRuleType.TOOL_ALLOWLIST,
+        RuntimeGuardrailRuleType.TOOL_DENYLIST,
+    }
+
+
+def _guardrail_denial_error_type(finding: RuntimeGuardrailFinding) -> str:
+    if _guardrail_block_is_policy_boundary(finding):
+        return "tool_policy_denied"
+    return "runtime_guardrail_denied"
+
+
+def _envelope_meta(envelope: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    raw_meta = envelope.get("meta")
+    if not isinstance(raw_meta, dict):
+        return {}
+    return _normalize_json_object(raw_meta)
+
+
+async def _apply_permission_request_hooks(
+    *,
+    ctx: ToolContext,
+    tool_name: str,
+    tool_call_id: str,
+    args_summary: dict[str, JsonValue],
+) -> tuple[bool, ToolError | None]:
+    hook_service = getattr(ctx.deps, "hook_service", None)
+    if hook_service is None:
+        return False, None
+    bundle = await hook_service.execute(
+        event_input=PermissionRequestInput(
+            event_name=HookEventName.PERMISSION_REQUEST,
+            session_id=ctx.deps.session_id,
+            run_id=ctx.deps.run_id,
+            trace_id=ctx.deps.trace_id,
+            task_id=ctx.deps.task_id,
+            instance_id=ctx.deps.instance_id,
+            role_id=ctx.deps.role_id,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            tool_input=args_summary,
+            approval_required=True,
+        ),
+        run_event_hub=ctx.deps.run_event_hub,
+    )
+    if bundle.decision == HookDecisionType.DENY:
+        await _apply_permission_denied_hooks(
+            ctx=ctx,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            tool_input=args_summary,
+            denial_source="permission_request_hook",
+            denial_reason=bundle.reason,
+            approval_status="hook_denied",
+        )
+        return (
+            False,
+            ToolError(
+                type="hook_denied",
+                message=bundle.reason or "Tool approval denied by runtime hooks.",
+                retryable=False,
+            ),
+        )
+    hook_approved = (
+        bool(bundle.executions) and bundle.decision == HookDecisionType.ALLOW
+    )
+    return hook_approved, None
+
+
+async def _apply_permission_denied_hooks(
+    *,
+    ctx: ToolContext,
+    tool_name: str,
+    tool_call_id: str,
+    tool_input: dict[str, JsonValue],
+    denial_source: str,
+    denial_reason: str,
+    approval_status: str,
+) -> None:
+    hook_service = getattr(ctx.deps, "hook_service", None)
+    if hook_service is None:
+        return
+    try:
+        bundle = await hook_service.execute(
+            event_input=PermissionDeniedInput(
+                event_name=HookEventName.PERMISSION_DENIED,
+                session_id=ctx.deps.session_id,
+                run_id=ctx.deps.run_id,
+                trace_id=ctx.deps.trace_id,
+                task_id=ctx.deps.task_id,
+                instance_id=ctx.deps.instance_id,
+                role_id=ctx.deps.role_id,
+                session_mode=ctx.deps.session_mode,
+                run_kind=ctx.deps.run_kind,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                tool_input=tool_input,
+                denial_source=denial_source,
+                denial_reason=denial_reason,
+                approval_status=approval_status,
+            ),
+            run_event_hub=ctx.deps.run_event_hub,
+        )
+        if bundle.additional_context:
+            await _enqueue_system_followup_async(
+                ctx=ctx,
+                content="\n\n".join(
+                    str(context).strip()
+                    for context in bundle.additional_context
+                    if str(context).strip()
+                ),
+            )
+        if bundle.deferred_action:
+            await _enqueue_deferred_followup_async(
+                ctx=ctx,
+                hook_event=HookEventName.PERMISSION_DENIED,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                deferred_action=bundle.deferred_action,
+            )
+    except Exception as exc:
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            event="tools.permission_denied_hook.failed",
+            message="PermissionDenied hook failed after tool approval denial",
+            payload={
+                "run_id": ctx.deps.run_id,
+                "tool_name": tool_name,
+                "tool_call_id": tool_call_id,
+                "denial_source": denial_source,
+                "approval_status": approval_status,
+                "error": str(exc),
+            },
+        )
+
+
+async def _apply_post_tool_hooks(
+    *,
+    ctx: ToolContext,
+    tool_name: str,
+    tool_call_id: str,
+    args_summary: dict[str, JsonValue],
+    envelope: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    hook_service = getattr(ctx.deps, "hook_service", None)
+    if hook_service is None:
+        return envelope
+    bundle = await hook_service.execute(
+        event_input=PostToolUseInput(
+            event_name=HookEventName.POST_TOOL_USE,
+            session_id=ctx.deps.session_id,
+            run_id=ctx.deps.run_id,
+            trace_id=ctx.deps.trace_id,
+            task_id=ctx.deps.task_id,
+            instance_id=ctx.deps.instance_id,
+            role_id=ctx.deps.role_id,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            tool_input=args_summary,
+            tool_result=envelope,
+        ),
+        run_event_hub=ctx.deps.run_event_hub,
+    )
+    return await _apply_post_hook_bundle_to_envelope_async(
+        ctx=ctx,
+        hook_event=HookEventName.POST_TOOL_USE,
+        tool_name=tool_name,
+        tool_call_id=tool_call_id,
+        envelope=envelope,
+        bundle=bundle,
+    )
+
+
+async def _apply_post_tool_failure_hooks(
+    *,
+    ctx: ToolContext,
+    tool_name: str,
+    tool_call_id: str,
+    args_summary: dict[str, JsonValue],
+    envelope: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    hook_service = getattr(ctx.deps, "hook_service", None)
+    if hook_service is None:
+        return envelope
+    error_payload = envelope.get("error")
+    tool_error = (
+        _normalize_json_object(error_payload) if isinstance(error_payload, dict) else {}
+    )
+    bundle = await hook_service.execute(
+        event_input=PostToolUseFailureInput(
+            event_name=HookEventName.POST_TOOL_USE_FAILURE,
+            session_id=ctx.deps.session_id,
+            run_id=ctx.deps.run_id,
+            trace_id=ctx.deps.trace_id,
+            task_id=ctx.deps.task_id,
+            instance_id=ctx.deps.instance_id,
+            role_id=ctx.deps.role_id,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            tool_input=args_summary,
+            tool_error=tool_error,
+        ),
+        run_event_hub=ctx.deps.run_event_hub,
+    )
+    return await _apply_post_hook_bundle_to_envelope_async(
+        ctx=ctx,
+        hook_event=HookEventName.POST_TOOL_USE_FAILURE,
+        tool_name=tool_name,
+        tool_call_id=tool_call_id,
+        envelope=envelope,
+        bundle=bundle,
+    )
+
+
+async def _apply_post_hook_bundle_to_envelope_async(
+    *,
+    ctx: ToolContext,
+    hook_event: HookEventName,
+    tool_name: str,
+    tool_call_id: str,
+    envelope: dict[str, JsonValue],
+    bundle: HookDecisionBundle,
+) -> dict[str, JsonValue]:
+    meta = envelope.get("meta")
+    runtime_meta = cast(dict[str, JsonValue], meta) if isinstance(meta, dict) else {}
+    if bundle.additional_context:
+        runtime_meta["hook_additional_context"] = list(bundle.additional_context)
+        await _enqueue_system_followup_async(
+            ctx=ctx,
+            content="\n\n".join(
+                str(context).strip()
+                for context in bundle.additional_context
+                if str(context).strip()
+            ),
+        )
+    if bundle.deferred_action:
+        runtime_meta["hook_deferred_action"] = bundle.deferred_action
+        await _enqueue_deferred_followup_async(
+            ctx=ctx,
+            hook_event=hook_event,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            deferred_action=bundle.deferred_action,
+        )
+    envelope["meta"] = runtime_meta
+    return envelope
+
+
+async def _enqueue_system_followup_async(
+    *,
+    ctx: ToolContext,
+    content: str,
+) -> bool:
+    if not content:
+        return False
+    result = await _system_injection_sink(ctx).enqueue_only_async(
+        session_id=ctx.deps.session_id,
+        run_id=ctx.deps.run_id,
+        trace_id=ctx.deps.trace_id,
+        task_id=ctx.deps.task_id,
+        instance_id=ctx.deps.instance_id,
+        role_id=ctx.deps.role_id,
+        content=content,
+        source=InjectionSource.SYSTEM,
+    )
+    return result.enqueued
+
+
+async def _enqueue_deferred_followup_async(
+    *,
+    ctx: ToolContext,
+    hook_event: HookEventName,
+    tool_name: str,
+    tool_call_id: str,
+    deferred_action: str,
+) -> None:
+    if not await _enqueue_system_followup_async(ctx=ctx, content=deferred_action):
+        return
+    await publish_run_event_async(
+        ctx.deps.run_event_hub,
+        RunEvent(
+            session_id=ctx.deps.session_id,
+            run_id=ctx.deps.run_id,
+            trace_id=ctx.deps.trace_id,
+            task_id=ctx.deps.task_id,
+            instance_id=ctx.deps.instance_id,
+            role_id=ctx.deps.role_id,
+            event_type=RunEventType.HOOK_DEFERRED,
+            payload_json=dumps(
+                {
+                    "hook_event": hook_event.value,
+                    "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "deferred_action": deferred_action,
+                },
+                ensure_ascii=False,
+            ),
+        ),
+    )
+
+
+def _system_injection_sink(ctx: ToolContext) -> SystemInjectionSink:
+    return SystemInjectionSink(
+        injection_manager=ctx.deps.injection_manager,
+        run_event_hub=ctx.deps.run_event_hub,
+        message_repo=ctx.deps.message_repo,
+    )
+
+
+# noinspection PyTypeHints
+async def _observe_tool_result_reminders_async(
+    *,
+    ctx: ToolContext,
+    tool_name: str,
+    tool_call_id: str,
+    envelope: dict[str, JsonValue],
+) -> None:
+    reminder_service = getattr(ctx.deps, "reminder_service", None)
+    if reminder_service is None:
+        return
+    error_payload = envelope.get("error")
+    error = (
+        cast(dict[str, JsonValue], error_payload)
+        if isinstance(error_payload, dict)
+        else {}
+    )
+    meta_payload = envelope.get("meta")
+    meta = (
+        cast(dict[str, JsonValue], meta_payload)
+        if isinstance(meta_payload, dict)
+        else {}
+    )
+    reported_failure = _reported_failure_from_success_envelope(
+        tool_name=tool_name,
+        envelope=envelope,
+    )
+    observed_ok = bool(envelope.get("ok") is True)
+    error_type = str(error.get("type") or "")
+    error_message = str(error.get("message") or "")
+    if reported_failure is not None:
+        observed_ok = False
+        if not error_type:
+            error_type = reported_failure[0]
+        if not error_message:
+            error_message = reported_failure[1]
+    observation = ToolResultObservation(
+        session_id=ctx.deps.session_id,
+        run_id=ctx.deps.run_id,
+        trace_id=ctx.deps.trace_id,
+        task_id=ctx.deps.task_id,
+        instance_id=ctx.deps.instance_id,
+        role_id=ctx.deps.role_id,
+        tool_name=tool_name,
+        tool_call_id=tool_call_id,
+        ok=observed_ok,
+        error_type=error_type,
+        error_message=error_message,
+        retryable=bool(error.get("retryable") is True),
+        meta=meta,
+    )
+    if isinstance(reminder_service, _AsyncToolResultReminderService):
+        _ = await reminder_service.observe_tool_result_async(observation)
+        return
+    _ = await _run_tool_state_work(reminder_service.observe_tool_result, observation)
+
+
+def _reported_failure_from_success_envelope(
+    *,
+    tool_name: str,
+    envelope: dict[str, JsonValue],
+) -> tuple[str, str] | None:
+    if envelope.get("ok") is not True:
+        return None
+    if tool_name != "shell":
+        return None
+    data_payload = envelope.get("data")
+    if not isinstance(data_payload, dict):
+        return None
+    data = cast(dict[str, JsonValue], data_payload)
+    if data.get("status") != "failed":
+        return None
+    exit_code = data.get("exit_code")
+    if not isinstance(exit_code, int) or exit_code == 0:
+        return None
+
+    message = _reported_failure_message(data)
+    return "reported_failed_status", message
+
+
+def _reported_failure_message(data: dict[str, JsonValue]) -> str:
+    output_excerpt = data.get("output_excerpt")
+    if isinstance(output_excerpt, str) and output_excerpt.strip():
+        return output_excerpt.strip()
+
+    recent_output = data.get("recent_output")
+    if isinstance(recent_output, list):
+        lines = [line for line in recent_output if isinstance(line, str)]
+        if lines:
+            return "\n".join(lines).strip()
+
+    command = data.get("command")
+    exit_code = data.get("exit_code")
+    if isinstance(command, str) and command.strip() and type(exit_code) is int:
+        return f"Command failed with exit code {exit_code}: {command}"
+    return "The tool result reported failed status."
+
+
+async def _handle_tool_approval(
+    *,
+    ctx: ToolContext,
+    tool_name: str,
+    args_summary: dict[str, JsonValue],
+    approval_args_summary: dict[str, JsonValue] | None,
+    meta: dict[str, JsonValue],
+    tool_call_id: str,
+    approval_request: ToolApprovalRequest | None = None,
+    force_approval: bool = False,
+) -> tuple[str | None, ToolError | None]:
+    decision = await _evaluate_tool_approval_policy(
+        ctx=ctx,
+        policy=ctx.deps.tool_approval_policy,
+        tool_name=tool_name,
+        approval_request=approval_request,
+    )
+    meta["runtime_policy_decision"] = decision.runtime_decision.value
+    if decision.reason:
+        meta["runtime_policy_reason"] = decision.reason
+    if decision.runtime_decision == ToolRuntimeDecision.DENY:
+        meta["approval_required"] = False
+        meta["approval_mode"] = ToolApprovalMode.POLICY_EXEMPT.value
+        meta["approval_status"] = "denied_by_policy"
+        return None, ToolError(
+            type="tool_policy_denied",
+            message=decision.reason or "Tool call denied by runtime policy.",
+            retryable=False,
+        )
+    approval_required = force_approval or decision.required
+    run_yolo = _policy_uses_yolo(ctx.deps.tool_approval_policy)
+    args_preview = _safe_json(args_summary)
+    approval_preview = _safe_json(
+        approval_args_summary if approval_args_summary is not None else args_summary
+    )
+    meta["run_yolo"] = run_yolo
+    meta["approval_required"] = approval_required
+    meta["approval_mode"] = (
+        ToolApprovalMode.YOLO.value
+        if run_yolo and not approval_required
+        else (
+            ToolApprovalMode.POLICY_EXEMPT.value
+            if not approval_required
+            else ToolApprovalMode.APPROVAL_FLOW.value
+        )
+    )
+    if decision.permission_scope is not None:
+        meta["permission_scope"] = decision.permission_scope.value
+    if decision.risk_level is not None:
+        meta["risk_level"] = decision.risk_level.value
+    if decision.target_summary:
+        meta["target_summary"] = decision.target_summary
+    if decision.source:
+        meta["source"] = decision.source
+    if decision.execution_surface is not None:
+        meta["execution_surface"] = decision.execution_surface.value
+    cache_key = approval_request.cache_key if approval_request is not None else ""
+    if not approval_required:
+        meta["approval_status"] = "not_required"
+        return None, None
+
+    hook_allowed, hook_error = await _apply_permission_request_hooks(
+        ctx=ctx,
+        tool_name=tool_name,
+        tool_call_id=tool_call_id,
+        args_summary=args_summary,
+    )
+    if hook_error is not None:
+        return None, hook_error
+    if hook_allowed:
+        meta["approval_required"] = False
+        meta["approval_mode"] = ToolApprovalMode.POLICY_EXEMPT.value
+        meta["approval_status"] = "not_required"
+        return None, None
+
+    reusable_ticket = await ctx.deps.approval_ticket_repo.find_reusable_async(
+        run_id=ctx.deps.run_id,
+        task_id=ctx.deps.task_id,
+        instance_id=ctx.deps.instance_id,
+        role_id=ctx.deps.role_id,
+        tool_name=tool_name,
+        args_preview=args_preview,
+        cache_key=cache_key,
+        signature_args_preview=approval_preview,
+    )
+    if reusable_ticket is not None:
+        if reusable_ticket.status == ApprovalTicketStatus.APPROVED:
+            meta["approval_status"] = "approve"
+            if reusable_ticket.feedback:
+                meta["approval_feedback"] = reusable_ticket.feedback
+            return reusable_ticket.tool_call_id, None
+        if reusable_ticket.status == ApprovalTicketStatus.REQUESTED:
+            return await _wait_for_ticket_resolution(
+                ctx=ctx,
+                ticket_id=reusable_ticket.tool_call_id,
+                tool_name=tool_name,
+                args_summary=args_summary,
+                args_preview=args_preview,
+                meta=meta,
+                decision=decision,
+            )
+        if reusable_ticket.status == ApprovalTicketStatus.DENIED:
+            meta["approval_status"] = "deny"
+            if reusable_ticket.feedback:
+                meta["approval_feedback"] = reusable_ticket.feedback
+            await _apply_permission_denied_hooks(
+                ctx=ctx,
+                tool_name=tool_name,
+                tool_call_id=reusable_ticket.tool_call_id,
+                tool_input=args_summary,
+                denial_source="cached_user_approval",
+                denial_reason=reusable_ticket.feedback,
+                approval_status="deny",
+            )
+            return reusable_ticket.tool_call_id, ToolError(
+                type="approval_denied",
+                message="Tool call was denied by user.",
+                retryable=True,
+            )
+        if reusable_ticket.status == ApprovalTicketStatus.TIMED_OUT:
+            meta["approval_status"] = "timeout"
+            await _apply_permission_denied_hooks(
+                ctx=ctx,
+                tool_name=tool_name,
+                tool_call_id=reusable_ticket.tool_call_id,
+                tool_input=args_summary,
+                denial_source="cached_user_approval",
+                denial_reason="Tool approval timed out.",
+                approval_status="timeout",
+            )
+            return reusable_ticket.tool_call_id, ToolError(
+                type="approval_timeout",
+                message="Tool approval timed out.",
+                retryable=True,
+            )
+    ticket = await ctx.deps.approval_ticket_repo.upsert_requested_async(
+        tool_call_id=tool_call_id,
+        run_id=ctx.deps.run_id,
+        session_id=ctx.deps.session_id,
+        task_id=ctx.deps.task_id,
+        instance_id=ctx.deps.instance_id,
+        role_id=ctx.deps.role_id,
+        tool_name=tool_name,
+        args_preview=args_preview,
+        metadata=approval_request.metadata if approval_request is not None else None,
+        cache_key=cache_key,
+        signature_args_preview=approval_preview,
+    )
+    return await _wait_for_ticket_resolution(
+        ctx=ctx,
+        ticket_id=ticket.tool_call_id,
+        tool_name=tool_name,
+        args_summary=args_summary,
+        args_preview=args_preview,
+        meta=meta,
+        decision=decision,
+        publish_request=True,
+    )
+
+
+async def _wait_for_ticket_resolution(
+    *,
+    ctx: ToolContext,
+    ticket_id: str,
+    tool_name: str,
+    args_summary: dict[str, JsonValue],
+    args_preview: str,
+    meta: dict[str, JsonValue],
+    decision: ToolApprovalDecision,
+    publish_request: bool = False,
+) -> tuple[str | None, ToolError | None]:
+    existing_approval = ctx.deps.tool_approval_manager.get_approval(
+        run_id=ctx.deps.run_id,
+        tool_call_id=ticket_id,
+    )
+    if existing_approval is None:
+        ctx.deps.tool_approval_manager.open_approval(
+            run_id=ctx.deps.run_id,
+            tool_call_id=ticket_id,
+            instance_id=ctx.deps.instance_id,
+            role_id=ctx.deps.role_id,
+            tool_name=tool_name,
+            args_preview=args_preview,
+            risk_level=(
+                decision.risk_level.value if decision.risk_level is not None else "high"
+            ),
+        )
+        publish_request = True
+
+    await _ensure_run_runtime_async(ctx=ctx)
+    await _update_run_runtime_async(
+        ctx=ctx,
+        status=RunRuntimeStatus.PAUSED,
+        phase=RunRuntimePhase.AWAITING_TOOL_APPROVAL,
+        active_instance_id=ctx.deps.instance_id,
+        active_task_id=ctx.deps.task_id,
+        active_role_id=ctx.deps.role_id,
+        active_subagent_instance_id=None,
+        last_error=None,
+    )
+    if publish_request:
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            event="tool.approval.requested",
+            message="Tool approval requested",
+            payload={
+                "tool_name": tool_name,
+                "tool_call_id": ticket_id,
+            },
+        )
+        await _publish_tool_approval_event_async(
+            ctx=ctx,
+            event_type=RunEventType.TOOL_APPROVAL_REQUESTED,
+            payload={
+                "tool_call_id": ticket_id,
+                "tool_name": tool_name,
+                "args_preview": args_preview,
+                "instance_id": ctx.deps.instance_id,
+                "role_id": ctx.deps.role_id,
+                "risk_level": (
+                    decision.risk_level.value
+                    if decision.risk_level is not None
+                    else "high"
+                ),
+                "permission_scope": (
+                    decision.permission_scope.value
+                    if decision.permission_scope is not None
+                    else ""
+                ),
+                "target_summary": decision.target_summary,
+                "source": decision.source,
+                "execution_surface": (
+                    decision.execution_surface.value
+                    if decision.execution_surface is not None
+                    else ""
+                ),
+            },
+        )
+        await _publish_tool_approval_notification_async(
+            ctx=ctx,
+            tool_call_id=ticket_id,
+            tool_name=tool_name,
+        )
+
+    try:
+        action, feedback = await _run_tool_approval_work(
+            ctx.deps.tool_approval_manager.wait_for_approval,
+            run_id=ctx.deps.run_id,
+            tool_call_id=ticket_id,
+            timeout=ctx.deps.tool_approval_policy.timeout_seconds,
+        )
+    except TimeoutError:
+        ctx.deps.tool_approval_manager.close_approval(
+            run_id=ctx.deps.run_id,
+            tool_call_id=ticket_id,
+        )
+        try:
+            resolved_ticket = await ctx.deps.approval_ticket_repo.resolve_async(
+                tool_call_id=ticket_id,
+                status=ApprovalTicketStatus.TIMED_OUT,
+                expected_status=ApprovalTicketStatus.REQUESTED,
+            )
+        except ApprovalTicketStatusConflictError:
+            resolved_ticket = await ctx.deps.approval_ticket_repo.get_async(ticket_id)
+            if resolved_ticket is None:
+                raise KeyError(f"Unknown approval ticket: {ticket_id}") from None
+        resolved_action, resolved_error = _approval_resolution_from_ticket(
+            ticket=resolved_ticket,
+            meta=meta,
+        )
+        if resolved_action == "timeout":
+            await _update_run_runtime_async(
+                ctx=ctx,
+                status=RunRuntimeStatus.PAUSED,
+                phase=RunRuntimePhase.AWAITING_TOOL_APPROVAL,
+                active_instance_id=ctx.deps.instance_id,
+                active_task_id=ctx.deps.task_id,
+                active_role_id=ctx.deps.role_id,
+                active_subagent_instance_id=None,
+                last_error="Tool approval timed out",
+            )
+        elif resolved_action == "deny":
+            await _update_run_runtime_async(
+                ctx=ctx,
+                status=RunRuntimeStatus.PAUSED,
+                phase=RunRuntimePhase.AWAITING_TOOL_APPROVAL,
+                active_instance_id=ctx.deps.instance_id,
+                active_task_id=ctx.deps.task_id,
+                active_role_id=ctx.deps.role_id,
+                active_subagent_instance_id=None,
+                last_error="Tool call was denied by user.",
+            )
+        log_event(
+            LOGGER,
+            logging.INFO if resolved_action == "approve" else logging.WARNING,
+            event="tool.approval.resolved",
+            message=(
+                "Tool approval resolved"
+                if resolved_action != "timeout"
+                else "Tool approval timed out"
+            ),
+            payload={
+                "tool_name": tool_name,
+                "tool_call_id": ticket_id,
+                "action": resolved_action,
+            },
+        )
+        await _publish_tool_approval_event_async(
+            ctx=ctx,
+            event_type=RunEventType.TOOL_APPROVAL_RESOLVED,
+            payload={
+                "tool_call_id": ticket_id,
+                "tool_name": tool_name,
+                "action": resolved_action,
+                "feedback": resolved_ticket.feedback,
+                "instance_id": ctx.deps.instance_id,
+                "role_id": ctx.deps.role_id,
+            },
+        )
+        if resolved_action in {"deny", "timeout"}:
+            await _apply_permission_denied_hooks(
+                ctx=ctx,
+                tool_name=tool_name,
+                tool_call_id=ticket_id,
+                tool_input=args_summary,
+                denial_source="user_approval",
+                denial_reason=resolved_ticket.feedback
+                or (
+                    "Tool approval timed out."
+                    if resolved_action == "timeout"
+                    else "Tool call was denied by user."
+                ),
+                approval_status=resolved_action,
+            )
+        return ticket_id, resolved_error
+
+    ctx.deps.tool_approval_manager.close_approval(
+        run_id=ctx.deps.run_id,
+        tool_call_id=ticket_id,
+    )
+    resolved_status = (
+        ApprovalTicketStatus.APPROVED
+        if _approval_action_is_approved(action)
+        else ApprovalTicketStatus.DENIED
+    )
+    try:
+        resolved_ticket = await ctx.deps.approval_ticket_repo.resolve_async(
+            tool_call_id=ticket_id,
+            status=resolved_status,
+            feedback=feedback,
+            expected_status=ApprovalTicketStatus.REQUESTED,
+        )
+    except ApprovalTicketStatusConflictError:
+        resolved_ticket = await ctx.deps.approval_ticket_repo.get_async(ticket_id)
+        if resolved_ticket is None:
+            raise KeyError(f"Unknown approval ticket: {ticket_id}") from None
+    resolved_action, resolved_error = _approval_resolution_from_ticket(
+        ticket=resolved_ticket,
+        meta=meta,
+    )
+    log_event(
+        LOGGER,
+        logging.INFO if resolved_action == "approve" else logging.WARNING,
+        event="tool.approval.resolved",
+        message="Tool approval resolved",
+        payload={
+            "tool_name": tool_name,
+            "tool_call_id": ticket_id,
+            "action": resolved_action,
+        },
+    )
+    await _publish_tool_approval_event_async(
+        ctx=ctx,
+        event_type=RunEventType.TOOL_APPROVAL_RESOLVED,
+        payload={
+            "tool_call_id": ticket_id,
+            "tool_name": tool_name,
+            "action": resolved_action,
+            "feedback": resolved_ticket.feedback,
+            "instance_id": ctx.deps.instance_id,
+            "role_id": ctx.deps.role_id,
+        },
+    )
+    if resolved_action == "deny":
+        await _apply_permission_denied_hooks(
+            ctx=ctx,
+            tool_name=tool_name,
+            tool_call_id=ticket_id,
+            tool_input=args_summary,
+            denial_source="user_approval",
+            denial_reason=resolved_ticket.feedback or "Tool call was denied by user.",
+            approval_status="deny",
+        )
+        await _update_run_runtime_async(
+            ctx=ctx,
+            status=RunRuntimeStatus.PAUSED,
+            phase=RunRuntimePhase.AWAITING_TOOL_APPROVAL,
+            active_instance_id=ctx.deps.instance_id,
+            active_task_id=ctx.deps.task_id,
+            active_role_id=ctx.deps.role_id,
+            active_subagent_instance_id=None,
+            last_error="Tool call was denied by user.",
+        )
+        return ticket_id, resolved_error
+    if resolved_action == "timeout":
+        await _apply_permission_denied_hooks(
+            ctx=ctx,
+            tool_name=tool_name,
+            tool_call_id=ticket_id,
+            tool_input=args_summary,
+            denial_source="user_approval",
+            denial_reason="Tool approval timed out.",
+            approval_status="timeout",
+        )
+        await _update_run_runtime_async(
+            ctx=ctx,
+            status=RunRuntimeStatus.PAUSED,
+            phase=RunRuntimePhase.AWAITING_TOOL_APPROVAL,
+            active_instance_id=ctx.deps.instance_id,
+            active_task_id=ctx.deps.task_id,
+            active_role_id=ctx.deps.role_id,
+            active_subagent_instance_id=None,
+            last_error="Tool approval timed out",
+        )
+        return ticket_id, resolved_error
+
+    return ticket_id, None
+
+
+def _approval_action_is_approved(action: str) -> bool:
+    return action in {"approve", "approve_once", "approve_exact", "approve_prefix"}
+
+
+def _approval_resolution_from_ticket(
+    *,
+    ticket: ApprovalTicketRecord,
+    meta: dict[str, JsonValue],
+) -> tuple[str, ToolError | None]:
+    if ticket.feedback:
+        meta["approval_feedback"] = ticket.feedback
+    if ticket.status in {
+        ApprovalTicketStatus.APPROVED,
+        ApprovalTicketStatus.COMPLETED,
+    }:
+        meta["approval_status"] = "approve"
+        return "approve", None
+    if ticket.status == ApprovalTicketStatus.DENIED:
+        meta["approval_status"] = "deny"
+        return "deny", ToolError(
+            type="approval_denied",
+            message="Tool call was denied by user.",
+            retryable=True,
+        )
+    meta["approval_status"] = "timeout"
+    return "timeout", ToolError(
+        type="approval_timeout",
+        message="Tool approval timed out.",
+        retryable=True,
+    )
+
+
+async def _publish_tool_approval_notification_async(
+    *,
+    ctx: ToolContext,
+    tool_call_id: str,
+    tool_name: str,
+) -> None:
+    notification_service = ctx.deps.notification_service
+    if notification_service is None:
+        return
+
+    role_label = ctx.deps.role_id or "An agent"
+    body = f"{role_label} requests approval for {tool_name}."
+    _ = await notification_service.emit_async(
+        notification_type=NotificationType.TOOL_APPROVAL_REQUESTED,
+        title="Approval Required",
+        body=body,
+        dedupe_key=f"tool_approval_requested:{ctx.deps.run_id}:{tool_call_id}",
+        context=NotificationContext(
+            session_id=ctx.deps.session_id,
+            run_id=ctx.deps.run_id,
+            trace_id=ctx.deps.trace_id,
+            task_id=ctx.deps.task_id,
+            instance_id=ctx.deps.instance_id,
+            role_id=ctx.deps.role_id,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+        ),
+    )
+
+
+async def _publish_tool_approval_event_async(
+    *,
+    ctx: ToolContext,
+    event_type: RunEventType,
+    payload: dict[str, JsonValue],
+) -> None:
+    await publish_run_event_async(
+        ctx.deps.run_event_hub,
+        RunEvent(
+            session_id=ctx.deps.session_id,
+            run_id=ctx.deps.run_id,
+            trace_id=ctx.deps.trace_id,
+            task_id=ctx.deps.task_id,
+            instance_id=ctx.deps.instance_id,
+            role_id=ctx.deps.role_id,
+            event_type=event_type,
+            payload_json=dumps(payload, ensure_ascii=False),
+        ),
+    )
+
+
+# noinspection PyTypeHints
+def _visible_envelope(
+    *,
+    ok: bool,
+    data: JsonValue = None,
+    error: ToolError | None = None,
+    meta: dict[str, JsonValue] | None = None,
+) -> dict[str, JsonValue]:
+    envelope = ToolResultEnvelope(
+        ok=ok,
+        data=data,
+        error=error,
+        meta={} if meta is None else dict(meta),
+    )
+    return cast(dict[str, JsonValue], envelope.model_dump(mode="json"))
+
+
+async def _evaluate_tool_approval_policy(
+    *,
+    ctx: ToolContext,
+    policy: ToolApprovalPolicy | _RequiresApprovalPolicy,
+    tool_name: str,
+    approval_request: ToolApprovalRequest | None,
+) -> ToolApprovalDecision:
+    if isinstance(policy, ToolApprovalPolicy):
+        allowed_tools = await _allowed_tools_for_runtime_policy(ctx=ctx)
+        return policy.evaluate(
+            tool_name,
+            approval_request,
+            role_id=ctx.deps.role_id,
+            task_id=ctx.deps.task_id,
+            allowed_tools=allowed_tools,
+        )
+    required = cast(bool, policy.requires_approval(tool_name))
+    return ToolApprovalDecision(
+        required=required,
+        runtime_decision=(
+            ToolRuntimeDecision.REQUIRE_APPROVAL
+            if required
+            else ToolRuntimeDecision.ALLOW
+        ),
+        permission_scope=(
+            approval_request.permission_scope if approval_request is not None else None
+        ),
+        risk_level=approval_request.risk_level
+        if approval_request is not None
+        else None,
+        target_summary=(
+            approval_request.target_summary if approval_request is not None else ""
+        ),
+        source=approval_request.source if approval_request is not None else "",
+        execution_surface=(
+            approval_request.execution_surface if approval_request is not None else None
+        ),
+    )
+
+
+async def _allowed_tools_for_runtime_policy(
+    *,
+    ctx: ToolContext,
+) -> tuple[str, ...] | None:
+    try:
+        runtime_role_resolver = getattr(ctx.deps, "runtime_role_resolver", None)
+        if runtime_role_resolver is not None:
+            role = await runtime_role_resolver.get_effective_role_async(
+                run_id=ctx.deps.run_id,
+                role_id=ctx.deps.role_id,
+            )
+        else:
+            role = ctx.deps.role_registry.get(ctx.deps.role_id)
+    except Exception as exc:
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            event="tool.policy.role_resolution_failed",
+            message="Tool runtime policy could not resolve role capabilities",
+            payload={
+                "role_id": ctx.deps.role_id,
+                "task_id": ctx.deps.task_id,
+                "error_type": type(exc).__name__,
+            },
+        )
+        return ()
+    tools = set(
+        runtime_tools_for_role(
+            role_registry=ctx.deps.role_registry,
+            role=role,
+            consumer="tools.runtime.execution.allowed_tools",
+        )
+    )
+    tools.update(await _runtime_snapshot_tool_names_for_policy(ctx=ctx))
+    denied_tools = set(runtime_denied_tools_for_role(role))
+    tools.difference_update(denied_tools)
+    return tuple(sorted(tools))
+
+
+async def _runtime_snapshot_tool_names_for_policy(
+    *,
+    ctx: ToolContext,
+) -> tuple[str, ...]:
+    agent_repo = getattr(ctx.deps, "agent_repo", None)
+    if not isinstance(agent_repo, _RuntimeToolsAgentRepository):
+        return ()
+    try:
+        instance = await agent_repo.get_instance_async(ctx.deps.instance_id)
+    except Exception as exc:
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            event="tool.policy.runtime_tools_snapshot_unavailable",
+            message="Tool runtime policy could not load runtime tool snapshot",
+            payload={
+                "role_id": ctx.deps.role_id,
+                "task_id": ctx.deps.task_id,
+                "instance_id": ctx.deps.instance_id,
+                "error_type": type(exc).__name__,
+            },
+        )
+        return ()
+    if not instance.runtime_tools_json.strip():
+        return ()
+    try:
+        snapshot = RuntimeToolsSnapshot.model_validate_json(instance.runtime_tools_json)
+    except ValidationError as exc:
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            event="tool.policy.runtime_tools_snapshot_invalid",
+            message="Tool runtime policy ignored invalid runtime tool snapshot",
+            payload={
+                "role_id": ctx.deps.role_id,
+                "task_id": ctx.deps.task_id,
+                "instance_id": ctx.deps.instance_id,
+                "error_type": type(exc).__name__,
+            },
+        )
+        return ()
+    return _runtime_snapshot_tool_names(snapshot)
+
+
+def _runtime_snapshot_tool_names(snapshot: RuntimeToolsSnapshot) -> tuple[str, ...]:
+    tools = set[str]()
+    for entry in _runtime_snapshot_entries(snapshot):
+        tools.add(entry.name)
+    return tuple(sorted(tools))
+
+
+def _runtime_snapshot_entries(
+    snapshot: RuntimeToolsSnapshot,
+) -> tuple[RuntimeToolSnapshotEntry, ...]:
+    return snapshot.local_tools + snapshot.skill_tools + snapshot.mcp_tools
+
+
+class _RequiresApprovalPolicy(Protocol):
+    timeout_seconds: float
+
+    @staticmethod
+    def requires_approval(tool_name: str) -> bool:
+        raise NotImplementedError
+
+
+# noinspection PyTypeHints
+def _internal_record(
+    *,
+    tool_name: str,
+    visible_envelope: dict[str, JsonValue],
+    internal_data: JsonValue | None,
+    runtime_meta: dict[str, JsonValue],
+    tool_content_parts: tuple[ContentPart, ...],
+) -> dict[str, JsonValue]:
+    record = ToolInternalRecord(
+        tool=tool_name,
+        visible_result=ToolResultEnvelope.model_validate(visible_envelope),
+        internal_data=internal_data,
+        runtime_meta=runtime_meta,
+        tool_content_parts=tool_content_parts,
+    )
+    return cast(dict[str, JsonValue], record.model_dump(mode="json"))
+
+
+async def _persist_tool_record_async(
+    *,
+    ctx: ToolContext,
+    tool_call_id: str,
+    tool_name: str,
+    args_summary: dict[str, JsonValue],
+    visible_envelope: dict[str, JsonValue],
+    internal_data: JsonValue | None,
+    runtime_meta: dict[str, JsonValue],
+    execution_status: ToolExecutionStatus,
+    tool_content_parts: tuple[ContentPart, ...] = (),
+    result_event_id: int = 0,
+) -> None:
+    approval_status = _approval_status_from_meta(runtime_meta)
+    approval_mode = _approval_mode_from_meta(runtime_meta)
+    result_record = _internal_record(
+        tool_name=tool_name,
+        visible_envelope=visible_envelope,
+        internal_data=internal_data,
+        runtime_meta=runtime_meta,
+        tool_content_parts=tool_content_parts,
+    )
+    current_state = await load_tool_call_state_async(
+        shared_store=ctx.deps.shared_store,
+        task_id=ctx.deps.task_id,
+        tool_call_id=tool_call_id,
+    )
+    existing_call_state = (
+        dict(current_state.call_state) if current_state is not None else {}
+    )
+    await merge_tool_call_state_async(
+        shared_store=ctx.deps.shared_store,
+        task_id=ctx.deps.task_id,
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+        run_id=ctx.deps.run_id,
+        session_id=ctx.deps.session_id,
+        instance_id=ctx.deps.instance_id,
+        role_id=ctx.deps.role_id,
+        args_preview=_safe_json(args_summary),
+        run_yolo=bool(runtime_meta.get("run_yolo") is True),
+        approval_mode=approval_mode,
+        approval_status=approval_status,
+        approval_feedback=str(runtime_meta.get("approval_feedback") or ""),
+        execution_status=execution_status,
+        result_envelope=result_record,
+        call_state=existing_call_state,
+        result_event_id=result_event_id,
+        finished_at=datetime.now(tz=timezone.utc).isoformat(),
+    )
+
+
+def _approval_status_from_meta(
+    runtime_meta: dict[str, JsonValue],
+) -> ToolApprovalStatus | None:
+    approval_text = str(runtime_meta.get("approval_status") or "").strip().lower()
+    if approval_text in {
+        ToolApprovalStatus.APPROVE.value,
+        "approve_once",
+        "approve_exact",
+        "approve_prefix",
+    }:
+        return ToolApprovalStatus.APPROVE
+    if approval_text == ToolApprovalStatus.DENY.value:
+        return ToolApprovalStatus.DENY
+    if approval_text == ToolApprovalStatus.TIMEOUT.value:
+        return ToolApprovalStatus.TIMEOUT
+    if approval_text == ToolApprovalStatus.NOT_REQUIRED.value:
+        return ToolApprovalStatus.NOT_REQUIRED
+    return None
+
+
+def _approval_mode_from_meta(
+    runtime_meta: dict[str, JsonValue],
+) -> ToolApprovalMode | None:
+    approval_mode = str(runtime_meta.get("approval_mode") or "").strip().lower()
+    for candidate in ToolApprovalMode:
+        if approval_mode == candidate.value:
+            return candidate
+    return None
+
+
+def _policy_uses_yolo(policy: object) -> bool:
+    return bool(getattr(policy, "yolo", False))

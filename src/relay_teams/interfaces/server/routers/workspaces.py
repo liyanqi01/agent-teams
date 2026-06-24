@@ -1,0 +1,388 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Annotated
+
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from relay_teams.validation import require_force_delete
+from relay_teams.interfaces.server.deps import (
+    get_session_service,
+    get_workspace_service,
+)
+from relay_teams.interfaces.server.write_models import DeleteRequest
+from relay_teams.sessions import SessionSidebarPage
+from relay_teams.sessions.session_service import SessionService
+from relay_teams.validation import RequiredIdentifierStr
+from relay_teams.workspace import (
+    WorkspaceMountRecord,
+    WorkspaceDiffFile,
+    WorkspaceDiffListing,
+    WorkspaceFileContent,
+    WorkspacePage,
+    WorkspacePageSort,
+    WorkspaceRecord,
+    WorkspaceSearchResponse,
+    WorkspaceService,
+    WorkspaceSnapshot,
+    WorkspaceTreeListing,
+    pick_workspace_directory,
+)
+
+import asyncio
+
+router = APIRouter(prefix="/workspaces", tags=["Workspaces"])
+
+
+class CreateWorkspaceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    workspace_id: RequiredIdentifierStr
+    root_path: str | None = Field(default=None, min_length=1)
+    default_mount_name: RequiredIdentifierStr | None = None
+    mounts: tuple[WorkspaceMountRecord, ...] | None = None
+
+    @model_validator(mode="after")
+    def _validate_mount_source(self) -> CreateWorkspaceRequest:
+        has_root_path = self.root_path is not None
+        has_mounts = self.mounts is not None
+        if has_root_path == has_mounts:
+            raise ValueError("Provide exactly one of root_path or mounts")
+        return self
+
+
+class UpdateWorkspaceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    default_mount_name: RequiredIdentifierStr
+    mounts: tuple[WorkspaceMountRecord, ...]
+
+
+class PickWorkspaceResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    workspace: WorkspaceRecord | None = None
+
+
+class PickWorkspaceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    root_path: str | None = Field(default=None, min_length=1)
+
+
+class ForkWorkspaceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1)
+    start_ref: str | None = Field(default=None, min_length=1)
+
+
+@router.post("", response_model=WorkspaceRecord)
+async def create_workspace(
+    req: CreateWorkspaceRequest,
+    service: WorkspaceService = Depends(get_workspace_service),
+) -> WorkspaceRecord:
+    try:
+        return await service.create_workspace_async(
+            workspace_id=req.workspace_id,
+            root_path=Path(req.root_path) if req.root_path is not None else None,
+            mounts=req.mounts,
+            default_mount_name=req.default_mount_name,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/pick", response_model=PickWorkspaceResponse)
+async def pick_workspace(
+    req: PickWorkspaceRequest | None = None,
+    service: WorkspaceService = Depends(get_workspace_service),
+) -> PickWorkspaceResponse:
+    def _pick_workspace_for_request() -> WorkspaceRecord | None:
+        if req is not None and req.root_path is not None:
+            selected_root = Path(req.root_path)
+        else:
+            selected_root = pick_workspace_directory()
+        if selected_root is None:
+            return None
+        return service.create_workspace_for_root(root_path=selected_root)
+
+    try:
+        workspace = await asyncio.to_thread(_pick_workspace_for_request)
+        if workspace is None:
+            return PickWorkspaceResponse(workspace=None)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return PickWorkspaceResponse(workspace=workspace)
+
+
+@router.get("", response_model=WorkspacePage)
+async def list_workspaces(
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    cursor: Annotated[str | None, Query()] = None,
+    sort: Annotated[WorkspacePageSort, Query()] = WorkspacePageSort.ACTIVITY,
+    service: WorkspaceService = Depends(get_workspace_service),
+) -> WorkspacePage:
+    try:
+        return await service.list_workspaces_page_async(
+            limit=limit,
+            cursor=cursor,
+            sort=sort,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/{workspace_id}", response_model=WorkspaceRecord)
+async def get_workspace(
+    workspace_id: RequiredIdentifierStr,
+    service: WorkspaceService = Depends(get_workspace_service),
+) -> WorkspaceRecord:
+    try:
+        return await service.get_workspace_async(workspace_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Workspace not found") from exc
+
+
+@router.get("/{workspace_id}/sessions/sidebar", response_model=SessionSidebarPage)
+async def list_workspace_sidebar_sessions(
+    workspace_id: RequiredIdentifierStr,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    cursor: Annotated[str | None, Query()] = None,
+    service: SessionService = Depends(get_session_service),
+) -> SessionSidebarPage:
+    try:
+        return await service.list_workspace_sidebar_sessions_page_async(
+            workspace_id,
+            limit=limit,
+            cursor=cursor,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.put("/{workspace_id}", response_model=WorkspaceRecord)
+async def update_workspace(
+    workspace_id: RequiredIdentifierStr,
+    req: UpdateWorkspaceRequest,
+    service: WorkspaceService = Depends(get_workspace_service),
+) -> WorkspaceRecord:
+    try:
+        return await service.update_workspace_async(
+            workspace_id,
+            mounts=req.mounts,
+            default_mount_name=req.default_mount_name,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Workspace not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/{workspace_id}:open-root")
+async def open_workspace_root(
+    workspace_id: RequiredIdentifierStr,
+    mount: Annotated[str | None, Query()] = None,
+    service: WorkspaceService = Depends(get_workspace_service),
+) -> dict[str, str]:
+    try:
+        _ = await service.open_workspace_root_async(workspace_id, mount_name=mount)
+        return {"status": "ok"}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Workspace not found") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/{workspace_id}/snapshot", response_model=WorkspaceSnapshot)
+async def get_workspace_snapshot(
+    workspace_id: RequiredIdentifierStr,
+    service: WorkspaceService = Depends(get_workspace_service),
+) -> WorkspaceSnapshot:
+    try:
+        return await service.get_workspace_snapshot_async(workspace_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Workspace not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/{workspace_id}/tree", response_model=WorkspaceTreeListing)
+async def get_workspace_tree_listing(
+    workspace_id: RequiredIdentifierStr,
+    path: Annotated[str, Query()] = ".",
+    mount: Annotated[str | None, Query()] = None,
+    service: WorkspaceService = Depends(get_workspace_service),
+) -> WorkspaceTreeListing:
+    try:
+        return await service.get_workspace_tree_listing_async(
+            workspace_id,
+            directory_path=path,
+            mount_name=mount,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Workspace not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/{workspace_id}/search", response_model=WorkspaceSearchResponse)
+async def search_workspace_paths(
+    workspace_id: RequiredIdentifierStr,
+    query: Annotated[str, Query()] = "",
+    limit: Annotated[int, Query(ge=1, le=500)] = 40,
+    mount: Annotated[str | None, Query()] = None,
+    service: WorkspaceService = Depends(get_workspace_service),
+) -> WorkspaceSearchResponse:
+    try:
+        return await service.search_workspace_paths_async(
+            workspace_id,
+            query=query,
+            limit=limit,
+            mount_name=mount,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Workspace not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/{workspace_id}/diffs", response_model=WorkspaceDiffListing)
+async def get_workspace_diffs(
+    workspace_id: RequiredIdentifierStr,
+    mount: Annotated[str | None, Query()] = None,
+    service: WorkspaceService = Depends(get_workspace_service),
+) -> WorkspaceDiffListing:
+    try:
+        return await service.get_workspace_diffs_async(
+            workspace_id,
+            mount_name=mount,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Workspace not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/{workspace_id}/diff", response_model=WorkspaceDiffFile)
+async def get_workspace_diff_file(
+    workspace_id: RequiredIdentifierStr,
+    path: Annotated[str, Query(min_length=1)],
+    mount: Annotated[str | None, Query()] = None,
+    service: WorkspaceService = Depends(get_workspace_service),
+) -> WorkspaceDiffFile:
+    try:
+        return await service.get_workspace_diff_file_async(
+            workspace_id,
+            path=path,
+            mount_name=mount,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Workspace not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/{workspace_id}/file", response_model=WorkspaceFileContent)
+async def get_workspace_file_content(
+    workspace_id: RequiredIdentifierStr,
+    path: Annotated[str, Query(min_length=1)],
+    mount: Annotated[str | None, Query()] = None,
+    service: WorkspaceService = Depends(get_workspace_service),
+) -> WorkspaceFileContent:
+    try:
+        return await service.get_workspace_file_content_async(
+            workspace_id,
+            path=path,
+            mount_name=mount,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Workspace not found") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/{workspace_id}/preview-file")
+async def get_workspace_preview_file(
+    workspace_id: RequiredIdentifierStr,
+    path: Annotated[str, Query(min_length=1)],
+    mount: Annotated[str | None, Query()] = None,
+    service: WorkspaceService = Depends(get_workspace_service),
+) -> FileResponse:
+    try:
+        (
+            resolved_path,
+            media_type,
+        ) = await service.get_workspace_image_preview_file_async(
+            workspace_id,
+            path=path,
+            mount_name=mount,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Workspace not found") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return FileResponse(
+        path=resolved_path,
+        filename=resolved_path.name,
+        media_type=media_type,
+    )
+
+
+@router.delete("/{workspace_id}")
+async def delete_workspace(
+    workspace_id: RequiredIdentifierStr,
+    remove_directory: Annotated[bool, Query()] = False,
+    remove_worktree: Annotated[bool, Query()] = False,
+    req: DeleteRequest | None = Body(default=None),
+    service: WorkspaceService = Depends(get_workspace_service),
+) -> dict[str, str]:
+    try:
+        should_remove_directory = remove_directory or remove_worktree
+        if should_remove_directory:
+            require_force_delete(
+                req.force if req is not None else False,
+                message="Cannot remove workspace directory without force",
+            )
+
+        await service.delete_workspace_with_options_async(
+            workspace_id=workspace_id,
+            remove_directory=should_remove_directory,
+        )
+        return {"status": "ok"}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Workspace not found") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/{workspace_id}:fork", response_model=WorkspaceRecord)
+async def fork_workspace(
+    workspace_id: RequiredIdentifierStr,
+    req: ForkWorkspaceRequest,
+    service: WorkspaceService = Depends(get_workspace_service),
+) -> WorkspaceRecord:
+    try:
+        return await service.fork_workspace_async(
+            source_workspace_id=workspace_id,
+            name=req.name,
+            start_ref=req.start_ref,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Workspace not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

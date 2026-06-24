@@ -1,0 +1,22 @@
+{
+  "name": "pptx-craft",
+  "version": "1.0.0",
+  "description": "PPT 技能辅助资源，提供输出目录处理与 SVG 转 PPTX 脚本入口。",
+  "type": "module",
+  "scripts": {
+    "prepare-output": "node scripts/ensure_output_dir.js",
+    "timestamp-dir": "node scripts/generate_timestamp_dir.js",
+    "convert-svg": "python scripts/svg_to_pptx/svg_to_pptx.py"
+  },
+  "keywords": [
+    "pptx",
+    "svg",
+    "presentation"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {},
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

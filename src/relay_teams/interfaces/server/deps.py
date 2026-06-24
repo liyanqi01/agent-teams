@@ -1,0 +1,387 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+from fastapi import Request, WebSocket
+
+from relay_teams.audit import AuditService
+from relay_teams.commands import CommandRegistry
+from relay_teams.agents.orchestration.settings_service import (
+    OrchestrationSettingsService,
+)
+from relay_teams.agents.orchestration.task_orchestration_service import (
+    TaskOrchestrationService,
+)
+from relay_teams.agents.tasks.artifact_query_service import ArtifactQueryService
+from relay_teams.agents.tasks.spec_artifact_diff_service import (
+    SpecArtifactDiffService,
+)
+from relay_teams.agents.tasks.task_repository import TaskRepository
+from relay_teams.automation.automation_service import AutomationService
+from relay_teams.binary_tools import BinaryToolService
+from relay_teams.boards import BoardTodoService
+from relay_teams.connector import ConnectorService
+from relay_teams.env.clawhub_config_service import ClawHubConfigService
+from relay_teams.env.environment_variable_service import EnvironmentVariableService
+from relay_teams.env.github_config_service import GitHubConfigService
+from relay_teams.env.localhost_run_tunnel_service import LocalhostRunTunnelService
+from relay_teams.env.proxy_config_service import ProxyConfigService
+from relay_teams.env.web_config_service import WebConfigService
+from relay_teams.general import GeneralConfigService
+from relay_teams.agent_runtimes import (
+    AcpRegistryService,
+    ExternalAgentConfigService,
+)
+from relay_teams.agent_runtimes.test_job_service import AgentRuntimeTestJobService
+from relay_teams.gateway.feishu.gateway_service import FeishuGatewayService
+from relay_teams.gateway.feishu.subscription_service import FeishuSubscriptionService
+from relay_teams.gateway.feishu.trigger_handler import FeishuTriggerHandler
+from relay_teams.gateway.discord import DiscordGatewayService
+from relay_teams.gateway.wechat.service import WeChatGatewayService
+from relay_teams.gateway.xiaoluban import (
+    XiaolubanGatewayService,
+    XiaolubanImListenerService,
+)
+from relay_teams.hooks import HookService
+from relay_teams.interfaces.server.config_status_service import ConfigStatusService
+from relay_teams.interfaces.server.container import ServerContainer
+from relay_teams.interfaces.server.ui_language_service import UiLanguageSettingsService
+from relay_teams.mcp.config_reload_service import McpConfigReloadService
+from relay_teams.mcp.mcp_discovery_service import McpDiscoveryService
+from relay_teams.mcp.mcp_registry import McpRegistry
+from relay_teams.mcp.mcp_service import McpService
+from relay_teams.mcp.runtime_schema_loader import RuntimeMcpSchemaLoader
+from relay_teams.media import MediaAssetService
+from relay_teams.memory.service import MemoryBankService
+from relay_teams.memory.evolution_service import MemoryEvolutionService
+from relay_teams.memory.skill_synthesis_service import MemorySkillSynthesisService
+from relay_teams.metrics import MetricsService
+from relay_teams.net.clawhub_connectivity import ClawHubConnectivityProbeService
+from relay_teams.net.github_connectivity import (
+    GitHubConnectivityProbeService,
+    GitHubWebhookConnectivityProbeService,
+)
+from relay_teams.net.web_connectivity import WebConnectivityProbeService
+from relay_teams.notifications.notification_settings_service import (
+    NotificationSettingsService,
+)
+from relay_teams.plugins import PluginRegistry
+from relay_teams.providers.model_config_service import ModelConfigService
+from relay_teams.roles import RoleRegistry
+from relay_teams.roles.settings_service import RoleSettingsService
+from relay_teams.sessions.runs.run_service import SessionRunService
+from relay_teams.sessions.session_service import SessionService
+from relay_teams.skills.clawhub_skill_service import ClawHubSkillService
+from relay_teams.skills.config_reload_service import SkillsConfigReloadService
+from relay_teams.skills.skill_market_service import ClawHubSkillMarketService
+from relay_teams.skills.skill_registry import SkillRegistry
+from relay_teams.skills.skill_routing_service import SkillRuntimeService
+from relay_teams.speech import RealtimeSttProxyService, SpeechConfigService
+from relay_teams.tools.registry import ToolRegistry
+from relay_teams.triggers import GitHubTriggerService
+from relay_teams.workspace import SshProfileService, WorkspaceManager, WorkspaceService
+
+
+from relay_teams.agents.orchestration.llm_evaluator import LLMEvaluator
+from relay_teams.roles.role_models import RoleDefinition
+
+
+def get_container(request: Request) -> ServerContainer:
+    return request.app.state.container
+
+
+def get_websocket_container(websocket: WebSocket) -> ServerContainer:
+    return websocket.app.state.container
+
+
+def get_run_service(request: Request) -> SessionRunService:
+    return get_container(request).run_service
+
+
+def get_session_service(request: Request) -> SessionService:
+    return get_container(request).session_service
+
+
+def get_task_service(request: Request) -> TaskOrchestrationService:
+    return get_container(request).task_service
+
+
+def get_llm_evaluator(request: Request) -> object:
+    container = get_container(request)
+    model_config = container.resolve_auxiliary_model_config()
+    model = model_config.model if model_config is not None else "gpt-4o"
+    profile_name = container.resolve_auxiliary_model_profile_name()
+    provider = container.create_provider(
+        RoleDefinition(
+            role_id="llm-evaluator",
+            name="LLM Evaluator",
+            description="LLM evaluator for spec quality assessment",
+            version="1",
+            system_prompt="internal",
+            model_profile=profile_name or "default",
+        ),
+        None,
+    )
+    return LLMEvaluator(provider=provider, model=model)
+
+
+def get_audit_service(request: Request) -> AuditService:
+    return get_container(request).audit_service
+
+
+def get_automation_service(request: Request) -> AutomationService:
+    return get_container(request).automation_service
+
+
+def get_connector_service(request: Request) -> ConnectorService:
+    return get_container(request).connector_service
+
+
+def get_binary_tool_service(request: Request) -> BinaryToolService:
+    return get_container(request).binary_tool_service
+
+
+def get_board_todo_service(request: Request) -> BoardTodoService:
+    return get_container(request).board_todo_service
+
+
+def get_feishu_gateway_service(request: Request) -> FeishuGatewayService:
+    return get_container(request).feishu_gateway_service
+
+
+def get_feishu_trigger_handler(request: Request) -> FeishuTriggerHandler:
+    return get_container(request).feishu_trigger_handler
+
+
+def get_feishu_subscription_service(request: Request) -> FeishuSubscriptionService:
+    return get_container(request).feishu_subscription_service
+
+
+def get_config_status_service(request: Request) -> ConfigStatusService:
+    return get_container(request).config_status_service
+
+
+def get_plugin_registry(request: Request) -> PluginRegistry:
+    return get_container(request).plugin_registry
+
+
+def get_model_config_service(request: Request) -> ModelConfigService:
+    return get_container(request).model_config_service
+
+
+def get_speech_config_service(request: Request) -> SpeechConfigService:
+    return get_container(request).speech_config_service
+
+
+def get_general_config_service(request: Request) -> GeneralConfigService:
+    return get_container(request).general_config_service
+
+
+def get_realtime_stt_proxy_service(request: Request) -> RealtimeSttProxyService:
+    return get_container(request).realtime_stt_proxy_service
+
+
+def get_websocket_realtime_stt_proxy_service(
+    websocket: WebSocket,
+) -> RealtimeSttProxyService:
+    return get_websocket_container(websocket).realtime_stt_proxy_service
+
+
+def get_notification_settings_service(request: Request) -> NotificationSettingsService:
+    return get_container(request).notification_settings_service
+
+
+def get_orchestration_settings_service(
+    request: Request,
+) -> OrchestrationSettingsService:
+    return get_container(request).orchestration_settings_service
+
+
+def get_mcp_config_reload_service(request: Request) -> McpConfigReloadService:
+    return get_container(request).mcp_config_reload_service
+
+
+def get_skills_config_reload_service(request: Request) -> SkillsConfigReloadService:
+    return get_container(request).skills_config_reload_service
+
+
+def get_mcp_service(request: Request) -> McpService:
+    return get_container(request).mcp_service
+
+
+def get_mcp_registry(request: Request) -> McpRegistry:
+    return get_container(request).mcp_registry
+
+
+def get_mcp_discovery_service(request: Request) -> McpDiscoveryService:
+    return get_container(request).mcp_discovery_service
+
+
+def get_runtime_mcp_schema_loader(request: Request) -> RuntimeMcpSchemaLoader:
+    return get_container(request).runtime_mcp_schema_loader
+
+
+def get_proxy_config_service(request: Request) -> ProxyConfigService:
+    return get_container(request).proxy_config_service
+
+
+def get_web_connectivity_probe_service(request: Request) -> WebConnectivityProbeService:
+    return get_container(request).web_connectivity_probe_service
+
+
+def get_github_connectivity_probe_service(
+    request: Request,
+) -> GitHubConnectivityProbeService:
+    return get_container(request).github_connectivity_probe_service
+
+
+def get_github_webhook_connectivity_probe_service(
+    request: Request,
+) -> GitHubWebhookConnectivityProbeService:
+    return get_container(request).github_webhook_connectivity_probe_service
+
+
+def get_clawhub_connectivity_probe_service(
+    request: Request,
+) -> ClawHubConnectivityProbeService:
+    return get_container(request).clawhub_connectivity_probe_service
+
+
+def get_environment_variable_service(request: Request) -> EnvironmentVariableService:
+    return get_container(request).environment_variable_service
+
+
+def get_web_config_service(request: Request) -> WebConfigService:
+    return get_container(request).web_config_service
+
+
+def get_external_agent_config_service(request: Request) -> ExternalAgentConfigService:
+    return get_container(request).external_agent_config_service
+
+
+def get_acp_registry_service(request: Request) -> AcpRegistryService:
+    return get_container(request).acp_registry_service
+
+
+def get_agent_runtime_test_job_service(
+    request: Request,
+) -> AgentRuntimeTestJobService:
+    return get_container(request).agent_runtime_test_job_service
+
+
+def get_clawhub_config_service(request: Request) -> ClawHubConfigService:
+    return get_container(request).clawhub_config_service
+
+
+def get_github_config_service(request: Request) -> GitHubConfigService:
+    return get_container(request).github_config_service
+
+
+def get_localhost_run_tunnel_service(request: Request) -> LocalhostRunTunnelService:
+    return get_container(request).localhost_run_tunnel_service
+
+
+def get_ui_language_settings_service(request: Request) -> UiLanguageSettingsService:
+    return get_container(request).ui_language_settings_service
+
+
+def get_role_registry(request: Request) -> RoleRegistry:
+    return get_container(request).role_registry
+
+
+def get_role_settings_service(request: Request) -> RoleSettingsService:
+    return get_container(request).role_settings_service
+
+
+def get_workspace_service(request: Request) -> WorkspaceService:
+    return get_container(request).workspace_service
+
+
+def get_workspace_manager(request: Request) -> WorkspaceManager:
+    return get_container(request).workspace_manager
+
+
+def get_ssh_profile_service(request: Request) -> SshProfileService:
+    return get_container(request).ssh_profile_service
+
+
+def get_media_asset_service(request: Request) -> MediaAssetService:
+    return get_container(request).media_asset_service
+
+
+def get_tool_registry(request: Request) -> ToolRegistry:
+    return get_container(request).tool_registry
+
+
+def get_skill_registry(request: Request) -> SkillRegistry:
+    return get_container(request).skill_registry
+
+
+def get_command_registry(request: Request) -> CommandRegistry:
+    return get_container(request).command_registry
+
+
+def get_skill_runtime_service(request: Request) -> SkillRuntimeService:
+    return get_container(request).skill_runtime_service
+
+
+def get_clawhub_skill_service(request: Request) -> ClawHubSkillService:
+    return get_container(request).clawhub_skill_service
+
+
+def get_clawhub_skill_market_service(
+    request: Request,
+) -> ClawHubSkillMarketService:
+    return get_container(request).clawhub_skill_market_service
+
+
+def get_metrics_service(request: Request) -> MetricsService:
+    return get_container(request).metrics_service
+
+
+def get_wechat_gateway_service(request: Request) -> WeChatGatewayService:
+    return get_container(request).wechat_gateway_service
+
+
+def get_discord_gateway_service(request: Request) -> DiscordGatewayService:
+    return get_container(request).discord_gateway_service
+
+
+def get_xiaoluban_gateway_service(request: Request) -> XiaolubanGatewayService:
+    return get_container(request).xiaoluban_gateway_service
+
+
+def get_xiaoluban_im_listener_service(
+    request: Request,
+) -> XiaolubanImListenerService:
+    return get_container(request).xiaoluban_im_listener_service
+
+
+def get_github_trigger_service(request: Request) -> GitHubTriggerService:
+    return get_container(request).github_trigger_service
+
+
+def get_hook_service(request: Request) -> HookService:
+    return get_container(request).hook_service
+
+
+def get_spec_artifact_diff_service(request: Request) -> SpecArtifactDiffService:
+    task_repo: TaskRepository = get_container(request).task_service.task_repo
+    return SpecArtifactDiffService(task_repo)
+
+
+def get_artifact_query_service(request: Request) -> ArtifactQueryService:
+    return ArtifactQueryService(get_container(request).artifact_repo)
+
+
+def get_memory_bank_service(request: Request) -> MemoryBankService:
+    return get_container(request).memory_bank_service
+
+
+def get_memory_evolution_service(request: Request) -> MemoryEvolutionService:
+    return get_container(request).memory_evolution_service
+
+
+def get_memory_skill_synthesis_service(
+    request: Request,
+) -> MemorySkillSynthesisService:
+    return get_container(request).memory_skill_synthesis_service

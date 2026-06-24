@@ -1,9 +1,15 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from agent_teams.providers.provider_contracts import EchoProvider
-from agent_teams.providers.model_config import ModelEndpointConfig, ProviderType
-from agent_teams.providers.provider_registry import (
+from relay_teams.providers.provider_contracts import EchoProvider
+from relay_teams.providers.model_config import (
+    CodeAgentAuthConfig,
+    DEFAULT_MAAS_BASE_URL,
+    MaaSAuthConfig,
+    ModelEndpointConfig,
+    ProviderType,
+)
+from relay_teams.providers.provider_registry import (
     ProviderRegistry,
     create_default_provider_registry,
     list_provider_models,
@@ -35,7 +41,7 @@ def test_create_default_provider_registry_has_bigmodel_support() -> None:
         ModelEndpointConfig(
             provider=ProviderType.BIGMODEL,
             model="glm-4.5",
-            base_url="https://open.bigmodel.cn/api/paas/v4",
+            base_url="https://open.bigmodel.cn/api/coding/paas/v4",
             api_key="unused",
         )
     )
@@ -53,6 +59,23 @@ def test_create_default_provider_registry_has_minimax_support() -> None:
             provider=ProviderType.MINIMAX,
             model="MiniMax-M1-80k",
             base_url="https://api.minimaxi.com/v1",
+            api_key="unused",
+        )
+    )
+
+    assert isinstance(provider, EchoProvider)
+
+
+def test_create_default_provider_registry_has_anthropic_support() -> None:
+    registry = create_default_provider_registry(
+        openai_compatible_builder=lambda _config: EchoProvider()
+    )
+
+    provider = registry.create(
+        ModelEndpointConfig(
+            provider=ProviderType.ANTHROPIC,
+            model="MiniMax-M2.7",
+            base_url="https://api.minimax.io/anthropic/v1",
             api_key="unused",
         )
     )
@@ -114,3 +137,40 @@ def test_model_endpoint_config_normalizes_string_fields() -> None:
     assert config.model == "gpt-4o-mini"
     assert config.base_url == "https://openai-compatible.local/v1"
     assert config.api_key == "key-openai"
+
+
+def test_create_default_provider_registry_has_maas_support() -> None:
+    registry = create_default_provider_registry(
+        openai_compatible_builder=lambda _config: EchoProvider()
+    )
+
+    config = ModelEndpointConfig(
+        provider=ProviderType.MAAS,
+        model="maas-chat",
+        base_url="https://maas.example/api/v2",
+        maas_auth=MaaSAuthConfig(
+            username="relay-user",
+            password="relay-password",
+        ),
+    )
+    provider = registry.create(config)
+
+    assert isinstance(provider, EchoProvider)
+    assert config.base_url == DEFAULT_MAAS_BASE_URL
+
+
+def test_create_default_provider_registry_has_codeagent_support() -> None:
+    registry = create_default_provider_registry(
+        openai_compatible_builder=lambda _config: EchoProvider()
+    )
+
+    provider = registry.create(
+        ModelEndpointConfig(
+            provider=ProviderType.CODEAGENT,
+            model="codeagent-chat",
+            base_url="https://codeagent.example/codeAgentPro",
+            codeagent_auth=CodeAgentAuthConfig(refresh_token="codeagent-refresh-token"),
+        )
+    )
+
+    assert isinstance(provider, EchoProvider)

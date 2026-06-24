@@ -4,6 +4,7 @@
  */
 export {
     renderMessageBlock,
+    shouldRenderMessageRoleLabel,
     renderParts,
     labelFromRole,
     scrollBottom,
@@ -13,17 +14,30 @@ export {
     updateMessageText,
     updateThinkingText,
     syncStreamingCursor,
+    clearThinkingOpenState,
+    clearThinkingOpenStateForRun,
 } from './helpers/block.js';
 
 export {
+    renderRichContent,
+    appendStructuredContentPart,
+} from './helpers/content.js';
+
+export {
     buildToolBlock,
+    buildPendingToolBlock,
     findToolBlock,
     setToolValidationFailureState,
     applyToolReturn,
+    setToolStatus,
     indexPendingToolBlock,
     resolvePendingToolBlock,
     findToolBlockInContainer,
 } from './helpers/toolBlocks.js';
+
+export {
+    isToolResultError,
+} from './helpers/toolResultStatus.js';
 
 export {
     decoratePendingApprovalBlock,

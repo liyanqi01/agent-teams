@@ -5,14 +5,28 @@
 import { fetchObservabilityBreakdowns, fetchObservabilityOverview } from '../core/api.js';
 import { state } from '../core/state.js';
 import { hideProjectView } from './projectView.js';
+import { clearNewSessionDraft } from './newSessionDraft.js';
 import { getCurrentLanguage, t } from '../utils/i18n.js';
 import { sysLog } from '../utils/logger.js';
 
 let currentScope = 'global';
 const chartInstances = new Map();
-const CHART_LABEL_COLOR = '#cbd5e1';
-const CHART_MUTED_COLOR = '#94a3b8';
-const CHART_GRID_COLOR = 'rgba(148, 163, 184, 0.14)';
+const OBSERVABILITY_CHART_COLORS = Object.freeze({
+    primary: [145, 166, 152],
+    success: [118, 161, 123],
+    warning: [184, 154, 102],
+    danger: [194, 123, 114],
+});
+const OBSERVABILITY_BREAKDOWN_PALETTE = Object.freeze([
+    OBSERVABILITY_CHART_COLORS.primary,
+    OBSERVABILITY_CHART_COLORS.success,
+    OBSERVABILITY_CHART_COLORS.warning,
+]);
+const DEFAULT_CHART_THEME = Object.freeze({
+    labelColor: '#f0eee8',
+    mutedColor: '#a5aaa6',
+    gridColor: 'rgba(165, 170, 166, 0.18)',
+});
 
 export function initializeObservability() {
     const button = document.getElementById('observability-btn');
@@ -129,6 +143,9 @@ function renderOverview(payload, breakdownPayload, safeScope) {
     const kpis = payload?.kpis || {};
     const trends = Array.isArray(payload?.trends) ? payload.trends : [];
     const rows = Array.isArray(breakdownPayload?.rows) ? breakdownPayload.rows : [];
+    const gatewayRows = Array.isArray(breakdownPayload?.gateway_rows)
+        ? breakdownPayload.gateway_rows
+        : [];
 
     host.innerHTML = `
         <section class="observability-summary-card">
@@ -142,16 +159,39 @@ function renderOverview(payload, breakdownPayload, safeScope) {
         <section class="observability-metric-grid">
             ${buildMetricChartCard('observability-metric-steps-chart', t('observability.kpi.steps'), formatNumber(kpis.steps), t('observability.metric.note.steps'))}
             ${buildMetricChartCard('observability-metric-input-chart', t('observability.kpi.input_tokens'), formatCompactNumber(kpis.input_tokens), t('observability.metric.note.input_tokens'))}
+            ${buildMetricChartCard('observability-metric-cached-input-chart', t('observability.kpi.cached_input_tokens'), formatCompactNumber(kpis.cached_input_tokens), t('observability.metric.note.cached_input_tokens'))}
+            ${buildMetricChartCard('observability-metric-uncached-input-chart', t('observability.kpi.uncached_input_tokens'), formatCompactNumber(kpis.uncached_input_tokens), t('observability.metric.note.uncached_input_tokens'))}
             ${buildMetricChartCard('observability-metric-output-chart', t('observability.kpi.output_tokens'), formatCompactNumber(kpis.output_tokens), t('observability.metric.note.output_tokens'))}
             ${buildMetricChartCard('observability-metric-tool-calls-chart', t('observability.kpi.tool_calls'), formatNumber(kpis.tool_calls), t('observability.metric.note.tool_calls'))}
             ${buildMetricChartCard('observability-metric-cached-chart', t('observability.kpi.cached_ratio'), formatPercent(kpis.cached_token_ratio), t('observability.metric.note.cached_ratio'))}
             ${buildMetricChartCard('observability-metric-success-chart', t('observability.kpi.tool_success'), formatPercent(kpis.tool_success_rate), t('observability.metric.note.tool_success'))}
             ${buildMetricChartCard('observability-metric-duration-chart', t('observability.kpi.avg_tool_ms'), formatNumber(kpis.tool_avg_duration_ms), t('observability.metric.note.avg_duration'))}
+            ${buildMetricChartCard('observability-metric-retrieval-searches-chart', t('observability.kpi.retrieval_searches'), formatNumber(kpis.retrieval_searches), t('observability.metric.note.retrieval_searches'))}
+            ${buildMetricChartCard('observability-metric-retrieval-failures-chart', t('observability.kpi.retrieval_failure_rate'), formatPercent(kpis.retrieval_failure_rate), t('observability.metric.note.retrieval_failure_rate'))}
+            ${buildMetricChartCard('observability-metric-retrieval-duration-chart', t('observability.kpi.avg_retrieval_ms'), formatNumber(kpis.retrieval_avg_duration_ms), t('observability.metric.note.avg_retrieval_ms'))}
+            ${buildMetricChartCard('observability-metric-retrieval-documents-chart', t('observability.kpi.retrieval_document_count'), formatNumber(kpis.retrieval_document_count), t('observability.metric.note.retrieval_document_count'))}
             ${buildMetricChartCard('observability-metric-integrations-chart', `${t('observability.kpi.skill_calls')} / ${t('observability.kpi.mcp_calls')}`, `${formatNumber(kpis.skill_calls)} / ${formatNumber(kpis.mcp_calls)}`, `${t('observability.source.skill')} + ${t('observability.source.mcp')}`)}
+        </section>
+        <section class="observability-section-card observability-section-stack-card" data-observability-section="gateway-signals">
+            <div class="observability-section-heading">
+                <div>
+                    <h4>${escapeHtml(t('observability.section.gateway_signals'))}</h4>
+                    <p>${escapeHtml(t('observability.section.gateway_signals_copy'))}</p>
+                </div>
+            </div>
+            <div class="observability-metric-grid">
+                ${buildMetricChartCard('observability-metric-gateway-calls-chart', t('observability.kpi.gateway_calls'), formatNumber(kpis.gateway_calls), t('observability.metric.note.gateway_calls'), 'gateway_calls')}
+                ${buildMetricChartCard('observability-metric-gateway-failure-rate-chart', t('observability.kpi.gateway_failure_rate'), formatPercent(kpis.gateway_failure_rate), t('observability.metric.note.gateway_failure_rate'), 'gateway_failure_rate')}
+                ${buildMetricChartCard('observability-metric-gateway-duration-chart', t('observability.kpi.gateway_avg_duration_ms'), formatNumber(kpis.gateway_avg_duration_ms), t('observability.metric.note.gateway_avg_duration_ms'), 'gateway_avg_duration_ms')}
+                ${buildMetricChartCard('observability-metric-gateway-prompt-start-chart', t('observability.kpi.gateway_prompt_avg_start_ms'), formatNumber(kpis.gateway_prompt_avg_start_ms), t('observability.metric.note.gateway_prompt_avg_start_ms'), 'gateway_prompt_avg_start_ms')}
+                ${buildMetricChartCard('observability-metric-gateway-first-update-chart', t('observability.kpi.gateway_prompt_avg_first_update_ms'), formatNumber(kpis.gateway_prompt_avg_first_update_ms), t('observability.metric.note.gateway_prompt_avg_first_update_ms'), 'gateway_prompt_avg_first_update_ms')}
+                ${buildMetricChartCard('observability-metric-gateway-mcp-calls-chart', t('observability.kpi.gateway_mcp_calls'), formatNumber(kpis.gateway_mcp_calls), t('observability.metric.note.gateway_mcp_calls'), 'gateway_mcp_calls')}
+                ${buildMetricChartCard('observability-metric-gateway-cold-starts-chart', t('observability.kpi.gateway_cold_start_calls'), formatNumber(kpis.gateway_cold_start_calls), t('observability.metric.note.gateway_cold_start_calls'), 'gateway_cold_start_calls')}
+            </div>
         </section>
     `;
 
-    renderMetricCharts({ kpis, trends, rows, safeScope });
+    renderMetricCharts({ kpis, trends, rows, gatewayRows, safeScope });
 
     trendsHost.innerHTML = `
         <section class="observability-section-card">
@@ -183,33 +223,79 @@ function renderBreakdowns(payload, overview) {
     }
 
     const rows = Array.isArray(payload?.rows) ? payload.rows.slice(0, 8) : [];
+    const roleRows = Array.isArray(payload?.role_rows) ? payload.role_rows.slice(0, 8) : [];
+    const gatewayRows = Array.isArray(payload?.gateway_rows)
+        ? payload.gateway_rows.slice(0, 8)
+        : [];
     host.innerHTML = `
-        <section class="observability-section-card">
-            <div class="observability-section-heading">
-                <div>
-                    <h4>${escapeHtml(t('observability.section.breakdowns'))}</h4>
-                    <p>${escapeHtml(t('observability.section.breakdowns_copy'))}</p>
+        <div class="observability-section-stack">
+            <section class="observability-section-card">
+                <div class="observability-section-heading">
+                    <div>
+                        <h4>${escapeHtml(t('observability.section.breakdowns'))}</h4>
+                        <p>${escapeHtml(t('observability.section.breakdowns_copy'))}</p>
+                    </div>
                 </div>
-            </div>
-            ${rows.length === 0 ? `<div class="observability-empty">${escapeHtml(t('observability.breakdowns.empty'))}</div>` : `
-                <div class="observability-breakdown-grid">
-                    ${buildChartCard('observability-breakdown-calls-chart', t('observability.breakdowns.chart_title'), resolveUpdatedAtCopy(overview?.updated_at), 'observability-breakdown-stage')}
-                    ${buildChartCard('observability-breakdown-success-chart', t('observability.breakdowns.success_chart_title'), resolveUpdatedAtCopy(overview?.updated_at), 'observability-breakdown-stage')}
-                    ${buildChartCard('observability-breakdown-duration-chart', t('observability.breakdowns.duration_chart_title'), resolveUpdatedAtCopy(overview?.updated_at), 'observability-breakdown-stage')}
-                    ${buildChartCard('observability-breakdown-source-chart', t('observability.breakdowns.source_chart_title'), resolveUpdatedAtCopy(overview?.updated_at), 'observability-breakdown-stage')}
+                ${rows.length === 0 ? `<div class="observability-empty">${escapeHtml(t('observability.breakdowns.empty'))}</div>` : `
+                    <div class="observability-breakdown-grid">
+                        ${buildChartCard('observability-breakdown-calls-chart', t('observability.breakdowns.chart_title'), resolveUpdatedAtCopy(overview?.updated_at), 'observability-breakdown-stage')}
+                        ${buildChartCard('observability-breakdown-success-chart', t('observability.breakdowns.success_chart_title'), resolveUpdatedAtCopy(overview?.updated_at), 'observability-breakdown-stage')}
+                        ${buildChartCard('observability-breakdown-duration-chart', t('observability.breakdowns.duration_chart_title'), resolveUpdatedAtCopy(overview?.updated_at), 'observability-breakdown-stage')}
+                        ${buildChartCard('observability-breakdown-source-chart', t('observability.breakdowns.source_chart_title'), resolveUpdatedAtCopy(overview?.updated_at), 'observability-breakdown-stage')}
+                    </div>
+                `}
+            </section>
+            <section class="observability-section-card">
+                <div class="observability-section-heading">
+                    <div>
+                        <h4>${escapeHtml(t('observability.section.role_breakdowns'))}</h4>
+                        <p>${escapeHtml(t('observability.section.role_breakdowns_copy'))}</p>
+                    </div>
                 </div>
-            `}
-        </section>
+                ${roleRows.length === 0 ? `<div class="observability-empty">${escapeHtml(t('observability.role_breakdowns.empty'))}</div>` : `
+                    <div class="observability-breakdown-grid">
+                        ${buildChartCard('observability-role-breakdown-input-chart', t('observability.role_breakdowns.input_chart_title'), resolveUpdatedAtCopy(overview?.updated_at), 'observability-breakdown-stage')}
+                        ${buildChartCard('observability-role-breakdown-cache-chart', t('observability.role_breakdowns.cache_chart_title'), resolveUpdatedAtCopy(overview?.updated_at), 'observability-breakdown-stage')}
+                        ${buildChartCard('observability-role-breakdown-failures-chart', t('observability.role_breakdowns.failures_chart_title'), resolveUpdatedAtCopy(overview?.updated_at), 'observability-breakdown-stage')}
+                    </div>
+                `}
+            </section>
+            <section class="observability-section-card" data-observability-section="gateway-breakdowns">
+                <div class="observability-section-heading">
+                    <div>
+                        <h4>${escapeHtml(t('observability.section.gateway_breakdowns'))}</h4>
+                        <p>${escapeHtml(t('observability.section.gateway_breakdowns_copy'))}</p>
+                    </div>
+                </div>
+                ${gatewayRows.length === 0 ? `<div class="observability-empty">${escapeHtml(t('observability.gateway_breakdowns.empty'))}</div>` : `
+                    <div class="observability-breakdown-grid">
+                        ${buildChartCard('observability-gateway-breakdown-calls-chart', t('observability.gateway_breakdowns.chart_title'), resolveUpdatedAtCopy(overview?.updated_at), 'observability-breakdown-stage', 'gateway-breakdown-calls')}
+                        ${buildChartCard('observability-gateway-breakdown-success-chart', t('observability.gateway_breakdowns.success_chart_title'), resolveUpdatedAtCopy(overview?.updated_at), 'observability-breakdown-stage', 'gateway-breakdown-success')}
+                        ${buildChartCard('observability-gateway-breakdown-duration-chart', t('observability.gateway_breakdowns.duration_chart_title'), resolveUpdatedAtCopy(overview?.updated_at), 'observability-breakdown-stage', 'gateway-breakdown-duration')}
+                        ${buildChartCard('observability-gateway-breakdown-cold-start-chart', t('observability.gateway_breakdowns.cold_start_chart_title'), resolveUpdatedAtCopy(overview?.updated_at), 'observability-breakdown-stage', 'gateway-breakdown-cold-starts')}
+                    </div>
+                `}
+            </section>
+        </div>
     `;
 
     if (rows.length > 0) {
         renderBreakdownCharts(rows);
     }
+    if (roleRows.length > 0) {
+        renderRoleBreakdownCharts(roleRows);
+    }
+    if (gatewayRows.length > 0) {
+        renderGatewayBreakdownCharts(gatewayRows);
+    }
 }
 
-function buildChartCard(id, title, axisLabel, stageClass = '') {
+function buildChartCard(id, title, axisLabel, stageClass = '', chartKey = '') {
+    const chartAttr = chartKey
+        ? ` data-observability-chart="${escapeHtml(chartKey)}"`
+        : '';
     return `
-        <article class="observability-chart-card">
+        <article class="observability-chart-card"${chartAttr}>
             <div class="observability-chart-header">
                 <h5>${escapeHtml(title)}</h5>
                 <div class="observability-chart-axis">${escapeHtml(axisLabel)}</div>
@@ -221,9 +307,12 @@ function buildChartCard(id, title, axisLabel, stageClass = '') {
     `;
 }
 
-function buildMetricChartCard(id, title, value, note) {
+function buildMetricChartCard(id, title, value, note, metricKey = '') {
+    const metricAttr = metricKey
+        ? ` data-observability-metric="${escapeHtml(metricKey)}"`
+        : '';
     return `
-        <article class="observability-chart-card observability-metric-chart-card">
+        <article class="observability-chart-card observability-metric-chart-card"${metricAttr}>
             <div class="observability-chart-header observability-metric-chart-header">
                 <div>
                     <h5>${escapeHtml(title)}</h5>
@@ -238,17 +327,30 @@ function buildMetricChartCard(id, title, value, note) {
     `;
 }
 
-function renderMetricCharts({ kpis, trends, rows, safeScope }) {
+function renderMetricCharts({ kpis, trends, rows, gatewayRows, safeScope }) {
     const ChartCtor = getChartConstructor();
     const ids = [
         'observability-metric-steps-chart',
         'observability-metric-input-chart',
+        'observability-metric-cached-input-chart',
+        'observability-metric-uncached-input-chart',
         'observability-metric-output-chart',
         'observability-metric-tool-calls-chart',
         'observability-metric-cached-chart',
         'observability-metric-success-chart',
         'observability-metric-duration-chart',
+        'observability-metric-retrieval-searches-chart',
+        'observability-metric-retrieval-failures-chart',
+        'observability-metric-retrieval-duration-chart',
+        'observability-metric-retrieval-documents-chart',
         'observability-metric-integrations-chart',
+        'observability-metric-gateway-calls-chart',
+        'observability-metric-gateway-failure-rate-chart',
+        'observability-metric-gateway-duration-chart',
+        'observability-metric-gateway-prompt-start-chart',
+        'observability-metric-gateway-first-update-chart',
+        'observability-metric-gateway-mcp-calls-chart',
+        'observability-metric-gateway-cold-starts-chart',
     ];
     if (!ChartCtor) {
         showChartUnavailable(ids);
@@ -264,11 +366,27 @@ function renderMetricCharts({ kpis, trends, rows, safeScope }) {
         ...rows.map(row => Number(row.avg_duration_ms || 0)),
         1000,
     );
+    const retrievalDurationMax = Math.max(Number(kpis.retrieval_avg_duration_ms || 0), 1000);
+    const gatewayDurationMax = Math.max(
+        Number(kpis.gateway_avg_duration_ms || 0),
+        Number(kpis.gateway_prompt_avg_start_ms || 0),
+        Number(kpis.gateway_prompt_avg_first_update_ms || 0),
+        ...gatewayRows.map(row => Number(row.avg_duration_ms || 0)),
+        1000,
+    );
+    const gatewayCountMax = Math.max(
+        Number(kpis.gateway_calls || 0),
+        Number(kpis.gateway_mcp_calls || 0),
+        Number(kpis.gateway_cold_start_calls || 0),
+        ...gatewayRows.map(row => Number(row.calls || 0)),
+        ...gatewayRows.map(row => Number(row.cold_start_calls || 0)),
+        1,
+    );
 
     createSeriesMetricChart('observability-metric-steps-chart', {
         labels: trendLabels,
         values: trends.map(row => Number(row.steps || 0)),
-        color: [37, 99, 235],
+        color: chartColor('primary'),
         type: 'line',
         label: t('observability.kpi.steps'),
         scopeLabel,
@@ -278,17 +396,35 @@ function renderMetricCharts({ kpis, trends, rows, safeScope }) {
     createSeriesMetricChart('observability-metric-input-chart', {
         labels: trendLabels,
         values: trends.map(row => Number(row.input_tokens || 0)),
-        color: [13, 148, 136],
+        color: chartColor('primary'),
         type: 'line',
         label: t('observability.kpi.input_tokens'),
         scopeLabel,
         yTitle: t('observability.kpi.input_tokens'),
         fallbackValue: Number(kpis.input_tokens || 0),
     });
+    createChart('observability-metric-cached-input-chart', buildSingleMetricBarChartConfig({
+        label: t('observability.kpi.cached_input_tokens'),
+        categoryLabel: scopeLabel,
+        value: Number(kpis.cached_input_tokens || 0),
+        color: chartColor('primary'),
+        xTitle: resolveScopeAxisTitle(),
+        yTitle: t('observability.kpi.cached_input_tokens'),
+        tickMode: 'compact',
+    }));
+    createChart('observability-metric-uncached-input-chart', buildSingleMetricBarChartConfig({
+        label: t('observability.kpi.uncached_input_tokens'),
+        categoryLabel: scopeLabel,
+        value: Number(kpis.uncached_input_tokens || 0),
+        color: chartColor('warning'),
+        xTitle: resolveScopeAxisTitle(),
+        yTitle: t('observability.kpi.uncached_input_tokens'),
+        tickMode: 'compact',
+    }));
     createSeriesMetricChart('observability-metric-output-chart', {
         labels: trendLabels,
         values: trends.map(row => Number(row.output_tokens || 0)),
-        color: [217, 119, 6],
+        color: chartColor('warning'),
         type: 'line',
         label: t('observability.kpi.output_tokens'),
         scopeLabel,
@@ -298,7 +434,7 @@ function renderMetricCharts({ kpis, trends, rows, safeScope }) {
     createSeriesMetricChart('observability-metric-tool-calls-chart', {
         labels: trendLabels,
         values: trends.map(row => Number(row.tool_calls || 0)),
-        color: [124, 58, 237],
+        color: chartColor('primary'),
         type: 'bar',
         label: t('observability.kpi.tool_calls'),
         scopeLabel,
@@ -309,7 +445,7 @@ function renderMetricCharts({ kpis, trends, rows, safeScope }) {
         label: t('observability.kpi.cached_ratio'),
         categoryLabel: scopeLabel,
         value: Number(kpis.cached_token_ratio || 0) * 100,
-        color: [124, 58, 237],
+        color: chartColor('primary'),
         xTitle: resolveScopeAxisTitle(),
         yTitle: resolvePercentageAxisTitle(),
         maxValue: 100,
@@ -319,7 +455,7 @@ function renderMetricCharts({ kpis, trends, rows, safeScope }) {
         label: t('observability.kpi.tool_success'),
         categoryLabel: scopeLabel,
         value: Number(kpis.tool_success_rate || 0) * 100,
-        color: [22, 163, 74],
+        color: chartColor('success'),
         xTitle: resolveScopeAxisTitle(),
         yTitle: resolvePercentageAxisTitle(),
         maxValue: 100,
@@ -329,19 +465,127 @@ function renderMetricCharts({ kpis, trends, rows, safeScope }) {
         label: t('observability.kpi.avg_tool_ms'),
         categoryLabel: scopeLabel,
         value: Number(kpis.tool_avg_duration_ms || 0),
-        color: [225, 29, 72],
+        color: chartColor('warning'),
         xTitle: resolveScopeAxisTitle(),
         yTitle: resolveDurationAxisTitle(),
         maxValue: durationMax,
         tickMode: 'number',
     }));
+    createChart('observability-metric-retrieval-searches-chart', buildSingleMetricBarChartConfig({
+        label: t('observability.kpi.retrieval_searches'),
+        categoryLabel: scopeLabel,
+        value: Number(kpis.retrieval_searches || 0),
+        color: chartColor('primary'),
+        xTitle: resolveScopeAxisTitle(),
+        yTitle: t('observability.kpi.retrieval_searches'),
+        tickMode: 'compact',
+    }));
+    createChart('observability-metric-retrieval-failures-chart', buildSingleMetricBarChartConfig({
+        label: t('observability.kpi.retrieval_failure_rate'),
+        categoryLabel: scopeLabel,
+        value: Number(kpis.retrieval_failure_rate || 0) * 100,
+        color: chartColor('danger'),
+        xTitle: resolveScopeAxisTitle(),
+        yTitle: t('observability.kpi.retrieval_failure_rate'),
+        maxValue: 100,
+        tickMode: 'percentage',
+    }));
+    createChart('observability-metric-retrieval-duration-chart', buildSingleMetricBarChartConfig({
+        label: t('observability.kpi.avg_retrieval_ms'),
+        categoryLabel: scopeLabel,
+        value: Number(kpis.retrieval_avg_duration_ms || 0),
+        color: chartColor('warning'),
+        xTitle: resolveScopeAxisTitle(),
+        yTitle: t('observability.kpi.avg_retrieval_ms'),
+        maxValue: retrievalDurationMax,
+        tickMode: 'number',
+    }));
+    createChart('observability-metric-retrieval-documents-chart', buildSingleMetricBarChartConfig({
+        label: t('observability.kpi.retrieval_document_count'),
+        categoryLabel: scopeLabel,
+        value: Number(kpis.retrieval_document_count || 0),
+        color: chartColor('success'),
+        xTitle: resolveScopeAxisTitle(),
+        yTitle: t('observability.kpi.retrieval_document_count'),
+        tickMode: 'compact',
+    }));
     createChart('observability-metric-integrations-chart', buildGroupedMetricBarChartConfig({
         labels: [t('observability.kpi.skill_calls'), t('observability.kpi.mcp_calls')],
         values: [Number(kpis.skill_calls || 0), Number(kpis.mcp_calls || 0)],
-        colors: [[8, 145, 178], [79, 70, 229]],
+        colors: [chartColor('primary'), chartColor('success')],
         datasetLabel: `${t('observability.kpi.skill_calls')} / ${t('observability.kpi.mcp_calls')}`,
         xTitle: resolveSourceAxisTitle(),
         yTitle: resolveCallsAxisTitle(),
+    }));
+    createChart('observability-metric-gateway-calls-chart', buildSingleMetricBarChartConfig({
+        label: t('observability.kpi.gateway_calls'),
+        categoryLabel: scopeLabel,
+        value: Number(kpis.gateway_calls || 0),
+        color: chartColor('primary'),
+        xTitle: resolveScopeAxisTitle(),
+        yTitle: t('observability.kpi.gateway_calls'),
+        tickMode: 'compact',
+        maxValue: gatewayCountMax,
+    }));
+    createChart('observability-metric-gateway-failure-rate-chart', buildSingleMetricBarChartConfig({
+        label: t('observability.kpi.gateway_failure_rate'),
+        categoryLabel: scopeLabel,
+        value: Number(kpis.gateway_failure_rate || 0) * 100,
+        color: chartColor('danger'),
+        xTitle: resolveScopeAxisTitle(),
+        yTitle: resolvePercentageAxisTitle(),
+        tickMode: 'percentage',
+        maxValue: 100,
+    }));
+    createChart('observability-metric-gateway-duration-chart', buildSingleMetricBarChartConfig({
+        label: t('observability.kpi.gateway_avg_duration_ms'),
+        categoryLabel: scopeLabel,
+        value: Number(kpis.gateway_avg_duration_ms || 0),
+        color: chartColor('warning'),
+        xTitle: resolveScopeAxisTitle(),
+        yTitle: resolveDurationAxisTitle(),
+        tickMode: 'number',
+        maxValue: gatewayDurationMax,
+    }));
+    createChart('observability-metric-gateway-prompt-start-chart', buildSingleMetricBarChartConfig({
+        label: t('observability.kpi.gateway_prompt_avg_start_ms'),
+        categoryLabel: scopeLabel,
+        value: Number(kpis.gateway_prompt_avg_start_ms || 0),
+        color: chartColor('primary'),
+        xTitle: resolveScopeAxisTitle(),
+        yTitle: resolveDurationAxisTitle(),
+        tickMode: 'number',
+        maxValue: gatewayDurationMax,
+    }));
+    createChart('observability-metric-gateway-first-update-chart', buildSingleMetricBarChartConfig({
+        label: t('observability.kpi.gateway_prompt_avg_first_update_ms'),
+        categoryLabel: scopeLabel,
+        value: Number(kpis.gateway_prompt_avg_first_update_ms || 0),
+        color: chartColor('primary'),
+        xTitle: resolveScopeAxisTitle(),
+        yTitle: resolveDurationAxisTitle(),
+        tickMode: 'number',
+        maxValue: gatewayDurationMax,
+    }));
+    createChart('observability-metric-gateway-mcp-calls-chart', buildSingleMetricBarChartConfig({
+        label: t('observability.kpi.gateway_mcp_calls'),
+        categoryLabel: scopeLabel,
+        value: Number(kpis.gateway_mcp_calls || 0),
+        color: chartColor('success'),
+        xTitle: resolveScopeAxisTitle(),
+        yTitle: t('observability.kpi.gateway_mcp_calls'),
+        tickMode: 'compact',
+        maxValue: gatewayCountMax,
+    }));
+    createChart('observability-metric-gateway-cold-starts-chart', buildSingleMetricBarChartConfig({
+        label: t('observability.kpi.gateway_cold_start_calls'),
+        categoryLabel: scopeLabel,
+        value: Number(kpis.gateway_cold_start_calls || 0),
+        color: chartColor('warning'),
+        xTitle: resolveScopeAxisTitle(),
+        yTitle: t('observability.kpi.gateway_cold_start_calls'),
+        tickMode: 'compact',
+        maxValue: gatewayCountMax,
     }));
 }
 function renderTrendCharts(trends) {
@@ -359,19 +603,19 @@ function renderTrendCharts(trends) {
     const labels = trends.map(row => formatBucketLabel(row.bucket_start));
     createChart('observability-steps-chart', buildLineChartConfig({
         labels,
-        datasets: [buildLineDataset(t('observability.legend.steps'), trends.map(row => Number(row.steps || 0)), [37, 99, 235])],
+        datasets: [buildLineDataset(t('observability.legend.steps'), trends.map(row => Number(row.steps || 0)), chartColor('primary'))],
         xTitle: resolveTimeAxisTitle(),
         yTitle: t('observability.kpi.steps'),
     }));
     createChart('observability-input-chart', buildLineChartConfig({
         labels,
-        datasets: [buildLineDataset(t('observability.legend.input_tokens'), trends.map(row => Number(row.input_tokens || 0)), [13, 148, 136])],
+        datasets: [buildLineDataset(t('observability.legend.input_tokens'), trends.map(row => Number(row.input_tokens || 0)), chartColor('primary'))],
         xTitle: resolveTimeAxisTitle(),
         yTitle: t('observability.kpi.input_tokens'),
     }));
     createChart('observability-output-chart', buildLineChartConfig({
         labels,
-        datasets: [buildLineDataset(t('observability.legend.output_tokens'), trends.map(row => Number(row.output_tokens || 0)), [217, 119, 6])],
+        datasets: [buildLineDataset(t('observability.legend.output_tokens'), trends.map(row => Number(row.output_tokens || 0)), chartColor('warning'))],
         xTitle: resolveTimeAxisTitle(),
         yTitle: t('observability.kpi.output_tokens'),
     }));
@@ -380,8 +624,8 @@ function renderTrendCharts(trends) {
         datasets: [{
             label: t('observability.legend.tool_calls'),
             data: trends.map(row => Number(row.tool_calls || 0)),
-            backgroundColor: 'rgba(124, 58, 237, 0.84)',
-            hoverBackgroundColor: 'rgba(139, 92, 246, 0.96)',
+            backgroundColor: toRgba(chartColor('primary'), 0.84),
+            hoverBackgroundColor: toRgba(chartColor('primary'), 0.96),
             borderRadius: 8,
             maxBarThickness: 28,
         }],
@@ -440,10 +684,115 @@ function renderBreakdownCharts(rows) {
             return accumulator;
         }, []),
         values: buildSourceValues(rows),
-        colors: [[37, 99, 235], [8, 145, 178], [124, 58, 237]],
+        colors: [chartColor('primary'), chartColor('success'), chartColor('warning')],
         datasetLabel: t('observability.breakdowns.source_chart_title'),
         xTitle: resolveSourceAxisTitle(),
         yTitle: resolveCallsAxisTitle(),
+    }));
+}
+
+function renderRoleBreakdownCharts(rows) {
+    const ChartCtor = getChartConstructor();
+    if (!ChartCtor) {
+        showChartUnavailable([
+            'observability-role-breakdown-input-chart',
+            'observability-role-breakdown-cache-chart',
+            'observability-role-breakdown-failures-chart',
+        ]);
+        return;
+    }
+
+    const labels = rows.map(row => resolveRoleLabel(row.role_id));
+    createChart('observability-role-breakdown-input-chart', buildHorizontalBarChartConfig({
+        labels,
+        values: rows.map(row => Number(row.input_tokens || 0)),
+        seriesLabel: t('observability.kpi.input_tokens'),
+        colorValues: rows.map((_, index) => pickPalette(index, 0.88)),
+        xTitle: t('observability.kpi.input_tokens'),
+        yTitle: resolveRoleAxisTitle(),
+        tickMode: 'compact',
+    }));
+    createChart('observability-role-breakdown-cache-chart', buildHorizontalBarChartConfig({
+        labels,
+        values: rows.map(row => Number(row.cached_token_ratio || 0) * 100),
+        seriesLabel: t('observability.kpi.cached_ratio'),
+        colorValues: rows.map((_, index) => pickPalette(index + 2, 0.84)),
+        xTitle: resolvePercentageAxisTitle(),
+        yTitle: resolveRoleAxisTitle(),
+        tickMode: 'percentage',
+        maxValue: 100,
+    }));
+    createChart('observability-role-breakdown-failures-chart', buildHorizontalBarChartConfig({
+        labels,
+        values: rows.map(row => Number(row.tool_failures || 0)),
+        seriesLabel: t('observability.metric.failures'),
+        colorValues: rows.map((_, index) => pickPalette(index + 4, 0.84)),
+        xTitle: t('observability.metric.failures'),
+        yTitle: resolveRoleAxisTitle(),
+        tickMode: 'compact',
+    }));
+}
+
+function renderGatewayBreakdownCharts(rows) {
+    const ChartCtor = getChartConstructor();
+    if (!ChartCtor) {
+        showChartUnavailable([
+            'observability-gateway-breakdown-calls-chart',
+            'observability-gateway-breakdown-success-chart',
+            'observability-gateway-breakdown-duration-chart',
+            'observability-gateway-breakdown-cold-start-chart',
+        ]);
+        return;
+    }
+
+    const labels = rows.map(row => resolveGatewayBreakdownLabel(row));
+    const gatewayDurationMax = Math.max(
+        ...rows.map(row => Number(row.avg_duration_ms || 0)),
+        1000,
+    );
+    const coldStartMax = Math.max(
+        ...rows.map(row => Number(row.cold_start_calls || 0)),
+        1,
+    );
+
+    createChart('observability-gateway-breakdown-calls-chart', buildHorizontalBarChartConfig({
+        labels,
+        values: rows.map(row => Number(row.calls || 0)),
+        seriesLabel: t('observability.metric.calls'),
+        colorValues: rows.map((_, index) => pickPalette(index, 0.88)),
+        xTitle: resolveCallsAxisTitle(),
+        yTitle: resolveGatewayAxisTitle(),
+        tickMode: 'compact',
+    }));
+    createChart('observability-gateway-breakdown-success-chart', buildHorizontalBarChartConfig({
+        labels,
+        values: rows.map(row => Number(row.success_rate || 0) * 100),
+        seriesLabel: t('observability.metric.success'),
+        colorValues: rows.map((_, index) => pickPalette(index + 2, 0.84)),
+        xTitle: resolvePercentageAxisTitle(),
+        yTitle: resolveGatewayAxisTitle(),
+        tickMode: 'percentage',
+        maxValue: 100,
+    }));
+    createChart('observability-gateway-breakdown-duration-chart', buildHorizontalBarChartConfig({
+        labels,
+        values: rows.map(row => Number(row.avg_duration_ms || 0)),
+        seriesLabel: t('observability.metric.avg_duration'),
+        colorValues: rows.map((_, index) => pickPalette(index + 4, 0.84)),
+        xTitle: resolveDurationAxisTitle(),
+        yTitle: resolveGatewayAxisTitle(),
+        tickMode: 'number',
+        maxValue: gatewayDurationMax,
+    }));
+    createChart('observability-gateway-breakdown-cold-start-chart', buildHorizontalBarChartConfig({
+        labels,
+        values: rows.map(row => Number(row.cold_start_calls || 0)),
+        seriesLabel: t('observability.kpi.gateway_cold_start_calls'),
+        colorValues: rows.map((_, index) => pickPalette(index + 6, 0.84)),
+        xTitle: resolveCallsAxisTitle(),
+        yTitle: resolveGatewayAxisTitle(),
+        tickMode: 'compact',
+        maxValue: coldStartMax,
     }));
 }
 
@@ -455,8 +804,8 @@ function createSeriesMetricChart(id, { labels, values, color, type, label, scope
                 datasets: [{
                     label,
                     data: values,
-                    backgroundColor: `rgba(${color.join(', ')}, 0.84)`,
-                    hoverBackgroundColor: `rgba(${color.join(', ')}, 0.96)`,
+                    backgroundColor: toRgba(color, 0.84),
+                    hoverBackgroundColor: toRgba(color, 0.96),
                     borderRadius: 8,
                     maxBarThickness: 28,
                 }],
@@ -488,16 +837,16 @@ function buildLineDataset(label, data, color) {
     return {
         label,
         data,
-        borderColor: `rgba(${color.join(', ')}, 0.96)`,
+        borderColor: toRgba(color, 0.96),
         backgroundColor(context) {
             const chart = context.chart;
             const area = chart.chartArea;
             if (!area) {
-                return `rgba(${color.join(', ')}, 0.18)`;
+                return toRgba(color, 0.18);
             }
             const gradient = chart.ctx.createLinearGradient(0, area.top, 0, area.bottom);
-            gradient.addColorStop(0, `rgba(${color.join(', ')}, 0.34)`);
-            gradient.addColorStop(1, `rgba(${color.join(', ')}, 0.03)`);
+            gradient.addColorStop(0, toRgba(color, 0.22));
+            gradient.addColorStop(1, toRgba(color, 0.02));
             return gradient;
         },
         fill: true,
@@ -539,8 +888,8 @@ function buildSingleMetricBarChartConfig({ label, categoryLabel, value, color, x
             datasets: [{
                 label,
                 data: [value],
-                backgroundColor: `rgba(${color.join(', ')}, 0.84)`,
-                hoverBackgroundColor: `rgba(${color.join(', ')}, 0.96)`,
+                backgroundColor: toRgba(color, 0.84),
+                hoverBackgroundColor: toRgba(color, 0.96),
                 borderRadius: 10,
                 maxBarThickness: 40,
             }],
@@ -561,8 +910,8 @@ function buildGroupedMetricBarChartConfig({ labels, values, colors, datasetLabel
             datasets: [{
                 label: datasetLabel,
                 data: values,
-                backgroundColor: values.map((_, index) => `rgba(${colors[index % colors.length].join(', ')}, 0.86)`),
-                hoverBackgroundColor: values.map((_, index) => `rgba(${colors[index % colors.length].join(', ')}, 0.98)`),
+                backgroundColor: values.map((_, index) => toRgba(colors[index % colors.length], 0.86)),
+                hoverBackgroundColor: values.map((_, index) => toRgba(colors[index % colors.length], 0.98)),
                 borderRadius: 10,
                 maxBarThickness: 44,
             }],
@@ -598,6 +947,7 @@ function buildHorizontalBarChartConfig({ labels, values, seriesLabel, colorValue
 }
 
 function buildCartesianOptions({ xScale, yScale, showLegend, indexAxis = 'x' }) {
+    const theme = resolveChartTheme();
     return {
         indexAxis,
         maintainAspectRatio: false,
@@ -609,7 +959,7 @@ function buildCartesianOptions({ xScale, yScale, showLegend, indexAxis = 'x' }) 
                 display: showLegend,
                 position: 'bottom',
                 labels: {
-                    color: CHART_LABEL_COLOR,
+                    color: theme.labelColor,
                     usePointStyle: true,
                     boxWidth: 10,
                     boxHeight: 10,
@@ -639,16 +989,17 @@ function resolveTooltipMode(indexAxis, yScale, xScale) {
 }
 
 function buildCategoryScale({ title, maxRotation }) {
+    const theme = resolveChartTheme();
     return {
         title: {
             display: true,
             text: title,
-            color: CHART_MUTED_COLOR,
+            color: theme.mutedColor,
             font: { size: 11, weight: '600' },
         },
         grid: { display: false },
         ticks: {
-            color: CHART_MUTED_COLOR,
+            color: theme.mutedColor,
             font: { size: 11 },
             maxRotation,
             minRotation: 0,
@@ -658,6 +1009,7 @@ function buildCategoryScale({ title, maxRotation }) {
 }
 
 function buildNumericScale({ title, mode, maxValue = null }) {
+    const theme = resolveChartTheme();
     return {
         metricMode: mode,
         beginAtZero: true,
@@ -665,15 +1017,15 @@ function buildNumericScale({ title, mode, maxValue = null }) {
         title: {
             display: true,
             text: title,
-            color: CHART_MUTED_COLOR,
+            color: theme.mutedColor,
             font: { size: 11, weight: '600' },
         },
         grid: {
-            color: CHART_GRID_COLOR,
+            color: theme.gridColor,
             drawBorder: false,
         },
         ticks: {
-            color: CHART_MUTED_COLOR,
+            color: theme.mutedColor,
             font: { size: 11 },
             callback(value) {
                 return formatAxisValue(value, mode);
@@ -741,19 +1093,60 @@ function handleWindowResize() {
     chartInstances.forEach(chart => chart.resize());
 }
 
-function pickPalette(index, alpha) {
-    const colors = [
-        [37, 99, 235],
-        [15, 118, 110],
-        [217, 119, 6],
-        [124, 58, 237],
-        [225, 29, 72],
-        [8, 145, 178],
-        [79, 70, 229],
-        [22, 163, 74],
-    ];
-    const [r, g, b] = colors[index % colors.length];
+function chartColor(tone) {
+    return OBSERVABILITY_CHART_COLORS[tone] || OBSERVABILITY_CHART_COLORS.primary;
+}
+
+function toRgba(color, alpha) {
+    const [r, g, b] = Array.isArray(color) ? color : OBSERVABILITY_CHART_COLORS.primary;
     return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+function resolveChartTheme() {
+    if (typeof window === 'undefined' || typeof window.getComputedStyle !== 'function') {
+        return DEFAULT_CHART_THEME;
+    }
+    const styles = window.getComputedStyle(document.body || document.documentElement);
+    const labelColor = readCssColor(styles, '--text-primary', DEFAULT_CHART_THEME.labelColor);
+    const mutedColor = readCssColor(styles, '--text-secondary', DEFAULT_CHART_THEME.mutedColor);
+    const mutedRgb = parseCssColor(mutedColor);
+    return {
+        labelColor,
+        mutedColor,
+        gridColor: mutedRgb ? toRgba(mutedRgb, 0.18) : DEFAULT_CHART_THEME.gridColor,
+    };
+}
+
+function readCssColor(styles, propertyName, fallback) {
+    const value = String(styles.getPropertyValue(propertyName) || '').trim();
+    return value || fallback;
+}
+
+function parseCssColor(value) {
+    const text = String(value || '').trim();
+    const hex = text.match(/^#([\da-f]{3}|[\da-f]{6})$/i);
+    if (hex) {
+        const raw = hex[1].length === 3
+            ? hex[1].split('').map(part => `${part}${part}`).join('')
+            : hex[1];
+        return [
+            Number.parseInt(raw.slice(0, 2), 16),
+            Number.parseInt(raw.slice(2, 4), 16),
+            Number.parseInt(raw.slice(4, 6), 16),
+        ];
+    }
+    const rgb = text.match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)/i);
+    if (!rgb) {
+        return null;
+    }
+    return [Number(rgb[1]), Number(rgb[2]), Number(rgb[3])];
+}
+
+function pickPalette(index, alpha) {
+    return toRgba(
+        OBSERVABILITY_BREAKDOWN_PALETTE[index % OBSERVABILITY_BREAKDOWN_PALETTE.length],
+        alpha,
+    );
 }
 function setVisible(visible) {
     const view = document.getElementById('observability-view');
@@ -766,6 +1159,9 @@ function setVisible(visible) {
             button.classList.remove('is-active');
             button.setAttribute('aria-current', 'false');
         });
+    }
+    if (visible) {
+        clearNewSessionDraft();
     }
     if (view) {
         view.style.display = visible ? 'block' : 'none';
@@ -855,6 +1251,14 @@ function resolveSourceLabel(source) {
     return t('observability.source.local');
 }
 
+function resolveRoleLabel(roleId) {
+    const normalizedRoleId = String(roleId || '').trim();
+    if (!normalizedRoleId || normalizedRoleId === 'unknown') {
+        return t('observability.role.unknown');
+    }
+    return normalizedRoleId;
+}
+
 function resolveTimeAxisTitle() {
     return getCurrentLanguage() === 'zh-CN' ? '\u65f6\u95f4' : 'Time';
 }
@@ -869,6 +1273,14 @@ function resolveSourceAxisTitle() {
 
 function resolveToolAxisTitle() {
     return getCurrentLanguage() === 'zh-CN' ? '\u5de5\u5177' : 'Tool';
+}
+
+function resolveRoleAxisTitle() {
+    return getCurrentLanguage() === 'zh-CN' ? '\u89d2\u8272' : 'Role';
+}
+
+function resolveGatewayAxisTitle() {
+    return getCurrentLanguage() === 'zh-CN' ? 'Gateway \u9636\u6bb5' : 'Gateway Stage';
 }
 
 function resolveCallsAxisTitle() { return t('observability.metric.calls'); }
@@ -928,6 +1340,60 @@ function formatBucketLabel(value) {
     } catch (_) {
         return String(value);
     }
+}
+
+function resolveGatewayBreakdownLabel(row) {
+    const operation = resolveGatewayOperationLabel(row.gateway_operation);
+    const phase = resolveGatewayPhaseLabel(row.gateway_phase);
+    const transport = resolveGatewayTransportLabel(row.gateway_transport);
+    return [operation, phase, transport].filter(Boolean).join(' · ');
+}
+
+function resolveGatewayOperationLabel(value) {
+    const normalized = String(value || '').trim();
+    if (!normalized) {
+        return t('observability.gateway.unknown');
+    }
+    const key = `observability.gateway.operation.${normalized}`;
+    const translated = t(key);
+    if (translated !== key) {
+        return translated;
+    }
+    return prettifyIdentifier(normalized);
+}
+
+function resolveGatewayPhaseLabel(value) {
+    const normalized = String(value || '').trim();
+    if (!normalized) {
+        return '';
+    }
+    const key = `observability.gateway.phase.${normalized}`;
+    const translated = t(key);
+    if (translated !== key) {
+        return translated;
+    }
+    return prettifyIdentifier(normalized);
+}
+
+function resolveGatewayTransportLabel(value) {
+    const normalized = String(value || '').trim();
+    if (!normalized) {
+        return '';
+    }
+    const key = `observability.gateway.transport.${normalized}`;
+    const translated = t(key);
+    if (translated !== key) {
+        return translated;
+    }
+    return prettifyIdentifier(normalized);
+}
+
+function prettifyIdentifier(value) {
+    return String(value || '')
+        .trim()
+        .replaceAll('/', ' ')
+        .replaceAll('_', ' ')
+        .replace(/\b\w/g, character => character.toUpperCase());
 }
 
 function escapeHtml(value) {

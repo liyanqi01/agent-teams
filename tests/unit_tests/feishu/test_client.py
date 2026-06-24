@@ -6,8 +6,10 @@ from pathlib import Path
 import httpx
 import pytest
 
-from agent_teams.gateway.feishu.client import FeishuClient
-from agent_teams.gateway.feishu.models import FeishuEnvironment
+from relay_teams.gateway.feishu.client import FeishuClient
+from relay_teams.gateway.feishu.models import FeishuEnvironment
+
+pytestmark = pytest.mark.asyncio
 
 
 class _FakeSyncHttpClient:
@@ -32,8 +34,19 @@ class _FakeSyncHttpClient:
                 tuple[str, str],
             ]
         ] = []
+        self.enter_count = 0
+        self.exit_count = 0
 
-    def request(
+    async def __aenter__(self) -> _FakeSyncHttpClient:
+        self.enter_count += 1
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        _ = (exc_type, exc, tb)
+        self.exit_count += 1
+        return False
+
+    async def request(
         self,
         method: str,
         url: str,
@@ -46,7 +59,7 @@ class _FakeSyncHttpClient:
         key = (method, url)
         return self._responses[key].pop(0)
 
-    def post(
+    async def post(
         self,
         url: str,
         *,
@@ -85,7 +98,7 @@ def _response(
     )
 
 
-def test_get_chat_name_uses_net_client_and_cache(monkeypatch) -> None:
+async def test_get_chat_name_uses_net_client_and_cache(monkeypatch) -> None:
     base_url = "https://open.feishu.cn"
     fake_client = _FakeSyncHttpClient(
         {
@@ -112,7 +125,7 @@ def test_get_chat_name_uses_net_client_and_cache(monkeypatch) -> None:
     )
     created_with_env: list[Mapping[str, str] | None] = []
 
-    def _fake_create_sync_http_client(
+    def _fake_create_async_http_client(
         *,
         merged_env: Mapping[str, str] | None = None,
         **_: object,
@@ -121,18 +134,20 @@ def test_get_chat_name_uses_net_client_and_cache(monkeypatch) -> None:
         return fake_client
 
     monkeypatch.setattr(
-        "agent_teams.gateway.feishu.client.create_sync_http_client",
-        _fake_create_sync_http_client,
+        "relay_teams.gateway.feishu.client.create_async_http_client",
+        _fake_create_async_http_client,
     )
     client = FeishuClient(merged_env={"SSL_VERIFY": "false"})
     environment = FeishuEnvironment(app_id="cli_1", app_secret="secret", app_name="bot")
 
-    first = client.get_chat_name(chat_id="oc_group_1", environment=environment)
-    second = client.get_chat_name(chat_id="oc_group_1", environment=environment)
+    first = await client.get_chat_name(chat_id="oc_group_1", environment=environment)
+    second = await client.get_chat_name(chat_id="oc_group_1", environment=environment)
 
     assert first == "Release Updates"
     assert second == "Release Updates"
-    assert created_with_env == [{"SSL_VERIFY": "false"}]
+    assert created_with_env == [{"SSL_VERIFY": "false"}, {"SSL_VERIFY": "false"}]
+    assert fake_client.enter_count == 2
+    assert fake_client.exit_count == 2
     assert [request[:2] for request in fake_client.requests] == [
         ("POST", f"{base_url}/open-apis/auth/v3/tenant_access_token/internal"),
         ("GET", f"{base_url}/open-apis/im/v1/chats/oc_group_1"),
@@ -140,7 +155,7 @@ def test_get_chat_name_uses_net_client_and_cache(monkeypatch) -> None:
     assert fake_client.requests[1][2]["Authorization"] == "Bearer token-1"
 
 
-def test_get_user_name_uses_net_client_and_cache(monkeypatch) -> None:
+async def test_get_user_name_uses_net_client_and_cache(monkeypatch) -> None:
     base_url = "https://open.feishu.cn"
     fake_client = _FakeSyncHttpClient(
         {
@@ -167,14 +182,14 @@ def test_get_user_name_uses_net_client_and_cache(monkeypatch) -> None:
     )
 
     monkeypatch.setattr(
-        "agent_teams.gateway.feishu.client.create_sync_http_client",
+        "relay_teams.gateway.feishu.client.create_async_http_client",
         lambda **_: fake_client,
     )
     client = FeishuClient()
     environment = FeishuEnvironment(app_id="cli_1", app_secret="secret", app_name="bot")
 
-    first = client.get_user_name(open_id="ou_user_1", environment=environment)
-    second = client.get_user_name(open_id="ou_user_1", environment=environment)
+    first = await client.get_user_name(open_id="ou_user_1", environment=environment)
+    second = await client.get_user_name(open_id="ou_user_1", environment=environment)
 
     assert first == "Alice"
     assert second == "Alice"
@@ -185,7 +200,7 @@ def test_get_user_name_uses_net_client_and_cache(monkeypatch) -> None:
     assert fake_client.requests[1][3] == {"user_id_type": "open_id"}
 
 
-def test_send_text_message_uses_net_client_request_chain(monkeypatch) -> None:
+async def test_send_text_message_uses_net_client_request_chain(monkeypatch) -> None:
     base_url = "https://open.feishu.cn"
     fake_client = _FakeSyncHttpClient(
         {
@@ -212,18 +227,19 @@ def test_send_text_message_uses_net_client_request_chain(monkeypatch) -> None:
     )
 
     monkeypatch.setattr(
-        "agent_teams.gateway.feishu.client.create_sync_http_client",
+        "relay_teams.gateway.feishu.client.create_async_http_client",
         lambda **_: fake_client,
     )
     client = FeishuClient()
     environment = FeishuEnvironment(app_id="cli_1", app_secret="secret", app_name="bot")
 
-    client.send_text_message(
+    message_id = await client.send_text_message(
         chat_id="oc_group_1",
         text="hello",
         environment=environment,
     )
 
+    assert message_id == "om_1"
     assert [request[:2] for request in fake_client.requests] == [
         ("POST", f"{base_url}/open-apis/auth/v3/tenant_access_token/internal"),
         ("POST", f"{base_url}/open-apis/im/v1/messages"),
@@ -236,7 +252,216 @@ def test_send_text_message_uses_net_client_request_chain(monkeypatch) -> None:
     }
 
 
-def test_get_chat_name_raises_runtime_error_for_failed_response(monkeypatch) -> None:
+async def test_delete_message_uses_delete_endpoint(monkeypatch) -> None:
+    base_url = "https://open.feishu.cn"
+    fake_client = _FakeSyncHttpClient(
+        {
+            (
+                "POST",
+                f"{base_url}/open-apis/auth/v3/tenant_access_token/internal",
+            ): [
+                _response(
+                    200,
+                    {"code": 0, "tenant_access_token": "token-1", "expire": 7200},
+                    method="POST",
+                    url=f"{base_url}/open-apis/auth/v3/tenant_access_token/internal",
+                )
+            ],
+            ("DELETE", f"{base_url}/open-apis/im/v1/messages/om_1"): [
+                _response(
+                    200,
+                    {"code": 0, "data": {}},
+                    method="DELETE",
+                    url=f"{base_url}/open-apis/im/v1/messages/om_1",
+                )
+            ],
+        }
+    )
+
+    monkeypatch.setattr(
+        "relay_teams.gateway.feishu.client.create_async_http_client",
+        lambda **_: fake_client,
+    )
+    client = FeishuClient()
+    environment = FeishuEnvironment(app_id="cli_1", app_secret="secret", app_name="bot")
+
+    await client.delete_message(message_id="om_1", environment=environment)
+
+    assert [request[:2] for request in fake_client.requests] == [
+        ("POST", f"{base_url}/open-apis/auth/v3/tenant_access_token/internal"),
+        ("DELETE", f"{base_url}/open-apis/im/v1/messages/om_1"),
+    ]
+
+
+async def test_reply_text_message_uses_reply_endpoint(monkeypatch) -> None:
+    base_url = "https://open.feishu.cn"
+    fake_client = _FakeSyncHttpClient(
+        {
+            (
+                "POST",
+                f"{base_url}/open-apis/auth/v3/tenant_access_token/internal",
+            ): [
+                _response(
+                    200,
+                    {"code": 0, "tenant_access_token": "token-1", "expire": 7200},
+                    method="POST",
+                    url=f"{base_url}/open-apis/auth/v3/tenant_access_token/internal",
+                )
+            ],
+            ("POST", f"{base_url}/open-apis/im/v1/messages/om_1/reply"): [
+                _response(
+                    200,
+                    {"code": 0, "data": {"message_id": "om_reply_1"}},
+                    method="POST",
+                    url=f"{base_url}/open-apis/im/v1/messages/om_1/reply",
+                )
+            ],
+        }
+    )
+
+    monkeypatch.setattr(
+        "relay_teams.gateway.feishu.client.create_async_http_client",
+        lambda **_: fake_client,
+    )
+    client = FeishuClient()
+    environment = FeishuEnvironment(app_id="cli_1", app_secret="secret", app_name="bot")
+
+    message_id = await client.reply_text_message(
+        message_id="om_1",
+        text="queued",
+        environment=environment,
+    )
+
+    assert message_id == "om_reply_1"
+    assert [request[:2] for request in fake_client.requests] == [
+        ("POST", f"{base_url}/open-apis/auth/v3/tenant_access_token/internal"),
+        ("POST", f"{base_url}/open-apis/im/v1/messages/om_1/reply"),
+    ]
+    assert fake_client.requests[1][4] == {
+        "msg_type": "text",
+        "content": '{"text": "queued"}',
+    }
+
+
+async def test_create_message_reaction_uses_reaction_endpoint(monkeypatch) -> None:
+    base_url = "https://open.feishu.cn"
+    fake_client = _FakeSyncHttpClient(
+        {
+            (
+                "POST",
+                f"{base_url}/open-apis/auth/v3/tenant_access_token/internal",
+            ): [
+                _response(
+                    200,
+                    {"code": 0, "tenant_access_token": "token-1", "expire": 7200},
+                    method="POST",
+                    url=f"{base_url}/open-apis/auth/v3/tenant_access_token/internal",
+                )
+            ],
+            ("POST", f"{base_url}/open-apis/im/v1/messages/om_1/reactions"): [
+                _response(
+                    200,
+                    {"code": 0, "data": {}},
+                    method="POST",
+                    url=f"{base_url}/open-apis/im/v1/messages/om_1/reactions",
+                )
+            ],
+        }
+    )
+
+    monkeypatch.setattr(
+        "relay_teams.gateway.feishu.client.create_async_http_client",
+        lambda **_: fake_client,
+    )
+    client = FeishuClient()
+    environment = FeishuEnvironment(app_id="cli_1", app_secret="secret", app_name="bot")
+
+    await client.create_message_reaction(
+        message_id="om_1",
+        reaction_type="eyes",
+        environment=environment,
+    )
+
+    assert [request[:2] for request in fake_client.requests] == [
+        ("POST", f"{base_url}/open-apis/auth/v3/tenant_access_token/internal"),
+        ("POST", f"{base_url}/open-apis/im/v1/messages/om_1/reactions"),
+    ]
+    assert fake_client.requests[1][4] == {
+        "reaction_type": {"emoji_type": "eyes"},
+    }
+
+
+async def test_resolve_user_name_falls_back_to_chat_member_lookup(monkeypatch) -> None:
+    base_url = "https://open.feishu.cn"
+    fake_client = _FakeSyncHttpClient(
+        {
+            (
+                "POST",
+                f"{base_url}/open-apis/auth/v3/tenant_access_token/internal",
+            ): [
+                _response(
+                    200,
+                    {"code": 0, "tenant_access_token": "token-1", "expire": 7200},
+                    method="POST",
+                    url=f"{base_url}/open-apis/auth/v3/tenant_access_token/internal",
+                )
+            ],
+            ("GET", f"{base_url}/open-apis/contact/v3/users/ou_user_1"): [
+                _response(
+                    200,
+                    {"code": 99991663, "msg": "user_error"},
+                    method="GET",
+                    url=f"{base_url}/open-apis/contact/v3/users/ou_user_1",
+                )
+            ],
+            ("GET", f"{base_url}/open-apis/im/v1/chats/oc_group_1/members"): [
+                _response(
+                    200,
+                    {
+                        "code": 0,
+                        "data": {
+                            "items": [
+                                {"member_id": "ou_user_1", "name": "Alice"},
+                            ],
+                            "has_more": False,
+                            "page_token": "",
+                        },
+                    },
+                    method="GET",
+                    url=f"{base_url}/open-apis/im/v1/chats/oc_group_1/members",
+                )
+            ],
+        }
+    )
+
+    monkeypatch.setattr(
+        "relay_teams.gateway.feishu.client.create_async_http_client",
+        lambda **_: fake_client,
+    )
+    client = FeishuClient()
+    environment = FeishuEnvironment(app_id="cli_1", app_secret="secret", app_name="bot")
+
+    resolved = await client.resolve_user_name(
+        open_id="ou_user_1",
+        chat_id="oc_group_1",
+        environment=environment,
+    )
+
+    assert resolved == "Alice"
+    assert [request[:2] for request in fake_client.requests] == [
+        ("POST", f"{base_url}/open-apis/auth/v3/tenant_access_token/internal"),
+        ("GET", f"{base_url}/open-apis/contact/v3/users/ou_user_1"),
+        ("GET", f"{base_url}/open-apis/im/v1/chats/oc_group_1/members"),
+    ]
+    assert fake_client.requests[2][3] == {
+        "member_id_type": "open_id",
+        "page_size": "100",
+    }
+
+
+async def test_get_chat_name_raises_runtime_error_for_failed_response(
+    monkeypatch,
+) -> None:
     base_url = "https://open.feishu.cn"
     fake_client = _FakeSyncHttpClient(
         {
@@ -263,21 +488,21 @@ def test_get_chat_name_raises_runtime_error_for_failed_response(monkeypatch) -> 
     )
 
     monkeypatch.setattr(
-        "agent_teams.gateway.feishu.client.create_sync_http_client",
+        "relay_teams.gateway.feishu.client.create_async_http_client",
         lambda **_: fake_client,
     )
     client = FeishuClient()
     environment = FeishuEnvironment(app_id="cli_1", app_secret="secret", app_name="bot")
 
     try:
-        client.get_chat_name(chat_id="oc_group_2", environment=environment)
+        await client.get_chat_name(chat_id="oc_group_2", environment=environment)
     except RuntimeError as exc:
         assert "chat_error" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("expected RuntimeError")
 
 
-def test_send_file_uploads_image_and_sends_image_message(
+async def test_send_file_uploads_image_and_sends_image_message(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -317,13 +542,13 @@ def test_send_file_uploads_image_and_sends_image_message(
     )
 
     monkeypatch.setattr(
-        "agent_teams.gateway.feishu.client.create_sync_http_client",
+        "relay_teams.gateway.feishu.client.create_async_http_client",
         lambda **_: fake_client,
     )
     client = FeishuClient()
     environment = FeishuEnvironment(app_id="cli_1", app_secret="secret", app_name="bot")
 
-    result = client.send_file(
+    result = await client.send_file(
         chat_id="oc_group_1",
         file_path=image_path,
         environment=environment,
@@ -345,7 +570,7 @@ def test_send_file_uploads_image_and_sends_image_message(
     }
 
 
-def test_send_file_uploads_regular_file_and_sends_file_message(
+async def test_send_file_uploads_regular_file_and_sends_file_message(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -385,13 +610,13 @@ def test_send_file_uploads_regular_file_and_sends_file_message(
     )
 
     monkeypatch.setattr(
-        "agent_teams.gateway.feishu.client.create_sync_http_client",
+        "relay_teams.gateway.feishu.client.create_async_http_client",
         lambda **_: fake_client,
     )
     client = FeishuClient()
     environment = FeishuEnvironment(app_id="cli_1", app_secret="secret", app_name="bot")
 
-    result = client.send_file(
+    result = await client.send_file(
         chat_id="oc_group_1",
         file_path=file_path,
         environment=environment,

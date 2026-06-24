@@ -3,13 +3,17 @@
  * UI log rendering plus frontend log shipping.
  */
 import { state } from '../core/state.js';
-import { els } from './dom.js';
+import { showToast } from './feedback.js';
 
 const FRONTEND_LOG_ENDPOINT = '/api/logs/frontend';
 const FLUSH_INTERVAL_MS = 1000;
+const BUSY_FLUSH_DEFER_MS = 3500;
 const MAX_BATCH_SIZE = 20;
 const MAX_PENDING_EVENTS = 200;
+const MAX_PENDING_WHEN_BACKED_UP = 80;
 const MAX_MESSAGE_LENGTH = 2000;
+const ERROR_TOAST_DURATION_MS = 6500;
+const WARNING_TOAST_DURATION_MS = 5200;
 
 const browserSessionId = `browser_${Math.random().toString(36).slice(2, 10)}`;
 
@@ -34,13 +38,14 @@ function getPagePath() {
 }
 
 function buildBaseEvent(level, event, message, payload = {}) {
+    const traceId = state.activeRunId ? String(state.activeRunId) : null;
     return {
         level,
         event,
         message: truncateMessage(message),
-        trace_id: String(state.activeRunId || ''),
+        trace_id: traceId,
         request_id: null,
-        run_id: String(state.activeRunId || '') || null,
+        run_id: traceId,
         session_id: String(state.currentSessionId || '') || null,
         task_id: null,
         instance_id: null,
@@ -64,12 +69,40 @@ function scheduleFlush() {
     }, FLUSH_INTERVAL_MS);
 }
 
+function scheduleDeferredFlush() {
+    if (flushTimer !== null) {
+        return;
+    }
+    flushTimer = globalThis.setTimeout(() => {
+        flushTimer = null;
+        void flushFrontendLogs();
+    }, BUSY_FLUSH_DEFER_MS);
+}
+
+function shouldDeferFrontendLogFlush() {
+    return (
+        state.isGenerating === true
+        || !!state.activeEventSource
+        || Number(state.activeRunStreamCount || 0) > 0
+    );
+}
+
 function enqueueEvent(event) {
+    if (
+        pendingEvents.length >= MAX_PENDING_WHEN_BACKED_UP
+        && (event.level === 'debug' || event.level === 'info')
+    ) {
+        return;
+    }
     pendingEvents.push(event);
     if (pendingEvents.length > MAX_PENDING_EVENTS) {
         pendingEvents = pendingEvents.slice(-MAX_PENDING_EVENTS);
     }
     if (pendingEvents.length >= MAX_BATCH_SIZE) {
+        if (shouldDeferFrontendLogFlush()) {
+            scheduleDeferredFlush();
+            return;
+        }
         void flushFrontendLogs();
         return;
     }
@@ -122,8 +155,15 @@ async function postLogBatch(events, useKeepalive = false) {
     });
 }
 
-export async function flushFrontendLogs({ useKeepalive = false } = {}) {
+export async function flushFrontendLogs({
+    useKeepalive = false,
+    allowDefer = true,
+} = {}) {
     if (!pendingEvents.length) {
+        return;
+    }
+    if (allowDefer && useKeepalive && shouldDeferFrontendLogFlush()) {
+        scheduleDeferredFlush();
         return;
     }
     if (flushTimer !== null) {
@@ -140,16 +180,33 @@ export async function flushFrontendLogs({ useKeepalive = false } = {}) {
 }
 
 export function sysLog(msg, type = 'info') {
-    if (!els.systemLogs) return;
+    const normalizedType = String(type || 'info').toLowerCase();
+    const level = normalizedType.includes('error')
+        ? 'error'
+        : normalizedType.includes('warn')
+        ? 'warn'
+        : 'info';
+    showVisibleSystemFeedback(msg, level);
+    enqueueEvent(buildBaseEvent(level, 'frontend.system_log', msg, {
+        source: 'sysLog',
+        type: normalizedType,
+    }));
+}
 
-    const entry = document.createElement('div');
-    entry.className = `log-entry ${type}`;
-
-    const time = new Date().toLocaleTimeString();
-    entry.innerHTML = `<span class="log-time">[${time}]</span> <span class="log-msg">${msg}</span>`;
-
-    els.systemLogs.appendChild(entry);
-    els.systemLogs.scrollTop = els.systemLogs.scrollHeight;
+function showVisibleSystemFeedback(message, level) {
+    if (level !== 'error' && level !== 'warn') {
+        return;
+    }
+    const text = truncateMessage(message);
+    if (!text) {
+        return;
+    }
+    showToast({
+        message: text,
+        tone: level === 'error' ? 'error' : 'warning',
+        durationMs: level === 'error' ? ERROR_TOAST_DURATION_MS : WARNING_TOAST_DURATION_MS,
+        dedupeKey: `syslog:${level}:${text.slice(0, 160)}`,
+    });
 }
 
 export function logDebug(event, message, payload = {}) {
@@ -199,6 +256,6 @@ export function installGlobalErrorLogging() {
     });
 
     globalThis.addEventListener('beforeunload', () => {
-        void flushFrontendLogs({ useKeepalive: true });
+        void flushFrontendLogs({ useKeepalive: true, allowDefer: false });
     });
 }

@@ -2,14 +2,24 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 
-from agent_teams.workspace import (
+import pytest
+
+from relay_teams.workspace import (
     FileScopeBackend,
+    SshProfileConfig,
+    SshProfileRepository,
+    SshProfileService,
     WorkspaceFileScope,
     WorkspaceManager,
+    WorkspaceMountProvider,
+    WorkspaceMountRecord,
     WorkspaceProfile,
     WorkspaceRepository,
     WorkspaceService,
+    WorkspaceSshMountConfig,
+    build_local_workspace_mount,
 )
 
 
@@ -45,12 +55,18 @@ def test_workspace_manager_uses_worktree_root_for_git_worktree_workspace(
         workspace_id="alpha-project-fork",
     )
 
+    tmp_root = (
+        manager.locations_for("alpha-project-fork").workspace_dir / "tmp"
+    ).resolve()
+
+    assert handle.locations.scope_root == worktree_root.resolve()
     assert handle.locations.execution_root == worktree_root.resolve()
     assert handle.locations.readable_roots == (
         worktree_root.resolve(),
-        (manager.locations_for("alpha-project-fork").workspace_dir / "tmp").resolve(),
+        tmp_root,
     )
-    assert handle.locations.writable_roots == (worktree_root.resolve(),)
+    assert handle.locations.writable_roots == (worktree_root.resolve(), tmp_root)
+    assert handle.locations.tmp_root == tmp_root
     assert handle.locations.worktree_root == worktree_root.resolve()
     assert (
         manager.session_artifact_dir(
@@ -61,6 +77,38 @@ def test_workspace_manager_uses_worktree_root_for_git_worktree_workspace(
             tmp_path / ".agent-teams" / "sessions" / "alpha-project-fork" / "session-1"
         ).resolve()
     )
+
+
+@pytest.mark.asyncio
+async def test_workspace_manager_resolve_async_uses_async_repository_path(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "workspace.db"
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    service = WorkspaceService(repository=WorkspaceRepository(db_path))
+    _ = service.create_workspace(
+        workspace_id="async-project",
+        root_path=project_root,
+    )
+    manager = WorkspaceManager(
+        project_root=tmp_path,
+        app_config_dir=tmp_path / ".agent-teams",
+        workspace_repo=WorkspaceRepository(db_path),
+    )
+
+    handle = await manager.resolve_async(
+        session_id="session-1",
+        role_id="designer",
+        instance_id="instance-1",
+        workspace_id="async-project",
+    )
+    locations = await manager.locations_for_async("async-project")
+
+    assert handle.ref.workspace_id == "async-project"
+    assert handle.ref.conversation_id == "conv_session_1_designer"
+    assert handle.locations.scope_root == project_root.resolve()
+    assert locations.scope_root == project_root.resolve()
 
 
 def test_workspace_manager_includes_builtin_and_app_skill_roots_in_read_scope(
@@ -94,13 +142,205 @@ def test_workspace_manager_includes_builtin_and_app_skill_roots_in_read_scope(
         workspace_id="default",
     )
 
+    tmp_root = (manager.locations_for("default").workspace_dir / "tmp").resolve()
+
     assert handle.locations.readable_roots == (
         project_root.resolve(),
-        (manager.locations_for("default").workspace_dir / "tmp").resolve(),
+        tmp_root,
         builtin_skills_dir.resolve(),
         app_skills_dir.resolve(),
     )
-    assert (
+    assert handle.locations.writable_roots == (project_root.resolve(), tmp_root)
+    with pytest.raises(ValueError, match="outside workspace write scope"):
         handle.resolve_workdir(app_skills_dir.resolve().as_posix())
-        == app_skills_dir.resolve()
+
+
+def test_workspace_manager_resolves_execution_root_under_worktree_working_directory(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "workspace.db"
+    worktree_root = tmp_path / "storage" / "alpha-project-fork" / "worktree"
+    worktree_root.mkdir(parents=True)
+    service = WorkspaceService(repository=WorkspaceRepository(db_path))
+    _ = service.create_workspace(
+        workspace_id="alpha-project-fork",
+        root_path=worktree_root,
+        profile=WorkspaceProfile(
+            file_scope=WorkspaceFileScope(
+                backend=FileScopeBackend.GIT_WORKTREE,
+                working_directory="packages/app",
+                branch_name="fork/alpha-project-fork",
+                source_root_path=str((tmp_path / "source-root").resolve()),
+                forked_from_workspace_id="project-alpha",
+            )
+        ),
     )
+    manager = WorkspaceManager(
+        project_root=tmp_path,
+        app_config_dir=tmp_path / ".agent-teams",
+        workspace_repo=WorkspaceRepository(db_path),
+    )
+
+    handle = manager.resolve(
+        session_id="session-1",
+        role_id="designer",
+        instance_id=None,
+        workspace_id="alpha-project-fork",
+    )
+
+    assert handle.locations.scope_root == worktree_root.resolve()
+    assert (
+        handle.locations.execution_root
+        == (worktree_root / "packages" / "app").resolve()
+    )
+
+
+def test_workspace_manager_materializes_default_ssh_mount(
+    tmp_path: Path,
+) -> None:
+    captured_commands: list[tuple[str, ...]] = []
+
+    def run_mount_command(
+        command: tuple[str, ...],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        captured_commands.append(command)
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+
+    db_path = tmp_path / "workspace.db"
+    ssh_profile_service = SshProfileService(
+        repository=SshProfileRepository(tmp_path / "ssh_profiles.db"),
+        config_dir=tmp_path,
+        ssh_path_lookup=lambda name: f"/usr/bin/{name}",
+        process_runner=run_mount_command,
+    )
+    _ = ssh_profile_service.save_profile(
+        ssh_profile_id="prod",
+        config=SshProfileConfig(host="prod-alias", username="deploy"),
+    )
+    service = WorkspaceService(repository=WorkspaceRepository(db_path))
+    _ = service.create_workspace(
+        workspace_id="remote-project",
+        mounts=(
+            WorkspaceMountRecord(
+                mount_name="prod",
+                provider=WorkspaceMountProvider.SSH,
+                provider_config=WorkspaceSshMountConfig(
+                    ssh_profile_id="prod",
+                    remote_root="/srv/app",
+                ),
+            ),
+        ),
+        default_mount_name="prod",
+    )
+    manager = WorkspaceManager(
+        project_root=tmp_path,
+        app_config_dir=tmp_path / ".agent-teams",
+        workspace_repo=WorkspaceRepository(db_path),
+        ssh_profile_service=ssh_profile_service,
+    )
+
+    handle = manager.resolve(
+        session_id="session-1",
+        role_id="designer",
+        instance_id=None,
+        workspace_id="remote-project",
+    )
+
+    expected_local_root = (
+        tmp_path
+        / ".agent-teams"
+        / "workspaces"
+        / "remote-project"
+        / "ssh_mounts"
+        / "prod"
+    ).resolve()
+    assert captured_commands[0][0] == "/usr/bin/sshfs"
+    assert captured_commands[0][1] == "deploy@prod-alias:/srv/app"
+    assert captured_commands[0][2] == str(expected_local_root)
+    assert handle.locations.provider == WorkspaceMountProvider.SSH
+    assert handle.locations.scope_root == expected_local_root
+    assert handle.locations.execution_root == expected_local_root
+    assert (
+        handle.resolve_path("src/app.py", write=True)
+        == (expected_local_root / "src" / "app.py").resolve()
+    )
+
+
+def test_workspace_manager_does_not_materialize_secondary_ssh_mount(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "workspace.db"
+    local_root = tmp_path / "project"
+    local_root.mkdir()
+    service = WorkspaceService(repository=WorkspaceRepository(db_path))
+    _ = service.create_workspace(
+        workspace_id="local-project",
+        mounts=(
+            build_local_workspace_mount(mount_name="default", root_path=local_root),
+            WorkspaceMountRecord(
+                mount_name="prod",
+                provider=WorkspaceMountProvider.SSH,
+                provider_config=WorkspaceSshMountConfig(
+                    ssh_profile_id="prod",
+                    remote_root="/srv/app",
+                ),
+            ),
+        ),
+        default_mount_name="default",
+    )
+    manager = WorkspaceManager(
+        project_root=tmp_path,
+        app_config_dir=tmp_path / ".agent-teams",
+        workspace_repo=WorkspaceRepository(db_path),
+    )
+
+    handle = manager.resolve(
+        session_id="session-1",
+        role_id="designer",
+        instance_id=None,
+        workspace_id="local-project",
+    )
+
+    assert handle.locations.provider == WorkspaceMountProvider.LOCAL
+    assert handle.locations.scope_root == local_root.resolve()
+    assert handle.locations.remote_mount_roots == ()
+
+
+def test_workspace_manager_rejects_ssh_mount_without_profile_service(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "workspace.db"
+    service = WorkspaceService(repository=WorkspaceRepository(db_path))
+    _ = service.create_workspace(
+        workspace_id="remote-project",
+        mounts=(
+            WorkspaceMountRecord(
+                mount_name="prod",
+                provider=WorkspaceMountProvider.SSH,
+                provider_config=WorkspaceSshMountConfig(
+                    ssh_profile_id="prod",
+                    remote_root="/srv/app",
+                ),
+            ),
+        ),
+        default_mount_name="prod",
+    )
+    manager = WorkspaceManager(
+        project_root=tmp_path,
+        app_config_dir=tmp_path / ".agent-teams",
+        workspace_repo=WorkspaceRepository(db_path),
+    )
+
+    with pytest.raises(ValueError, match="requires ssh profile service"):
+        _ = manager.resolve(
+            session_id="session-1",
+            role_id="designer",
+            instance_id=None,
+            workspace_id="remote-project",
+        )

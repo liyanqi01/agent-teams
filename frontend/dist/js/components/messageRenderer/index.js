@@ -5,16 +5,51 @@
 export { renderMessageBlock } from './helpers.js';
 export { renderHistoricalMessageList } from './history.js';
 export {
+    formatElapsed,
+    normalizeProcessedTranscript,
+} from './transcriptGrouping.js';
+export {
+    applyTimelineAction,
+    clearTimelineRun,
+    clearTimelineState,
+    getRunTimelineSnapshot,
+    getTimelineSnapshot,
+    getTimelineStream,
+    subscribeTimeline,
+} from '../messageTimeline/store.js';
+export { applyRunEventToTimeline } from '../messageTimeline/actions.js';
+export { renderTimelineStream } from '../messageTimeline/renderer.js';
+export {
+    bindCopyButton,
+    extractMessageCopyText,
+    syncLastAnswerCopyButton,
+} from './messageActions.js';
+export {
+    computeVisibleRoundWindow,
+    shouldMountRound,
+} from '../messageTimeline/virtualList.js';
+export {
+    followBottomIfNeeded,
+    isNearBottom,
+    preserveScrollOnPrepend,
+} from '../messageTimeline/scrollController.js';
+export {
     getOrCreateStreamBlock,
     appendStreamChunk,
+    appendStreamInjectionMarker,
+    appendStreamOutputParts,
     finalizeStream,
     clearStreamState,
     clearRunStreamState,
+    reconcileTerminalRunStreamState,
+    clearStreamOverlayEntry,
+    clearRunRenderedStreamState,
     clearRenderedStreamState,
     clearAllStreamState,
     getCoordinatorStreamOverlay,
     getInstanceStreamOverlay,
     getRunStreamOverlaySnapshot,
+    bindStreamOverlayToContainer,
     startThinkingBlock,
     appendThinkingChunk,
     finalizeThinking,

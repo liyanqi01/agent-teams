@@ -3,44 +3,107 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
+from typing import cast
 
 import pytest
-from pydantic_ai.messages import ModelRequest, UserPromptPart
+import pytest_asyncio
+from pydantic_ai import Agent, RunContext
+from pydantic_ai.messages import ModelMessagesTypeAdapter, ModelRequest, UserPromptPart
 
-from agent_teams.agents.instances.enums import InstanceStatus
-from agent_teams.agents.instances.models import create_subagent_instance
-from agent_teams.agents.orchestration.task_execution_service import TaskExecutionService
-from agent_teams.agents.execution.system_prompts import RuntimePromptBuilder
-from agent_teams.mcp.mcp_registry import McpRegistry
-from agent_teams.roles.memory_repository import RoleMemoryRepository
-from agent_teams.roles.memory_service import RoleMemoryService
-from agent_teams.roles.role_models import RoleDefinition
-from agent_teams.roles.role_registry import RoleRegistry
-from agent_teams.sessions.runs.run_control_manager import RunControlManager
-from agent_teams.sessions.runs.event_stream import RunEventHub
-from agent_teams.sessions.runs.injection_queue import RunInjectionManager
-from agent_teams.agents.instances.instance_repository import AgentInstanceRepository
-from agent_teams.tools.runtime.approval_ticket_repo import ApprovalTicketRepository
-from agent_teams.sessions.runs.event_log import EventLog
-from agent_teams.agents.execution.message_repository import MessageRepository
-from agent_teams.sessions.runs.run_models import IntentInput, RunThinkingConfig
-from agent_teams.sessions.runs.run_intent_repo import RunIntentRepository
-from agent_teams.sessions.runs.run_runtime_repo import (
+from relay_teams.agents.execution.message_repository import MessageRepository
+from relay_teams.agents.execution.system_prompts import PromptBuildInput
+from relay_teams.agents.execution.system_prompts import RuntimePromptBuilder
+from relay_teams.agents.execution.system_prompts import RuntimePromptSections
+from relay_teams.agent_runtimes.instances.enums import InstanceStatus
+from relay_teams.agent_runtimes.instances.instance_repository import (
+    AgentInstanceRepository,
+)
+from relay_teams.agent_runtimes.instances.models import create_subagent_instance
+from relay_teams.agents.orchestration.harnesses.tool_harness import TaskToolHarness
+from relay_teams.agents.orchestration.task_execution_service import TaskExecutionService
+from relay_teams.agents.tasks.artifact_repository import TaskArtifactRepository
+from relay_teams.agents.tasks.enums import TaskStatus
+from relay_teams.agents.tasks.enums import TaskArtifactPhase
+from relay_teams.agents.tasks.events import EventType
+from relay_teams.agents.tasks.models import (
+    TaskArtifactEntry,
+    TaskEnvelope,
+    VerificationPlan,
+)
+from relay_teams.agents.tasks.task_repository import TaskRepository
+from relay_teams.hooks import HookDecisionBundle, HookDecisionType, HookService
+from relay_teams.media import (
+    MediaAssetRepository,
+    MediaAssetService,
+    content_parts_from_text,
+)
+from relay_teams.mcp.mcp_models import McpToolSchema
+from relay_teams.mcp.mcp_registry import McpRegistry
+from relay_teams.memory.models import (
+    CreateMemoryEntryRequest,
+    MemoryContent,
+    MemoryEntryKind,
+    MemoryScope,
+    MemorySourceKind,
+    MemoryTier,
+)
+from relay_teams.memory.repository import MemoryBankRepository
+from relay_teams.memory.service import MemoryBankService
+from relay_teams.persistence import close_live_sqlite_repositories_async
+from relay_teams.persistence.shared_state_repo import SharedStateRepository
+from relay_teams.reminders import ReminderStateRepository
+from relay_teams.reminders.service import SystemReminderService
+from relay_teams.retrieval import RetrievalService, SqliteFts5RetrievalStore
+from relay_teams.roles.role_models import RoleDefinition
+from relay_teams.roles.role_registry import RoleRegistry
+from relay_teams.sessions.runs.run_models import (
+    IntentInput,
+    RuntimePromptConversationContext,
+    RunThinkingConfig,
+)
+from relay_teams.sessions.runs.assistant_errors import RunCompletionReason
+from relay_teams.sessions.runs.event_log import EventLog
+from relay_teams.sessions.runs.event_stream import RunEventHub
+from relay_teams.sessions.runs.injection_queue import RunInjectionManager
+from relay_teams.sessions.runs.recoverable_pause import (
+    RecoverableRunPauseError,
+    RecoverableRunPausePayload,
+)
+from relay_teams.sessions.runs.run_control_manager import RunControlManager
+from relay_teams.sessions.runs.run_intent_repo import RunIntentRepository
+from relay_teams.sessions.runs.run_runtime_repo import (
     RunRuntimePhase,
     RunRuntimeRepository,
     RunRuntimeStatus,
 )
-from agent_teams.persistence.shared_state_repo import SharedStateRepository
-from agent_teams.agents.tasks.task_repository import TaskRepository
-from agent_teams.skills.skill_registry import SkillRegistry
-from agent_teams.tools.registry import build_default_registry
-from agent_teams.workspace import (
+from relay_teams.sessions.runs.system_injection import SystemInjectionSink
+from relay_teams.sessions.runs.todo_models import TodoItem, TodoStatus
+from relay_teams.sessions.runs.todo_repository import TodoRepository
+from relay_teams.sessions.runs.todo_service import TodoService
+from relay_teams.skills.skill_routing_service import SkillRuntimeService
+from relay_teams.skills.skill_routing_models import (
+    SkillPromptResult,
+    SkillRoutingDiagnostics,
+    SkillRoutingMode,
+    SkillRoutingResult,
+)
+from relay_teams.skills.skill_registry import SkillRegistry
+from relay_teams.tools.registry.defaults import build_default_registry
+from relay_teams.tools.registry.registry import ToolRegistry
+from relay_teams.tools.runtime.approval_ticket_repo import ApprovalTicketRepository
+from relay_teams.tools.runtime.context import ToolDeps
+from relay_teams.workspace import (
     WorkspaceManager,
     build_conversation_id,
 )
-from agent_teams.agents.tasks.enums import TaskStatus
-from agent_teams.agents.tasks.models import TaskEnvelope, VerificationPlan
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _close_async_sqlite_repositories_after_test() -> AsyncIterator[None]:
+    yield
+    await close_live_sqlite_repositories_async()
 
 
 class _CapturingProvider:
@@ -63,15 +126,185 @@ class _CapturingProvider:
         return "ok"
 
 
+class _TodoCompletingProvider:
+    def __init__(self, todo_service: TodoService) -> None:
+        self.calls = 0
+        self._todo_service = todo_service
+
+    async def generate(self, request: object) -> str:
+        self.calls += 1
+        if self.calls == 2:
+            self._todo_service.clear_for_run(
+                run_id=str(getattr(request, "run_id")),
+                session_id=str(getattr(request, "session_id")),
+                updated_by_role_id=str(getattr(request, "role_id")),
+                updated_by_instance_id=str(getattr(request, "instance_id")),
+            )
+        return f"ok-{self.calls}"
+
+
 class _InterruptingProvider:
     async def generate(self, request: object) -> str:
         _ = request
         raise asyncio.CancelledError
 
 
+class _BlockingRunControlManager(RunControlManager):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.completed = False
+
+    async def handle_instance_cancelled_async(
+        self,
+        *,
+        task: TaskEnvelope,
+        instance_id: str,
+    ) -> bool:
+        self.started.set()
+        await self.release.wait()
+        stopped = await super().handle_instance_cancelled_async(
+            task=task,
+            instance_id=instance_id,
+        )
+        self.completed = True
+        return stopped
+
+
+class _ExplodingProvider:
+    async def generate(self, request: object) -> str:
+        _ = request
+        raise RuntimeError("boom")
+
+
+class _RecoverablePauseProvider:
+    async def generate(self, request: object) -> str:
+        raise RecoverableRunPauseError(
+            RecoverableRunPausePayload(
+                run_id=str(getattr(request, "run_id")),
+                trace_id=str(getattr(request, "trace_id")),
+                task_id=str(getattr(request, "task_id")),
+                session_id=str(getattr(request, "session_id")),
+                instance_id=str(getattr(request, "instance_id")),
+                role_id=str(getattr(request, "role_id")),
+                error_code="network_stream_interrupted",
+                error_message="stream interrupted",
+                retries_used=1,
+                total_attempts=3,
+            )
+        )
+
+
+class _CapturingHookService:
+    def __init__(self, decision: HookDecisionType = HookDecisionType.ALLOW) -> None:
+        self.decision = decision
+        self.calls: list[tuple[object, object | None]] = []
+
+    async def execute(
+        self,
+        *,
+        event_input: object,
+        run_event_hub: object | None,
+    ) -> HookDecisionBundle:
+        self.calls.append((event_input, run_event_hub))
+        return HookDecisionBundle(decision=self.decision)
+
+
+class _StaticPromptBuilder(RuntimePromptBuilder):
+    async def build_sections(self, data: PromptBuildInput) -> RuntimePromptSections:
+        prompt = data.role.system_prompt
+        return RuntimePromptSections(
+            prompt=prompt,
+            base_instructions=prompt,
+        )
+
+
+class _StaticSkillRegistry:
+    def resolve_known(
+        self,
+        skill_names: tuple[str, ...],
+        *,
+        strict: bool,
+        consumer: str,
+    ) -> tuple[str, ...]:
+        _ = (strict, consumer)
+        return tuple(skill_names)
+
+    def get_toolset_tools(self, resolved_skills: tuple[str, ...]) -> tuple[object, ...]:
+        _ = resolved_skills
+        return ()
+
+
+class _StaticSkillRuntimeService:
+    def __init__(self) -> None:
+        self.skill_name_calls: list[tuple[str, ...] | None] = []
+
+    async def prepare_prompt_async(
+        self,
+        *,
+        role: RoleDefinition,
+        objective: str,
+        shared_state_snapshot: tuple[tuple[str, str], ...],
+        conversation_context: RuntimePromptConversationContext | None = None,
+        orchestration_prompt: str = "",
+        skill_names: tuple[str, ...] | None = None,
+        consumer: str,
+    ) -> SkillPromptResult:
+        _ = (
+            shared_state_snapshot,
+            conversation_context,
+            orchestration_prompt,
+            consumer,
+        )
+        self.skill_name_calls.append(skill_names)
+        visible_skills = role.skills if skill_names is None else skill_names
+        appendix = "\n".join(f"- {name}: {name} helper" for name in visible_skills)
+        return SkillPromptResult(
+            user_prompt=f"{objective.strip()}\n\n## Skill Candidates\n{appendix}",
+            system_prompt_skill_instructions=(),
+            routing=SkillRoutingResult(
+                authorized_skills=tuple(visible_skills),
+                visible_skills=tuple(visible_skills),
+                diagnostics=SkillRoutingDiagnostics(
+                    mode=SkillRoutingMode.PASSTHROUGH,
+                    authorized_count=len(visible_skills),
+                    visible_skills=tuple(visible_skills),
+                ),
+            ),
+        )
+
+
+class _PartiallyFailingToolSchemaMcpRegistry(McpRegistry):
+    def resolve_server_names(
+        self,
+        names: tuple[str, ...],
+        *,
+        strict: bool = True,
+        consumer: str | None = None,
+        expand_wildcards: bool = True,
+    ) -> tuple[str, ...]:
+        _ = strict, consumer, expand_wildcards
+        return tuple(name for name in names if name != "missing")
+
+    async def list_tool_schemas(self, name: str) -> tuple[McpToolSchema, ...]:
+        if name == "broken":
+            raise RuntimeError("MCP startup failed")
+        return (
+            McpToolSchema(
+                name=f"{name}_search",
+                description="Search docs",
+                input_schema={"type": "object"},
+            ),
+        )
+
+
 def _build_service(
     db_path: Path,
     provider: object,
+    artifact_repo: TaskArtifactRepository | None = None,
+    memory_bank_service: MemoryBankService | None = None,
+    provider_factory: Callable[[RoleDefinition, str | None], object] | None = None,
 ) -> tuple[
     TaskExecutionService,
     TaskRepository,
@@ -106,17 +339,28 @@ def _build_service(
         workspace_manager=WorkspaceManager(
             project_root=Path("."), shared_store=shared_store
         ),
-        prompt_builder=RuntimePromptBuilder(
+        prompt_builder=_StaticPromptBuilder(
             role_registry=role_registry,
             mcp_registry=McpRegistry(),
         ),
-        provider_factory=lambda _, __=None: provider,
+        provider_factory=provider_factory or (lambda _, __=None: provider),
         tool_registry=build_default_registry(),
-        skill_registry=SkillRegistry.from_config_dirs(app_config_dir=db_path.parent),
+        skill_registry=_StaticSkillRegistry(),
         mcp_registry=McpRegistry(),
         run_intent_repo=RunIntentRepository(db_path),
+        artifact_repo=artifact_repo,
+        memory_bank_service=memory_bank_service,
     )
     return service, task_repo, agent_repo, message_repo
+
+
+def _write_skill(app_config_dir: Path, *, name: str, description: str) -> None:
+    skill_dir = app_config_dir / "skills" / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: {description}\n---\n{description}\n",
+        encoding="utf-8",
+    )
 
 
 def _build_service_with_control(
@@ -170,13 +414,13 @@ def _build_service_with_control(
         workspace_manager=WorkspaceManager(
             project_root=Path("."), shared_store=shared_store
         ),
-        prompt_builder=RuntimePromptBuilder(
+        prompt_builder=_StaticPromptBuilder(
             role_registry=role_registry,
             mcp_registry=McpRegistry(),
         ),
         provider_factory=lambda _, __=None: provider,
         tool_registry=build_default_registry(),
-        skill_registry=SkillRegistry.from_config_dirs(app_config_dir=db_path.parent),
+        skill_registry=_StaticSkillRegistry(),
         mcp_registry=McpRegistry(),
         run_control_manager=run_control_manager,
         run_intent_repo=RunIntentRepository(db_path),
@@ -196,6 +440,7 @@ def _seed_task(
     task_repo: TaskRepository,
     agent_repo: AgentInstanceRepository,
     message_repo: MessageRepository,
+    parent_task_id: str | None = "task-root",
 ) -> tuple[TaskEnvelope, str]:
     workspace_id = "default"
     conversation_id = build_conversation_id("session-1", "time")
@@ -207,7 +452,7 @@ def _seed_task(
     task = TaskEnvelope(
         task_id="task-1",
         session_id="session-1",
-        parent_task_id="task-root",
+        parent_task_id=parent_task_id,
         trace_id="run-1",
         objective="query time",
         verification=VerificationPlan(checklist=("non_empty_response",)),
@@ -257,8 +502,221 @@ async def test_execute_omits_objective_when_task_history_exists(
         task=task,
     )
 
-    assert result == "ok"
+    assert result.output == "ok"
     assert provider.prompts == [None]
+
+
+@pytest.mark.asyncio
+async def test_execute_injects_memory_bank_project_memory(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "task_execution_service_memory_bank.db"
+    memory_bank_service = MemoryBankService(
+        repository=MemoryBankRepository(tmp_path / "memory_bank.db")
+    )
+    _ = await memory_bank_service.create_entry_async(
+        CreateMemoryEntryRequest(
+            tier=MemoryTier.PERSISTENT,
+            scope=MemoryScope.WORKSPACE,
+            workspace_id="default",
+            role_id="time",
+            kind=MemoryEntryKind.CONSTRAINT,
+            content=MemoryContent(
+                title="Runtime memory must follow session context",
+                body="Agent runtime prompts include the shared project memory bank.",
+            ),
+            source=MemorySourceKind.MANUAL,
+        )
+    )
+    provider = _CapturingProvider()
+    service, task_repo, agent_repo, message_repo = _build_service(
+        db_path,
+        provider,
+        memory_bank_service=memory_bank_service,
+    )
+    task, instance_id = _seed_task(
+        task_repo=task_repo,
+        agent_repo=agent_repo,
+        message_repo=message_repo,
+    )
+
+    result = await service.execute(
+        instance_id=instance_id,
+        role_id="time",
+        task=task,
+    )
+
+    assert result.output == "ok"
+    assert provider.system_prompts
+    system_prompt = provider.system_prompts[0]
+    assert "## Project Memory" in system_prompt
+    assert "Runtime memory must follow session context" in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_execute_records_task_artifact_entries(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "task_execution_service_artifacts.db"
+    artifact_repo = TaskArtifactRepository(tmp_path / "task_artifacts.db")
+    provider = _CapturingProvider()
+    service, task_repo, agent_repo, message_repo = _build_service(
+        db_path,
+        provider,
+        artifact_repo=artifact_repo,
+    )
+    task, instance_id = _seed_task(
+        task_repo=task_repo,
+        agent_repo=agent_repo,
+        message_repo=message_repo,
+    )
+
+    result = await service.execute(
+        instance_id=instance_id,
+        role_id="time",
+        task=task,
+    )
+
+    assert artifact_repo.drain_write_queue(timeout_seconds=2.0) is True
+    artifact = artifact_repo.get_artifact(task.task_id)
+    metrics = artifact_repo.write_metrics()
+    assert result.output == "ok"
+    assert artifact is not None
+    assert artifact.summary == "ok"
+    assert metrics.enqueued >= 5
+    assert metrics.completed == metrics.enqueued
+    assert tuple(entry.phase for entry in artifact.entries) == (
+        TaskArtifactPhase.SPEC,
+        TaskArtifactPhase.EXECUTION,
+        TaskArtifactPhase.VERIFICATION,
+        TaskArtifactPhase.DELIVERY,
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_skips_artifact_entries_when_container_enqueue_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "task_execution_service_artifact_queue_full.db"
+    artifact_repo = TaskArtifactRepository(tmp_path / "task_artifacts.db")
+    appended_entries: list[str] = []
+
+    def fail_artifact_container_enqueue(
+        *,
+        task_id: str,
+        spec_artifact_id: str,
+    ) -> bool:
+        _ = task_id
+        _ = spec_artifact_id
+        return False
+
+    def record_artifact_append(
+        *,
+        task_id: str,
+        entry: TaskArtifactEntry,
+    ) -> bool:
+        _ = task_id
+        appended_entries.append(entry.entry_id)
+        return True
+
+    monkeypatch.setattr(
+        artifact_repo,
+        "enqueue_ensure_artifact",
+        fail_artifact_container_enqueue,
+    )
+    monkeypatch.setattr(
+        artifact_repo,
+        "enqueue_append_entry",
+        record_artifact_append,
+    )
+    provider = _CapturingProvider()
+    service, task_repo, agent_repo, message_repo = _build_service(
+        db_path,
+        provider,
+        artifact_repo=artifact_repo,
+    )
+    task, instance_id = _seed_task(
+        task_repo=task_repo,
+        agent_repo=agent_repo,
+        message_repo=message_repo,
+    )
+
+    result = await service.execute(
+        instance_id=instance_id,
+        role_id="time",
+        task=task,
+    )
+
+    assert result.output == "ok"
+    assert appended_entries == []
+
+
+@pytest.mark.asyncio
+async def test_execute_retries_root_completion_when_todos_are_incomplete(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "task_execution_service_reminders.db"
+    todo_service = TodoService(repository=TodoRepository(db_path))
+    provider = _TodoCompletingProvider(todo_service)
+    service, task_repo, agent_repo, message_repo = _build_service(db_path, provider)
+    service.todo_service = todo_service
+    service.reminder_service = SystemReminderService(
+        state_repository=ReminderStateRepository(service.shared_store),
+        injection_sink=SystemInjectionSink(
+            injection_manager=RunInjectionManager(),
+            run_event_hub=RunEventHub(),
+            message_repo=message_repo,
+        ),
+    )
+    workspace_id = "default"
+    conversation_id = build_conversation_id("session-1", "time")
+    instance = create_subagent_instance(
+        "time",
+        workspace_id=workspace_id,
+        conversation_id=conversation_id,
+    )
+    task = TaskEnvelope(
+        task_id="task-1",
+        session_id="session-1",
+        parent_task_id=None,
+        trace_id="run-1",
+        objective="query time",
+        verification=VerificationPlan(checklist=("non_empty_response",)),
+    )
+    _ = task_repo.create(task)
+    agent_repo.upsert_instance(
+        run_id="run-1",
+        trace_id="run-1",
+        session_id="session-1",
+        instance_id=instance.instance_id,
+        role_id="time",
+        workspace_id=instance.workspace_id,
+        conversation_id=instance.conversation_id,
+        status=InstanceStatus.IDLE,
+    )
+    todo_service.replace_for_run(
+        run_id="run-1",
+        session_id="session-1",
+        items=(TodoItem(content="finish verification", status=TodoStatus.PENDING),),
+    )
+
+    result = await service.execute(
+        instance_id=instance.instance_id,
+        role_id="time",
+        task=task,
+    )
+
+    refreshed = task_repo.get("task-1")
+    messages = message_repo.get_messages_for_instance("session-1", instance.instance_id)
+    history = message_repo.get_history_for_conversation(instance.conversation_id)
+    serialized_messages = ModelMessagesTypeAdapter.dump_json(history).decode()
+    assert provider.calls == 2
+    assert result.output == "ok-2"
+    assert refreshed.status == TaskStatus.COMPLETED
+    assert "<system-reminder>" not in json.dumps(messages, ensure_ascii=False)
+    assert "<system-reminder>" in serialized_messages
+    assert "finish verification" in serialized_messages
 
 
 @pytest.mark.asyncio
@@ -303,7 +761,7 @@ async def test_execute_persists_objective_before_first_turn(
         task=task,
     )
 
-    assert result == "ok"
+    assert result.output == "ok"
     assert provider.prompts == [None]
     history = message_repo.get_history_for_task(instance.instance_id, "task-1")
     assert len(history) == 1
@@ -319,6 +777,116 @@ async def test_execute_persists_objective_before_first_turn(
 
 
 @pytest.mark.asyncio
+async def test_execute_does_not_emit_task_completed_hook_for_root_task(
+    tmp_path: Path,
+) -> None:
+    provider = _CapturingProvider()
+    service, task_repo, _agent_repo, _message_repo = _build_service(
+        tmp_path / "task_execution_service_root_hook.db",
+        provider,
+    )
+    hook_service = _CapturingHookService()
+    service.hook_service = cast(HookService, hook_service)
+    root_task = TaskEnvelope(
+        task_id="task-root",
+        session_id="session-1",
+        parent_task_id=None,
+        trace_id="run-1",
+        objective="handle user intent",
+        verification=VerificationPlan(checklist=("non_empty_response",)),
+    )
+    _ = task_repo.create(root_task)
+
+    await service._execution_harness().execute_task_completed_hooks(
+        task=root_task,
+        instance_id="inst-root",
+        role_id="time",
+        output_text="ok",
+    )
+
+    assert hook_service.calls == []
+
+
+@pytest.mark.asyncio
+async def test_execute_task_completed_hook_denial_prevents_completed_state(
+    tmp_path: Path,
+) -> None:
+    provider = _CapturingProvider()
+    service, task_repo, agent_repo, message_repo = _build_service(
+        tmp_path / "task_execution_service_completion_hook_deny.db",
+        provider,
+    )
+    hook_service = _CapturingHookService(HookDecisionType.DENY)
+    service.hook_service = cast(HookService, hook_service)
+    task, instance_id = _seed_task(
+        task_repo=task_repo,
+        agent_repo=agent_repo,
+        message_repo=message_repo,
+    )
+
+    result = await service.execute(
+        instance_id=instance_id,
+        role_id="time",
+        task=task,
+    )
+
+    record = task_repo.get(task.task_id)
+    assert record.status == TaskStatus.FAILED
+    assert "Task completion denied" in result.output
+    assert provider.prompts == [None]
+    assert len(hook_service.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_passes_explicit_task_skills_to_skill_runtime(
+    tmp_path: Path,
+) -> None:
+    provider = _CapturingProvider()
+    service, task_repo, agent_repo, _message_repo = _build_service(
+        tmp_path / "task_execution_service_explicit_task_skills.db",
+        provider,
+    )
+    skill_runtime_service = _StaticSkillRuntimeService()
+    service.skill_runtime_service = cast(SkillRuntimeService, skill_runtime_service)
+    workspace_id = "default"
+    conversation_id = build_conversation_id("session-1", "time")
+    instance = create_subagent_instance(
+        "time",
+        workspace_id=workspace_id,
+        conversation_id=conversation_id,
+    )
+    task = TaskEnvelope(
+        task_id="task-1",
+        session_id="session-1",
+        parent_task_id=None,
+        trace_id="run-1",
+        objective="query time",
+        skills=("pdf",),
+        verification=VerificationPlan(checklist=("non_empty_response",)),
+    )
+    _ = task_repo.create(task)
+    agent_repo.upsert_instance(
+        run_id="run-1",
+        trace_id="run-1",
+        session_id="session-1",
+        instance_id=instance.instance_id,
+        role_id="time",
+        workspace_id=instance.workspace_id,
+        conversation_id=instance.conversation_id,
+        status=InstanceStatus.IDLE,
+    )
+
+    result = await service.execute(
+        instance_id=instance.instance_id,
+        role_id="time",
+        task=task,
+    )
+
+    assert result.output == "ok"
+    assert skill_runtime_service.skill_name_calls == [("pdf",)]
+
+
+@pytest.mark.asyncio
 async def test_execute_runtime_snapshot_includes_skill_list_for_ui(
     tmp_path: Path,
 ) -> None:
@@ -329,13 +897,116 @@ async def test_execute_runtime_snapshot_includes_skill_list_for_ui(
         description="Reports the current time.",
         version="1",
         tools=(),
-        skills=("time",),
+        skills=("time", "missing_skill"),
         system_prompt="You are the time role.",
     )
     role_registry = RoleRegistry()
     role_registry.register(role)
 
     db_path = tmp_path / "task_execution_service_runtime_skill_list.db"
+    task_repo = TaskRepository(db_path)
+    agent_repo = AgentInstanceRepository(db_path)
+    message_repo = MessageRepository(db_path)
+    shared_store = SharedStateRepository(db_path)
+    skill_registry = SkillRegistry.from_config_dirs(app_config_dir=db_path.parent)
+    service = TaskExecutionService(
+        role_registry=role_registry,
+        task_repo=task_repo,
+        shared_store=shared_store,
+        event_bus=EventLog(db_path),
+        agent_repo=agent_repo,
+        message_repo=message_repo,
+        approval_ticket_repo=ApprovalTicketRepository(db_path),
+        run_runtime_repo=RunRuntimeRepository(db_path),
+        workspace_manager=WorkspaceManager(
+            project_root=Path("."), shared_store=shared_store
+        ),
+        prompt_builder=RuntimePromptBuilder(
+            role_registry=role_registry,
+            mcp_registry=McpRegistry(),
+        ),
+        provider_factory=lambda _, __=None: provider,
+        tool_registry=build_default_registry(),
+        skill_registry=skill_registry,
+        skill_runtime_service=SkillRuntimeService(
+            skill_registry=skill_registry,
+            retrieval_service=RetrievalService(
+                store=SqliteFts5RetrievalStore(db_path),
+            ),
+        ),
+        mcp_registry=McpRegistry(),
+        run_intent_repo=RunIntentRepository(db_path),
+    )
+    workspace_id = "default"
+    conversation_id = build_conversation_id("session-1", "time")
+    instance = create_subagent_instance(
+        "time",
+        workspace_id=workspace_id,
+        conversation_id=conversation_id,
+    )
+    task = TaskEnvelope(
+        task_id="task-1",
+        session_id="session-1",
+        parent_task_id="task-root",
+        trace_id="run-1",
+        objective="query time",
+        verification=VerificationPlan(checklist=("non_empty_response",)),
+    )
+    _ = task_repo.create(task)
+    agent_repo.upsert_instance(
+        run_id="run-1",
+        trace_id="run-1",
+        session_id="session-1",
+        instance_id=instance.instance_id,
+        role_id="time",
+        workspace_id=instance.workspace_id,
+        conversation_id=instance.conversation_id,
+        status=InstanceStatus.IDLE,
+    )
+    instance_id = instance.instance_id
+
+    result = await service.execute(
+        instance_id=instance_id,
+        role_id="time",
+        task=task,
+    )
+
+    assert result.output == "ok"
+    history = message_repo.get_history_for_task(instance_id, "task-1")
+    assert len(history) == 1
+    assert isinstance(history[0], ModelRequest)
+    prompt_content = history[0].parts[0].content
+    assert isinstance(prompt_content, str)
+    assert prompt_content == "query time"
+    assert "missing_skill" not in prompt_content
+    runtime_record = agent_repo.get_instance(instance_id)
+    assert "## Available Skills" in runtime_record.runtime_system_prompt
+    assert "- time:" in runtime_record.runtime_system_prompt
+    assert "missing_skill" not in runtime_record.runtime_system_prompt
+    tools_snapshot = json.loads(runtime_record.runtime_tools_json)
+    assert len(tools_snapshot["skill_tools"]) == 1
+    assert tools_snapshot["skill_tools"][0]["name"] == "load_skill"
+    assert tools_snapshot["skill_tools"][0]["source"] == "skill"
+    assert "absolute file paths" in tools_snapshot["skill_tools"][0]["description"]
+
+
+@pytest.mark.asyncio
+async def test_execute_runtime_prompt_lists_authorized_runtime_tools(
+    tmp_path: Path,
+) -> None:
+    provider = _CapturingProvider()
+    role = RoleDefinition(
+        role_id="reader",
+        name="reader",
+        description="Reads workspace files.",
+        version="1",
+        tools=("read",),
+        system_prompt="You are the reader role.",
+    )
+    role_registry = RoleRegistry()
+    role_registry.register(role)
+
+    db_path = tmp_path / "task_execution_service_runtime_tools_prompt.db"
     task_repo = TaskRepository(db_path)
     agent_repo = AgentInstanceRepository(db_path)
     message_repo = MessageRepository(db_path)
@@ -362,27 +1033,40 @@ async def test_execute_runtime_snapshot_includes_skill_list_for_ui(
         mcp_registry=McpRegistry(),
         run_intent_repo=RunIntentRepository(db_path),
     )
-    task, instance_id = _seed_task(
-        task_repo=task_repo,
-        agent_repo=agent_repo,
-        message_repo=message_repo,
+    instance = create_subagent_instance(
+        "reader",
+        workspace_id="default",
+        conversation_id=build_conversation_id("session-1", "reader"),
+    )
+    task = TaskEnvelope(
+        task_id="task-1",
+        session_id="session-1",
+        parent_task_id="task-root",
+        trace_id="run-1",
+        objective="read a file",
+        verification=VerificationPlan(checklist=("non_empty_response",)),
+    )
+    _ = task_repo.create(task)
+    agent_repo.upsert_instance(
+        run_id="run-1",
+        trace_id="run-1",
+        session_id="session-1",
+        instance_id=instance.instance_id,
+        role_id="reader",
+        workspace_id=instance.workspace_id,
+        conversation_id=instance.conversation_id,
+        status=InstanceStatus.IDLE,
     )
 
-    result = await service.execute(
-        instance_id=instance_id,
-        role_id="time",
+    _ = await service.execute(
+        instance_id=instance.instance_id,
+        role_id="reader",
         task=task,
     )
 
-    assert result == "ok"
-    runtime_record = agent_repo.get_instance(instance_id)
-    assert "## Available Skills" in runtime_record.runtime_system_prompt
-    assert "- time:" in runtime_record.runtime_system_prompt
-    tools_snapshot = json.loads(runtime_record.runtime_tools_json)
-    assert len(tools_snapshot["skill_tools"]) == 1
-    assert tools_snapshot["skill_tools"][0]["name"] == "load_skill"
-    assert tools_snapshot["skill_tools"][0]["source"] == "skill"
-    assert "absolute file paths" in tools_snapshot["skill_tools"][0]["description"]
+    runtime_record = agent_repo.get_instance(instance.instance_id)
+    assert "## Authorized Runtime Tools" in runtime_record.runtime_system_prompt
+    assert "Local Tools: read" in runtime_record.runtime_system_prompt
 
 
 @pytest.mark.asyncio
@@ -407,7 +1091,7 @@ async def test_execute_persists_followup_prompt_before_turn(
         user_prompt_override="Follow up: query time again.",
     )
 
-    assert result == "ok"
+    assert result.output == "ok"
     assert provider.prompts == [None]
     history = message_repo.get_history_for_task(instance_id, "task-1")
     assert len(history) == 2
@@ -433,7 +1117,7 @@ async def test_execute_passes_run_thinking_config_to_provider(tmp_path: Path) ->
         session_id=task.session_id,
         intent=IntentInput(
             session_id=task.session_id,
-            intent="query time",
+            input=content_parts_from_text("query time"),
             thinking=RunThinkingConfig(enabled=True, effort="high"),
         ),
     )
@@ -446,6 +1130,204 @@ async def test_execute_passes_run_thinking_config_to_provider(tmp_path: Path) ->
 
     assert provider.thinking_enabled == [True]
     assert provider.thinking_efforts == ["high"]
+
+
+@pytest.mark.asyncio
+async def test_execute_applies_normal_model_profile_to_root_task(
+    tmp_path: Path,
+) -> None:
+    provider = _CapturingProvider()
+    captured_roles: list[RoleDefinition] = []
+
+    def provider_factory(role: RoleDefinition, session_id: str | None) -> object:
+        _ = session_id
+        captured_roles.append(role)
+        return provider
+
+    service, task_repo, agent_repo, message_repo = _build_service(
+        tmp_path / "task_execution_service_normal_model_root.db",
+        provider,
+        provider_factory=provider_factory,
+    )
+    task, instance_id = _seed_task(
+        task_repo=task_repo,
+        agent_repo=agent_repo,
+        message_repo=message_repo,
+        parent_task_id=None,
+    )
+    assert service.run_intent_repo is not None
+    service.run_intent_repo.upsert(
+        run_id=task.trace_id,
+        session_id=task.session_id,
+        intent=IntentInput(
+            session_id=task.session_id,
+            input=content_parts_from_text("query time"),
+            normal_model_profile="fast",
+        ),
+    )
+
+    _ = await service.execute(
+        instance_id=instance_id,
+        role_id="time",
+        task=task,
+    )
+
+    assert captured_roles[0].model_profile == "fast"
+
+
+@pytest.mark.asyncio
+async def test_execute_does_not_apply_normal_model_profile_to_child_task(
+    tmp_path: Path,
+) -> None:
+    provider = _CapturingProvider()
+    captured_roles: list[RoleDefinition] = []
+
+    def provider_factory(role: RoleDefinition, session_id: str | None) -> object:
+        _ = session_id
+        captured_roles.append(role)
+        return provider
+
+    service, task_repo, agent_repo, message_repo = _build_service(
+        tmp_path / "task_execution_service_normal_model_child.db",
+        provider,
+        provider_factory=provider_factory,
+    )
+    task, instance_id = _seed_task(
+        task_repo=task_repo,
+        agent_repo=agent_repo,
+        message_repo=message_repo,
+    )
+    assert service.run_intent_repo is not None
+    service.run_intent_repo.upsert(
+        run_id=task.trace_id,
+        session_id=task.session_id,
+        intent=IntentInput(
+            session_id=task.session_id,
+            input=content_parts_from_text("query time"),
+            normal_model_profile="fast",
+        ),
+    )
+
+    _ = await service.execute(
+        instance_id=instance_id,
+        role_id="time",
+        task=task,
+    )
+
+    assert captured_roles[0].model_profile == "default"
+
+
+@pytest.mark.asyncio
+async def test_execute_root_intent_input_appends_routed_skill_candidates(
+    tmp_path: Path,
+) -> None:
+    provider = _CapturingProvider()
+    role = RoleDefinition(
+        role_id="time",
+        name="time",
+        description="Reports the current time.",
+        version="1",
+        tools=(),
+        skills=(
+            "time",
+            "planner",
+            "sql",
+            "docs",
+            "api",
+            "tests",
+            "frontend",
+            "ops",
+            "calendar",
+        ),
+        system_prompt="You are the time role.",
+    )
+    role_registry = RoleRegistry()
+    role_registry.register(role)
+    db_path = tmp_path / "task_execution_service_root_input_routing.db"
+    task_repo = TaskRepository(db_path)
+    agent_repo = AgentInstanceRepository(db_path)
+    message_repo = MessageRepository(db_path)
+    shared_store = SharedStateRepository(db_path)
+    run_intent_repo = RunIntentRepository(db_path)
+    service = TaskExecutionService(
+        role_registry=role_registry,
+        task_repo=task_repo,
+        shared_store=shared_store,
+        event_bus=EventLog(db_path),
+        agent_repo=agent_repo,
+        message_repo=message_repo,
+        approval_ticket_repo=ApprovalTicketRepository(db_path),
+        run_runtime_repo=RunRuntimeRepository(db_path),
+        workspace_manager=WorkspaceManager(
+            project_root=Path("."), shared_store=shared_store
+        ),
+        prompt_builder=_StaticPromptBuilder(
+            role_registry=role_registry,
+            mcp_registry=McpRegistry(),
+        ),
+        provider_factory=lambda _, __=None: provider,
+        tool_registry=build_default_registry(),
+        skill_registry=_StaticSkillRegistry(),
+        skill_runtime_service=_StaticSkillRuntimeService(),
+        mcp_registry=McpRegistry(),
+        run_intent_repo=run_intent_repo,
+        media_asset_service=MediaAssetService(
+            repository=MediaAssetRepository(db_path),
+            workspace_manager=WorkspaceManager(
+                project_root=Path("."), shared_store=shared_store
+            ),
+        ),
+    )
+    workspace_id = "default"
+    conversation_id = build_conversation_id("session-1", "time")
+    instance = create_subagent_instance(
+        "time",
+        workspace_id=workspace_id,
+        conversation_id=conversation_id,
+    )
+    task = TaskEnvelope(
+        task_id="task-1",
+        session_id="session-1",
+        parent_task_id=None,
+        trace_id="run-1",
+        objective="query time",
+        verification=VerificationPlan(checklist=("non_empty_response",)),
+    )
+    _ = task_repo.create(task)
+    agent_repo.upsert_instance(
+        run_id="run-1",
+        trace_id="run-1",
+        session_id="session-1",
+        instance_id=instance.instance_id,
+        role_id="time",
+        workspace_id=instance.workspace_id,
+        conversation_id=instance.conversation_id,
+        status=InstanceStatus.IDLE,
+    )
+    run_intent_repo.upsert(
+        run_id="run-1",
+        session_id="session-1",
+        intent=IntentInput(
+            session_id="session-1",
+            input=content_parts_from_text("query time"),
+        ),
+    )
+
+    result = await service.execute(
+        instance_id=instance.instance_id,
+        role_id="time",
+        task=task,
+    )
+
+    assert result.output == "ok"
+    history = message_repo.get_history_for_task(instance.instance_id, "task-1")
+    assert len(history) == 1
+    assert isinstance(history[0], ModelRequest)
+    prompt_content = history[0].parts[0].content
+    assert isinstance(prompt_content, str)
+    assert prompt_content.startswith("query time")
+    assert "## Skill Candidates" in prompt_content
+    assert "- time:" in prompt_content
 
 
 @pytest.mark.asyncio
@@ -487,6 +1369,147 @@ async def test_execute_marks_run_stop_as_stopped_idle_not_paused_followup(
     record = task_repo.get(task.task_id)
     assert record.status == TaskStatus.STOPPED
     assert record.error_message == "Task stopped by user"
+
+
+@pytest.mark.asyncio
+async def test_execute_finishes_cancelled_persistence_after_repeated_cancel(
+    tmp_path: Path,
+) -> None:
+    (
+        service,
+        task_repo,
+        agent_repo,
+        message_repo,
+        run_runtime_repo,
+        _run_control_manager,
+    ) = _build_service_with_control(
+        tmp_path / "task_execution_service_repeated_cancel.db",
+        _InterruptingProvider(),
+    )
+    control = _BlockingRunControlManager()
+    control.bind_runtime(
+        run_event_hub=RunEventHub(),
+        injection_manager=RunInjectionManager(),
+        agent_repo=agent_repo,
+        task_repo=task_repo,
+        message_repo=message_repo,
+        event_bus=service.event_bus,
+        run_runtime_repo=run_runtime_repo,
+    )
+    service.run_control_manager = control
+    task, instance_id = _seed_task(
+        task_repo=task_repo,
+        agent_repo=agent_repo,
+        message_repo=message_repo,
+    )
+    _ = control.request_run_stop("run-1")
+
+    execution = asyncio.create_task(
+        service.execute(
+            instance_id=instance_id,
+            role_id="time",
+            task=task,
+        )
+    )
+    await control.started.wait()
+    execution.cancel()
+    await asyncio.sleep(0)
+    assert not execution.done()
+    execution.cancel()
+    await asyncio.sleep(0)
+    assert not execution.done()
+
+    control.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        _ = await execution
+
+    runtime = run_runtime_repo.get("run-1")
+    assert runtime is not None
+    assert runtime.status == RunRuntimeStatus.STOPPED
+    assert runtime.phase == RunRuntimePhase.IDLE
+    assert control.completed is True
+    assert task_repo.get(task.task_id).status == TaskStatus.STOPPED
+    assert agent_repo.get_instance(instance_id).status == InstanceStatus.STOPPED
+
+
+@pytest.mark.asyncio
+async def test_execute_marks_non_user_cancellation_as_failed(
+    tmp_path: Path,
+) -> None:
+    (
+        service,
+        task_repo,
+        agent_repo,
+        message_repo,
+        run_runtime_repo,
+        _run_control_manager,
+    ) = _build_service_with_control(
+        tmp_path / "task_execution_service_non_user_cancel.db",
+        _InterruptingProvider(),
+    )
+    task, instance_id = _seed_task(
+        task_repo=task_repo,
+        agent_repo=agent_repo,
+        message_repo=message_repo,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await service.execute(
+            instance_id=instance_id,
+            role_id="time",
+            task=task,
+        )
+
+    runtime = run_runtime_repo.get("run-1")
+    assert runtime is not None
+    assert runtime.status == RunRuntimeStatus.FAILED
+    assert runtime.phase == RunRuntimePhase.IDLE
+    assert runtime.last_error == "Task cancelled"
+    record = task_repo.get(task.task_id)
+    assert record.status == TaskStatus.FAILED
+    assert record.error_message == "Task cancelled"
+    instance = agent_repo.get_instance(instance_id)
+    assert instance.status == InstanceStatus.FAILED
+    events = EventLog(
+        tmp_path / "task_execution_service_non_user_cancel.db"
+    ).list_by_session("session-1")
+    assert str(events[-1]["event_type"]) == EventType.TASK_FAILED.value
+
+
+@pytest.mark.asyncio
+async def test_execute_marks_unmanaged_cancellation_as_failed(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "task_execution_service_unmanaged_cancel.db"
+    service, task_repo, agent_repo, message_repo = _build_service(
+        db_path,
+        _InterruptingProvider(),
+    )
+    task, instance_id = _seed_task(
+        task_repo=task_repo,
+        agent_repo=agent_repo,
+        message_repo=message_repo,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await service.execute(
+            instance_id=instance_id,
+            role_id="time",
+            task=task,
+        )
+
+    runtime = RunRuntimeRepository(db_path).get("run-1")
+    assert runtime is not None
+    assert runtime.status == RunRuntimeStatus.FAILED
+    assert runtime.phase == RunRuntimePhase.IDLE
+    assert runtime.last_error == "Task cancelled"
+    record = task_repo.get(task.task_id)
+    assert record.status == TaskStatus.FAILED
+    assert record.error_message == "Task cancelled"
+    instance = agent_repo.get_instance(instance_id)
+    assert instance.status == InstanceStatus.FAILED
+    events = EventLog(db_path).list_by_session("session-1")
+    assert str(events[-1]["event_type"]) == EventType.TASK_FAILED.value
 
 
 @pytest.mark.asyncio
@@ -534,6 +1557,147 @@ async def test_execute_marks_subagent_stop_as_awaiting_followup(
 
 
 @pytest.mark.asyncio
+async def test_execute_keeps_run_running_when_parallel_subagent_is_stopped(
+    tmp_path: Path,
+) -> None:
+    (
+        service,
+        task_repo,
+        agent_repo,
+        message_repo,
+        run_runtime_repo,
+        run_control_manager,
+    ) = _build_service_with_control(
+        tmp_path / "task_execution_service_subagent_stop_parallel.db",
+        _InterruptingProvider(),
+    )
+    task, instance_id = _seed_task(
+        task_repo=task_repo,
+        agent_repo=agent_repo,
+        message_repo=message_repo,
+    )
+    running_task = TaskEnvelope(
+        task_id="task-2",
+        session_id="session-1",
+        parent_task_id="task-root",
+        trace_id="run-1",
+        role_id="time",
+        objective="query time in parallel",
+        verification=VerificationPlan(checklist=("non_empty_response",)),
+    )
+    _ = task_repo.create(running_task)
+    task_repo.update_status(
+        running_task.task_id,
+        TaskStatus.RUNNING,
+        assigned_instance_id="inst-running",
+    )
+    _ = run_control_manager.request_subagent_stop(
+        run_id="run-1",
+        instance_id=instance_id,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await service.execute(
+            instance_id=instance_id,
+            role_id="time",
+            task=task,
+        )
+
+    runtime = run_runtime_repo.get("run-1")
+    assert runtime is not None
+    assert runtime.status == RunRuntimeStatus.RUNNING
+    assert runtime.phase == RunRuntimePhase.SUBAGENT_RUNNING
+    assert runtime.active_task_id == running_task.task_id
+    assert runtime.active_role_id == "time"
+    assert runtime.active_subagent_instance_id == "inst-running"
+    assert runtime.last_error == "Task stopped by user"
+    record = task_repo.get(task.task_id)
+    assert record.status == TaskStatus.STOPPED
+    assert record.error_message == "Task stopped by user"
+
+
+@pytest.mark.asyncio
+async def test_execute_marks_recoverable_pause_as_awaiting_recovery(
+    tmp_path: Path,
+) -> None:
+    (
+        service,
+        task_repo,
+        agent_repo,
+        message_repo,
+        run_runtime_repo,
+        _run_control_manager,
+    ) = _build_service_with_control(
+        tmp_path / "task_execution_service_pause.db",
+        _RecoverablePauseProvider(),
+    )
+    task, instance_id = _seed_task(
+        task_repo=task_repo,
+        agent_repo=agent_repo,
+        message_repo=message_repo,
+    )
+
+    with pytest.raises(RecoverableRunPauseError):
+        await service.execute(
+            instance_id=instance_id,
+            role_id="time",
+            task=task,
+        )
+
+    runtime = run_runtime_repo.get("run-1")
+    assert runtime is not None
+    assert runtime.status == RunRuntimeStatus.PAUSED
+    assert runtime.phase == RunRuntimePhase.AWAITING_RECOVERY
+    assert runtime.active_task_id == task.task_id
+    assert runtime.active_role_id == "time"
+    assert runtime.active_instance_id == instance_id
+    assert runtime.active_subagent_instance_id == instance_id
+    assert runtime.last_error == "stream interrupted"
+    record = task_repo.get(task.task_id)
+    assert record.status == TaskStatus.STOPPED
+    assert record.error_message == "stream interrupted"
+
+
+@pytest.mark.asyncio
+async def test_execute_marks_assistant_error_path_as_failed(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "task_execution_service_assistant_error.db"
+    service, task_repo, agent_repo, message_repo = _build_service(
+        db_path,
+        _ExplodingProvider(),
+    )
+    task, instance_id = _seed_task(
+        task_repo=task_repo,
+        agent_repo=agent_repo,
+        message_repo=message_repo,
+    )
+
+    result = await service.execute(
+        instance_id=instance_id,
+        role_id="time",
+        task=task,
+    )
+
+    assert result.completion_reason == RunCompletionReason.ASSISTANT_ERROR
+    assert result.error_code == "internal_execution_error"
+    assert result.error_message == "boom"
+    record = task_repo.get(task.task_id)
+    assert record.status == TaskStatus.FAILED
+    assert record.error_message == "boom"
+    assert record.result
+    instance = agent_repo.get_instance(instance_id)
+    assert instance.status == InstanceStatus.FAILED
+    runtime = RunRuntimeRepository(db_path).get("run-1")
+    assert runtime is not None
+    assert runtime.status == RunRuntimeStatus.RUNNING
+    assert runtime.phase == RunRuntimePhase.IDLE
+    assert runtime.last_error == "boom"
+    events = EventLog(db_path).list_by_session("session-1")
+    assert str(events[-1]["event_type"]) == EventType.TASK_FAILED.value
+
+
+@pytest.mark.asyncio
 async def test_execute_coordinator_receives_task_runtime_contract(
     tmp_path: Path,
 ) -> None:
@@ -541,11 +1705,11 @@ async def test_execute_coordinator_receives_task_runtime_contract(
     role_registry = RoleRegistry()
     role_registry.register(
         RoleDefinition(
-            role_id="coordinator_agent",
+            role_id="Coordinator",
             name="Coordinator Agent",
             description="Coordinates delegated work.",
             version="1",
-            tools=("create_tasks", "update_task", "dispatch_task"),
+            tools=("orch_create_tasks", "orch_update_task", "orch_dispatch_task"),
             system_prompt="Coordinate tasks.",
         )
     )
@@ -567,9 +1731,9 @@ async def test_execute_coordinator_receives_task_runtime_contract(
     message_repo = MessageRepository(db_path)
     shared_store = SharedStateRepository(db_path)
     workspace_id = "default"
-    conversation_id = build_conversation_id("session-1", "coordinator_agent")
+    conversation_id = build_conversation_id("session-1", "Coordinator")
     instance = create_subagent_instance(
-        "coordinator_agent",
+        "Coordinator",
         workspace_id=workspace_id,
         conversation_id=conversation_id,
     )
@@ -587,7 +1751,7 @@ async def test_execute_coordinator_receives_task_runtime_contract(
         trace_id="run-1",
         session_id="session-1",
         instance_id=instance.instance_id,
-        role_id="coordinator_agent",
+        role_id="Coordinator",
         workspace_id=instance.workspace_id,
         conversation_id=instance.conversation_id,
         status=InstanceStatus.IDLE,
@@ -616,11 +1780,11 @@ async def test_execute_coordinator_receives_task_runtime_contract(
 
     result = await service.execute(
         instance_id=instance.instance_id,
-        role_id="coordinator_agent",
+        role_id="Coordinator",
         task=task,
     )
 
-    assert result == "ok"
+    assert result.output == "ok"
     assert provider.system_prompts
     assert "Coordinate tasks." in provider.system_prompts[0]
     assert "## Orchestration Rules" in provider.system_prompts[0]
@@ -630,10 +1794,18 @@ async def test_execute_coordinator_receives_task_runtime_contract(
         in provider.system_prompts[0]
     )
     assert (
+        "If no existing role is a good fit, create a run-scoped role with `orch_create_temporary_role` before dispatch."
+        in provider.system_prompts[0]
+    )
+    assert (
         "The roles listed below are dispatch targets, not your own capabilities."
         in provider.system_prompts[0]
     )
     assert "### writer_agent" in provider.system_prompts[0]
+    assert "- Source: static" in provider.system_prompts[0]
+    assert "## Workspace Environments" in provider.system_prompts[0]
+    assert "- Workspace ID: default" in provider.system_prompts[0]
+    assert "### Mount: default (default)" in provider.system_prompts[0]
 
 
 @pytest.mark.asyncio
@@ -643,11 +1815,11 @@ async def test_build_runtime_tools_snapshot_uses_external_tool_descriptions(
     role_registry = RoleRegistry()
     role_registry.register(
         RoleDefinition(
-            role_id="coordinator_agent",
+            role_id="Coordinator",
             name="Coordinator Agent",
             description="Coordinates delegated work.",
             version="1",
-            tools=("create_tasks", "update_task", "dispatch_task"),
+            tools=("orch_create_tasks", "orch_update_task", "orch_dispatch_task"),
             system_prompt="Coordinate tasks.",
         )
     )
@@ -657,7 +1829,7 @@ async def test_build_runtime_tools_snapshot_uses_external_tool_descriptions(
             name="Writer Agent",
             description="Writes implementation changes.",
             version="1",
-            tools=("read", "write"),
+            tools=("read", "write", "orch_dispatch_task"),
             mcp_servers=(),
             skills=(),
             system_prompt="Write tasks.",
@@ -687,10 +1859,12 @@ async def test_build_runtime_tools_snapshot_uses_external_tool_descriptions(
         mcp_registry=McpRegistry(),
     )
 
-    coordinator_snapshot = await service._build_runtime_tools_snapshot(
-        role_registry.get("coordinator_agent")
+    coordinator_snapshot = (
+        await service._execution_harness().build_runtime_tools_snapshot(
+            role_registry.get("Coordinator")
+        )
     )
-    writer_snapshot = await service._build_runtime_tools_snapshot(
+    writer_snapshot = await service._execution_harness().build_runtime_tools_snapshot(
         role_registry.get("writer_agent")
     )
 
@@ -701,19 +1875,110 @@ async def test_build_runtime_tools_snapshot_uses_external_tool_descriptions(
         entry.name: entry.description for entry in writer_snapshot.local_tools
     }
 
-    assert coordinator_tools["create_tasks"].startswith(
+    assert coordinator_tools["orch_create_tasks"].startswith(
         "Create one or more run-scoped delegated task contracts."
     )
-    assert writer_tools["read"].startswith(
-        "Read a file or directory from the workspace."
-    )
+    assert writer_tools["read"].startswith("Read a file or directory from disk.")
     assert writer_tools["write"].startswith(
         "Write full file contents to the workspace."
     )
+    assert "orch_dispatch_task" not in writer_tools
 
 
 @pytest.mark.asyncio
-async def test_execute_injects_memory_and_records_role_memory(tmp_path: Path) -> None:
+async def test_build_runtime_tools_snapshot_accepts_agent_tool_keyword_options(
+    tmp_path: Path,
+) -> None:
+    role_registry = RoleRegistry()
+    role = RoleDefinition(
+        role_id="generated_tool_user",
+        name="Generated Tool User",
+        description="Uses generated tools.",
+        version="1",
+        tools=("generated_runtime_tool",),
+        mcp_servers=(),
+        skills=(),
+        system_prompt="Use generated tools.",
+    )
+    role_registry.register(role)
+
+    def register_generated_tool(agent: Agent[ToolDeps, str]) -> None:
+        @agent.tool(
+            name="generated_runtime_tool",
+            description="Generated tool description.",
+            timeout=31.0,
+            metadata={"source": "unit-test"},
+        )
+        def generated_tool(ctx: RunContext[ToolDeps]) -> str:
+            _ = ctx
+            return "ok"
+
+    harness = TaskToolHarness(
+        role_registry=role_registry,
+        tool_registry=ToolRegistry({"generated_runtime_tool": register_generated_tool}),
+        skill_registry=SkillRegistry.from_config_dirs(app_config_dir=tmp_path),
+        mcp_registry=McpRegistry(),
+    )
+
+    snapshot = await harness.build_runtime_tools_snapshot(role)
+
+    assert len(snapshot.local_tools) == 1
+    assert snapshot.local_tools[0].name == "generated_runtime_tool"
+    assert snapshot.local_tools[0].description == "Generated tool description."
+
+
+@pytest.mark.asyncio
+async def test_build_runtime_tools_snapshot_skips_mcp_servers_that_fail_to_load(
+    tmp_path: Path,
+) -> None:
+    role_registry = RoleRegistry()
+    role_registry.register(
+        RoleDefinition(
+            role_id="docs_agent",
+            name="Docs Agent",
+            description="Uses documentation.",
+            version="1",
+            tools=("read",),
+            mcp_servers=("docs", "broken"),
+            system_prompt="Read docs.",
+        )
+    )
+    db_path = tmp_path / "task_execution_service_mcp_snapshot.db"
+    shared_store = SharedStateRepository(db_path)
+    mcp_registry = _PartiallyFailingToolSchemaMcpRegistry()
+    service = TaskExecutionService(
+        role_registry=role_registry,
+        task_repo=TaskRepository(db_path),
+        shared_store=shared_store,
+        event_bus=EventLog(db_path),
+        agent_repo=AgentInstanceRepository(db_path),
+        message_repo=MessageRepository(db_path),
+        approval_ticket_repo=ApprovalTicketRepository(db_path),
+        run_runtime_repo=RunRuntimeRepository(db_path),
+        workspace_manager=WorkspaceManager(
+            project_root=Path("."), shared_store=shared_store
+        ),
+        prompt_builder=RuntimePromptBuilder(
+            role_registry=role_registry,
+            mcp_registry=mcp_registry,
+        ),
+        provider_factory=lambda _, __=None: _CapturingProvider(),
+        tool_registry=build_default_registry(),
+        skill_registry=SkillRegistry.from_config_dirs(app_config_dir=db_path.parent),
+        mcp_registry=mcp_registry,
+    )
+
+    snapshot = await service._execution_harness().build_runtime_tools_snapshot(
+        role_registry.get("docs_agent")
+    )
+
+    assert [entry.name for entry in snapshot.mcp_tools] == ["docs_search"]
+    assert [entry.server_name for entry in snapshot.mcp_tools] == ["docs"]
+    assert "read" in {entry.name for entry in snapshot.local_tools}
+
+
+@pytest.mark.asyncio
+async def test_execute_injects_memory_bank_entries(tmp_path: Path) -> None:
     provider = _CapturingProvider()
     project_root = tmp_path / "project"
     project_root.mkdir()
@@ -727,29 +1992,39 @@ async def test_execute_injects_memory_and_records_role_memory(tmp_path: Path) ->
     )
     role_registry = RoleRegistry()
     role_registry.register(role)
-    db_path = tmp_path / "task_execution_service_role_memory.db"
+    db_path = tmp_path / "task_execution_service_memory_bank.db"
     task_repo = TaskRepository(db_path)
     agent_repo = AgentInstanceRepository(db_path)
     message_repo = MessageRepository(db_path)
     shared_store = SharedStateRepository(db_path)
-    role_memory_service = RoleMemoryService(repository=RoleMemoryRepository(db_path))
-    role_memory_service.record_task_result(
-        role_id="time",
-        workspace_id="default",
-        session_id="seed-session",
-        task_id="seed-task",
-        objective="Be concise",
-        result="Prefer concise output.",
-        transcript_lines=(),
+    memory_bank_service = MemoryBankService(repository=MemoryBankRepository(db_path))
+    await memory_bank_service.create_entry_async(
+        CreateMemoryEntryRequest(
+            tier=MemoryTier.PERSISTENT,
+            scope=MemoryScope.ROLE,
+            workspace_id="default",
+            role_id="time",
+            kind=MemoryEntryKind.INSIGHT,
+            content=MemoryContent(
+                title="Concise output",
+                body="Prefer concise output.",
+            ),
+            source=MemorySourceKind.MANUAL,
+        )
     )
-    role_memory_service.record_task_result(
-        role_id="time",
-        workspace_id="other-workspace",
-        session_id="other-session",
-        task_id="other-task",
-        objective="Use other cwd",
-        result="Refer to /d/workspace/aider.",
-        transcript_lines=(),
+    await memory_bank_service.create_entry_async(
+        CreateMemoryEntryRequest(
+            tier=MemoryTier.PERSISTENT,
+            scope=MemoryScope.ROLE,
+            workspace_id="other-workspace",
+            role_id="time",
+            kind=MemoryEntryKind.INSIGHT,
+            content=MemoryContent(
+                title="Other workspace",
+                body="Refer to /d/workspace/aider.",
+            ),
+            source=MemorySourceKind.MANUAL,
+        )
     )
     service = TaskExecutionService(
         role_registry=role_registry,
@@ -771,7 +2046,7 @@ async def test_execute_injects_memory_and_records_role_memory(tmp_path: Path) ->
         tool_registry=build_default_registry(),
         skill_registry=SkillRegistry.from_config_dirs(app_config_dir=db_path.parent),
         mcp_registry=McpRegistry(),
-        role_memory_service=role_memory_service,
+        memory_bank_service=memory_bank_service,
     )
     task, instance_id = _seed_task(
         task_repo=task_repo,
@@ -785,15 +2060,8 @@ async def test_execute_injects_memory_and_records_role_memory(tmp_path: Path) ->
         task=task,
     )
 
-    assert result == "ok"
+    assert result.output == "ok"
     assert provider.system_prompts
-    assert "## Reflection Memory" in provider.system_prompts[0]
-    assert "Prefer concise output." in provider.system_prompts[0]
+    assert "## Project Memory" in provider.system_prompts[0]
+    assert "Concise output" in provider.system_prompts[0]
     assert "/d/workspace/aider" not in provider.system_prompts[0]
-    durable = role_memory_service.build_injected_memory(
-        role_id="time",
-        workspace_id="default",
-    )
-    assert "Prefer concise output." in durable
-    assert "query time: ok" not in durable
-    assert "Refer to /d/workspace/aider." not in durable

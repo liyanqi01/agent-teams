@@ -5,11 +5,16 @@ import json
 import os
 from pathlib import Path
 
-from agent_teams.mcp import mcp_config_manager as config_manager
-from agent_teams.mcp.mcp_models import McpConfigScope
+from pydantic_ai.mcp import MCPServerStdio
+
+import relay_teams.mcp.mcp_config_manager as config_manager
+from relay_teams.env import runtime_env
+from relay_teams.mcp.mcp_models import McpConfigScope
+from relay_teams.mcp.mcp_registry import build_mcp_server
 
 
 def _clear_proxy_env(monkeypatch) -> None:
+    runtime_env.SYNCED_APP_ENV_KEYS.clear()
     for key in (
         "HTTP_PROXY",
         "http_proxy",
@@ -20,15 +25,34 @@ def _clear_proxy_env(monkeypatch) -> None:
         "NO_PROXY",
         "no_proxy",
         "SSL_VERIFY",
+        "NODE_USE_ENV_PROXY",
+        "NODE_TLS_REJECT_UNAUTHORIZED",
+        "NPM_CONFIG_PROXY",
+        "npm_config_proxy",
+        "NPM_CONFIG_HTTPS_PROXY",
+        "npm_config_https_proxy",
+        "NPM_CONFIG_NOPROXY",
+        "npm_config_noproxy",
+        "NPM_CONFIG_STRICT_SSL",
+        "npm_config_strict_ssl",
     ):
         monkeypatch.delenv(key, raising=False)
 
 
 def _set_test_app_config_dir(monkeypatch, config_dir: Path) -> None:
     monkeypatch.setattr(
-        "agent_teams.env.runtime_env.get_app_config_dir",
+        "relay_teams.env.runtime_env.get_app_config_dir",
         lambda user_home_dir=None: config_dir,
     )
+
+
+class _FakeProxySecretStore:
+    def __init__(self, password: str | None) -> None:
+        self._password = password
+
+    def get_password(self, config_dir: Path) -> str | None:
+        _ = config_dir
+        return self._password
 
 
 def test_load_registry_reads_app_scope_only(tmp_path: Path) -> None:
@@ -59,7 +83,7 @@ def test_load_registry_reads_app_scope_only(tmp_path: Path) -> None:
     assert registry.get_spec("shared").server_config["command"] == "app-shared"
 
 
-def test_load_registry_applies_proxy_env_to_all_mcp_server_configs(
+def test_load_registry_applies_proxy_env_to_remote_mcp_server_configs(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -79,6 +103,14 @@ def test_load_registry_applies_proxy_env_to_all_mcp_server_configs(
                     "filesystem": {
                         "command": "uvx",
                         "args": ["mcp-server-filesystem"],
+                    },
+                    "stdio_proxy": {
+                        "transport": "stdio",
+                        "command": "uvx",
+                        "args": ["mcp-server-filesystem"],
+                        "env": {
+                            "HTTP_PROXY": "http://stdio-proxy.internal:9000",
+                        },
                     },
                     "events": {
                         "transport": "sse",
@@ -103,14 +135,143 @@ def test_load_registry_applies_proxy_env_to_all_mcp_server_configs(
         "http_proxy": "http://proxy.internal:8080",
         "NO_PROXY": "localhost,127.0.0.1",
         "no_proxy": "localhost,127.0.0.1",
+        "NODE_USE_ENV_PROXY": "1",
+        "NPM_CONFIG_PROXY": "http://proxy.internal:8080",
+        "npm_config_proxy": "http://proxy.internal:8080",
+        "NPM_CONFIG_HTTPS_PROXY": "http://proxy.internal:8080",
+        "npm_config_https_proxy": "http://proxy.internal:8080",
+        "NPM_CONFIG_NOPROXY": "localhost,127.0.0.1",
+        "npm_config_noproxy": "localhost,127.0.0.1",
     }
-    assert registry.get_spec("filesystem").server_config["env"] == expected_proxy_env
+    assert "env" not in registry.get_spec("filesystem").server_config
+    assert registry.get_spec("stdio_proxy").server_config["env"] == {
+        "HTTP_PROXY": "http://stdio-proxy.internal:9000",
+    }
     assert registry.get_spec("events").server_config["env"] == expected_proxy_env
     assert registry.get_spec("api").server_config["env"] == expected_proxy_env
     assert os.environ["HTTP_PROXY"] == "http://proxy.internal:8080"
     assert os.environ["http_proxy"] == "http://proxy.internal:8080"
     assert os.environ["NO_PROXY"] == "localhost,127.0.0.1"
     assert os.environ["no_proxy"] == "localhost,127.0.0.1"
+    assert os.environ["NODE_USE_ENV_PROXY"] == "1"
+    assert os.environ["npm_config_proxy"] == "http://proxy.internal:8080"
+    assert os.environ["npm_config_https_proxy"] == "http://proxy.internal:8080"
+    assert os.environ["npm_config_noproxy"] == "localhost,127.0.0.1"
+
+
+def test_load_registry_hydrates_saved_proxy_password_for_mcp_runtime(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _clear_proxy_env(monkeypatch)
+    app_config_dir = tmp_path / ".agent-teams"
+    app_config_dir.mkdir(parents=True)
+    _set_test_app_config_dir(monkeypatch, app_config_dir)
+    monkeypatch.setattr(
+        "relay_teams.env.proxy_env.get_proxy_secret_store",
+        lambda: _FakeProxySecretStore("secret"),
+    )
+    (app_config_dir / ".env").write_text(
+        "HTTPS_PROXY=http://alice@proxy.internal:8443\n",
+        encoding="utf-8",
+    )
+    (app_config_dir / "mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "stdio": {
+                        "command": "uvx",
+                        "args": ["mcp-server-filesystem"],
+                    },
+                    "remote": {
+                        "transport": "http",
+                        "url": "https://example.com/mcp",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manager = config_manager.McpConfigManager(app_config_dir=app_config_dir)
+
+    registry = manager.load_registry()
+    remote_env = registry.get_spec("remote").server_config["env"]
+    stdio_toolset = registry.get_toolsets(("stdio",))[0]
+
+    assert isinstance(remote_env, dict)
+    assert remote_env["HTTPS_PROXY"] == "http://alice:secret@proxy.internal:8443"
+    assert (
+        remote_env["NPM_CONFIG_HTTPS_PROXY"]
+        == "http://alice:secret@proxy.internal:8443"
+    )
+    assert "env" not in registry.get_spec("stdio").server_config
+    assert isinstance(stdio_toolset, MCPServerStdio)
+    assert stdio_toolset.env is not None
+    assert stdio_toolset.env["HTTPS_PROXY"] == "http://alice:secret@proxy.internal:8443"
+    assert (
+        stdio_toolset.env["NPM_CONFIG_HTTPS_PROXY"]
+        == "http://alice:secret@proxy.internal:8443"
+    )
+    assert os.environ["HTTPS_PROXY"] == "http://alice:secret@proxy.internal:8443"
+
+
+def test_load_registry_preserves_process_proxy_for_mcp_runtime(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("HTTPS_PROXY", "http://process-proxy.internal:8443")
+    monkeypatch.setenv("NO_PROXY", "localhost,.internal")
+    monkeypatch.setitem(
+        runtime_env.PROCESS_ENV_BASELINE,
+        "HTTPS_PROXY",
+        "http://process-proxy.internal:8443",
+    )
+    monkeypatch.setitem(
+        runtime_env.PROCESS_ENV_BASELINE,
+        "NO_PROXY",
+        "localhost,.internal",
+    )
+    app_config_dir = tmp_path / ".agent-teams"
+    app_config_dir.mkdir(parents=True)
+    _set_test_app_config_dir(monkeypatch, app_config_dir)
+    (app_config_dir / "mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "stdio": {
+                        "command": "uvx",
+                        "args": ["mcp-server-filesystem"],
+                    },
+                    "remote": {
+                        "transport": "http",
+                        "url": "https://example.com/mcp",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manager = config_manager.McpConfigManager(app_config_dir=app_config_dir)
+
+    registry = manager.load_registry()
+    remote_env = registry.get_spec("remote").server_config["env"]
+    stdio_toolset = registry.get_toolsets(("stdio",))[0]
+
+    assert isinstance(remote_env, dict)
+    assert remote_env["HTTPS_PROXY"] == "http://process-proxy.internal:8443"
+    assert remote_env["NO_PROXY"] == "localhost,.internal"
+    assert remote_env["NPM_CONFIG_NOPROXY"] == "localhost,.internal"
+    assert "env" not in registry.get_spec("stdio").server_config
+    assert isinstance(stdio_toolset, MCPServerStdio)
+    assert stdio_toolset.env is not None
+    assert stdio_toolset.env["HTTPS_PROXY"] == "http://process-proxy.internal:8443"
+    assert stdio_toolset.env["NO_PROXY"] == "localhost,.internal"
+    assert stdio_toolset.env["NPM_CONFIG_NOPROXY"] == "localhost,.internal"
+    assert os.environ["HTTPS_PROXY"] == "http://process-proxy.internal:8443"
+    assert os.environ["NO_PROXY"] == "localhost,.internal"
 
 
 def test_load_registry_preserves_explicit_server_env_over_proxy_defaults(
@@ -146,12 +307,17 @@ def test_load_registry_preserves_explicit_server_env_over_proxy_defaults(
     manager = config_manager.McpConfigManager(app_config_dir=app_config_dir)
 
     registry = manager.load_registry()
+    server_env = registry.get_spec("remote").server_config["env"]
 
-    assert registry.get_spec("remote").server_config["env"] == {
-        "HTTP_PROXY": "http://custom-proxy.internal:9000",
-        "http_proxy": "http://custom-proxy.internal:9000",
-        "CUSTOM_TOKEN": "secret",
-    }
+    assert isinstance(server_env, dict)
+    assert server_env["HTTP_PROXY"] == "http://custom-proxy.internal:9000"
+    assert server_env["http_proxy"] == "http://custom-proxy.internal:9000"
+    assert server_env["NODE_USE_ENV_PROXY"] == "1"
+    assert server_env["NPM_CONFIG_PROXY"] == "http://custom-proxy.internal:9000"
+    assert server_env["npm_config_proxy"] == "http://custom-proxy.internal:9000"
+    assert server_env["NPM_CONFIG_HTTPS_PROXY"] == "http://custom-proxy.internal:9000"
+    assert server_env["npm_config_https_proxy"] == "http://custom-proxy.internal:9000"
+    assert server_env["CUSTOM_TOKEN"] == "secret"
 
 
 def test_load_registry_accepts_utf8_bom(tmp_path: Path) -> None:
@@ -175,6 +341,542 @@ def test_load_registry_accepts_utf8_bom(tmp_path: Path) -> None:
     registry = manager.load_registry()
 
     assert registry.list_names() == ("time-mcp",)
+
+
+def test_add_server_writes_app_mcp_config_and_reload_discovers_it(
+    tmp_path: Path,
+) -> None:
+    app_config_dir = tmp_path / ".agent-teams"
+    app_config_dir.mkdir(parents=True)
+    manager = config_manager.McpConfigManager(app_config_dir=app_config_dir)
+
+    config_path = manager.add_server(
+        name="filesystem",
+        server_config={
+            "type": "local",
+            "command": ["npx", "-y", "@modelcontextprotocol/server-filesystem"],
+        },
+    )
+
+    assert config_path == app_config_dir / "mcp.json"
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    assert payload["mcpServers"]["filesystem"] == {
+        "type": "local",
+        "command": "npx",
+        "transport": "stdio",
+        "args": ["-y", "@modelcontextprotocol/server-filesystem"],
+    }
+    registry = manager.load_registry()
+    assert registry.get_spec("filesystem").server_config["command"] == "npx"
+
+
+def test_add_server_preserves_legacy_top_level_mcp_servers(tmp_path: Path) -> None:
+    app_config_dir = tmp_path / ".agent-teams"
+    app_config_dir.mkdir(parents=True)
+    config_path = app_config_dir / "mcp.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "existing": {
+                    "transport": "stdio",
+                    "command": "uvx",
+                    "args": ["existing-server"],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    manager = config_manager.McpConfigManager(app_config_dir=app_config_dir)
+
+    manager.add_server(
+        name="filesystem",
+        server_config={
+            "transport": "stdio",
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-filesystem"],
+        },
+    )
+
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    assert payload == {
+        "mcpServers": {
+            "existing": {
+                "transport": "stdio",
+                "command": "uvx",
+                "args": ["existing-server"],
+            },
+            "filesystem": {
+                "transport": "stdio",
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-filesystem"],
+            },
+        }
+    }
+
+
+def test_add_server_replaces_invalid_wrapped_mcp_servers(tmp_path: Path) -> None:
+    app_config_dir = tmp_path / ".agent-teams"
+    app_config_dir.mkdir(parents=True)
+    config_path = app_config_dir / "mcp.json"
+    config_path.write_text(json.dumps({"mcpServers": []}), encoding="utf-8")
+    manager = config_manager.McpConfigManager(app_config_dir=app_config_dir)
+
+    manager.add_server(
+        name="filesystem",
+        server_config={"transport": "stdio", "command": "npx"},
+    )
+
+    assert json.loads(config_path.read_text(encoding="utf-8")) == {
+        "mcpServers": {"filesystem": {"transport": "stdio", "command": "npx"}}
+    }
+
+
+def test_add_server_accepts_nested_named_config(tmp_path: Path) -> None:
+    app_config_dir = tmp_path / ".agent-teams"
+    app_config_dir.mkdir(parents=True)
+    manager = config_manager.McpConfigManager(app_config_dir=app_config_dir)
+
+    manager.add_server(
+        name="filesystem",
+        server_config={
+            "mcpServers": {
+                "filesystem": {
+                    "type": "local",
+                    "command": ["npx", "-y", "server-filesystem"],
+                }
+            }
+        },
+    )
+
+    stored_config = manager.get_server_config("filesystem")
+    assert stored_config["transport"] == "stdio"
+    assert stored_config["command"] == "npx"
+    assert stored_config["args"] == ["-y", "server-filesystem"]
+
+
+def test_add_server_rejects_duplicate_without_overwrite(tmp_path: Path) -> None:
+    app_config_dir = tmp_path / ".agent-teams"
+    app_config_dir.mkdir(parents=True)
+    (app_config_dir / "mcp.json").write_text(
+        json.dumps({"mcpServers": {"filesystem": {"command": "npx"}}}),
+        encoding="utf-8",
+    )
+    manager = config_manager.McpConfigManager(app_config_dir=app_config_dir)
+
+    try:
+        manager.add_server(name="filesystem", server_config={"command": "uvx"})
+    except ValueError as exc:
+        assert "already exists" in str(exc)
+    else:
+        raise AssertionError("Expected duplicate MCP server to be rejected")
+
+
+def test_add_server_rejects_empty_name(tmp_path: Path) -> None:
+    app_config_dir = tmp_path / ".agent-teams"
+    app_config_dir.mkdir(parents=True)
+    manager = config_manager.McpConfigManager(app_config_dir=app_config_dir)
+
+    try:
+        manager.add_server(name=" ", server_config={"command": "npx"})
+    except ValueError as exc:
+        assert "MCP server name must be a non-empty string" in str(exc)
+    else:
+        raise AssertionError("Expected empty MCP server name to be rejected")
+
+
+def test_set_server_enabled_updates_app_mcp_config(tmp_path: Path) -> None:
+    app_config_dir = tmp_path / ".agent-teams"
+    app_config_dir.mkdir(parents=True)
+    config_path = app_config_dir / "mcp.json"
+    config_path.write_text(
+        json.dumps({"mcpServers": {"filesystem": {"command": "npx"}}}),
+        encoding="utf-8",
+    )
+    manager = config_manager.McpConfigManager(app_config_dir=app_config_dir)
+
+    manager.set_server_enabled(name="filesystem", enabled=False)
+
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    assert payload["mcpServers"]["filesystem"]["enabled"] is False
+    registry = manager.load_registry()
+    spec = registry.get_spec("filesystem")
+    assert spec.enabled is False
+    assert registry.list_names() == ("filesystem",)
+    assert registry.list_enabled_names() == ()
+
+
+def test_set_server_enabled_rejects_empty_and_unknown_names(tmp_path: Path) -> None:
+    app_config_dir = tmp_path / ".agent-teams"
+    app_config_dir.mkdir(parents=True)
+    manager = config_manager.McpConfigManager(app_config_dir=app_config_dir)
+
+    try:
+        manager.set_server_enabled(name=" ", enabled=True)
+    except ValueError as exc:
+        assert "MCP server name must be a non-empty string" in str(exc)
+    else:
+        raise AssertionError("Expected empty MCP server name to be rejected")
+
+    try:
+        manager.set_server_enabled(name="missing", enabled=True)
+    except ValueError as exc:
+        assert "Unknown MCP server: missing" in str(exc)
+    else:
+        raise AssertionError("Expected unknown MCP server to be rejected")
+
+
+def test_delete_server_removes_entry_from_app_mcp_config(tmp_path: Path) -> None:
+    app_config_dir = tmp_path / ".agent-teams"
+    app_config_dir.mkdir(parents=True)
+    config_path = app_config_dir / "mcp.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "filesystem": {"command": "npx"},
+                    "docs": {"command": "uvx"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    manager = config_manager.McpConfigManager(app_config_dir=app_config_dir)
+
+    manager.delete_server(name="filesystem")
+
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    assert payload == {"mcpServers": {"docs": {"command": "uvx"}}}
+    registry = manager.load_registry()
+    assert registry.list_names() == ("docs",)
+
+
+def test_delete_server_rejects_empty_and_unknown_names(tmp_path: Path) -> None:
+    app_config_dir = tmp_path / ".agent-teams"
+    app_config_dir.mkdir(parents=True)
+    manager = config_manager.McpConfigManager(app_config_dir=app_config_dir)
+
+    try:
+        manager.delete_server(name=" ")
+    except ValueError as exc:
+        assert "MCP server name must be a non-empty string" in str(exc)
+    else:
+        raise AssertionError("Expected empty MCP server name to be rejected")
+
+    try:
+        manager.delete_server(name="missing")
+    except ValueError as exc:
+        assert "Unknown MCP server: missing" in str(exc)
+    else:
+        raise AssertionError("Expected unknown MCP server to be rejected")
+
+
+def test_delete_server_rejects_missing_app_mcp_payload(tmp_path: Path) -> None:
+    app_config_dir = tmp_path / ".agent-teams"
+    app_config_dir.mkdir(parents=True)
+    manager = config_manager.McpConfigManager(app_config_dir=app_config_dir)
+
+    try:
+        manager.delete_server(name="filesystem")
+    except ValueError as exc:
+        assert "Unknown MCP server: filesystem" in str(exc)
+    else:
+        raise AssertionError("Expected missing app MCP payload to be rejected")
+
+
+def test_update_server_preserves_enabled_state(tmp_path: Path) -> None:
+    app_config_dir = tmp_path / ".agent-teams"
+    app_config_dir.mkdir(parents=True)
+    config_path = app_config_dir / "mcp.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "filesystem": {
+                        "transport": "stdio",
+                        "command": "npx",
+                        "enabled": False,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    manager = config_manager.McpConfigManager(app_config_dir=app_config_dir)
+
+    manager.update_server(
+        name="filesystem",
+        server_config={
+            "transport": "stdio",
+            "command": "uvx",
+            "args": ["mcp-server-filesystem"],
+        },
+    )
+
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    assert payload["mcpServers"]["filesystem"] == {
+        "transport": "stdio",
+        "command": "uvx",
+        "args": ["mcp-server-filesystem"],
+        "enabled": False,
+    }
+    assert manager.get_server_config("filesystem")["command"] == "uvx"
+
+
+def test_update_server_accepts_explicit_disabled_alias(tmp_path: Path) -> None:
+    app_config_dir = tmp_path / ".agent-teams"
+    app_config_dir.mkdir(parents=True)
+    config_path = app_config_dir / "mcp.json"
+    config_path.write_text(
+        json.dumps({"mcpServers": {"filesystem": {"command": "npx"}}}),
+        encoding="utf-8",
+    )
+    manager = config_manager.McpConfigManager(app_config_dir=app_config_dir)
+
+    manager.update_server(
+        name="filesystem",
+        server_config={"command": "uvx", "disabled": True},
+    )
+
+    stored = json.loads(config_path.read_text(encoding="utf-8"))
+    assert stored["mcpServers"]["filesystem"] == {
+        "command": "uvx",
+        "enabled": False,
+    }
+
+
+def test_update_server_rejects_empty_and_unknown_names(tmp_path: Path) -> None:
+    app_config_dir = tmp_path / ".agent-teams"
+    app_config_dir.mkdir(parents=True)
+    manager = config_manager.McpConfigManager(app_config_dir=app_config_dir)
+
+    try:
+        manager.update_server(name=" ", server_config={"command": "uvx"})
+    except ValueError as exc:
+        assert "MCP server name must be a non-empty string" in str(exc)
+    else:
+        raise AssertionError("Expected empty MCP server name to be rejected")
+
+    try:
+        manager.update_server(name="missing", server_config={"command": "uvx"})
+    except ValueError as exc:
+        assert "Unknown MCP server: missing" in str(exc)
+    else:
+        raise AssertionError("Expected unknown MCP server to be rejected")
+
+
+def test_get_server_config_rejects_empty_and_unknown_names(tmp_path: Path) -> None:
+    app_config_dir = tmp_path / ".agent-teams"
+    app_config_dir.mkdir(parents=True)
+    manager = config_manager.McpConfigManager(app_config_dir=app_config_dir)
+
+    try:
+        manager.get_server_config(" ")
+    except ValueError as exc:
+        assert "MCP server name must be a non-empty string" in str(exc)
+    else:
+        raise AssertionError("Expected empty MCP server name to be rejected")
+
+    try:
+        manager.get_server_config("missing")
+    except ValueError as exc:
+        assert "Unknown MCP server: missing" in str(exc)
+    else:
+        raise AssertionError("Expected unknown MCP server to be rejected")
+
+
+def test_load_registry_accepts_disabled_alias(tmp_path: Path) -> None:
+    app_config_dir = tmp_path / ".agent-teams"
+    app_config_dir.mkdir(parents=True)
+    (app_config_dir / "mcp.json").write_text(
+        json.dumps(
+            {"mcpServers": {"filesystem": {"command": "npx", "disabled": True}}}
+        ),
+        encoding="utf-8",
+    )
+    manager = config_manager.McpConfigManager(app_config_dir=app_config_dir)
+
+    registry = manager.load_registry()
+
+    assert registry.get_spec("filesystem").enabled is False
+
+
+def test_load_registry_normalizes_opencode_remote_type(tmp_path: Path) -> None:
+    app_config_dir = tmp_path / ".agent-teams"
+    app_config_dir.mkdir(parents=True)
+    (app_config_dir / "mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "remote-docs": {
+                        "type": "remote",
+                        "url": "https://example.com/mcp",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    manager = config_manager.McpConfigManager(app_config_dir=app_config_dir)
+
+    registry = manager.load_registry()
+
+    assert registry.get_spec("remote-docs").server_config["transport"] == "http"
+
+
+def test_load_registry_normalizes_opencode_remote_sse_type(tmp_path: Path) -> None:
+    app_config_dir = tmp_path / ".agent-teams"
+    app_config_dir.mkdir(parents=True)
+    (app_config_dir / "mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "remote-events": {
+                        "type": "remote",
+                        "url": "https://example.com/sse",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    manager = config_manager.McpConfigManager(app_config_dir=app_config_dir)
+
+    registry = manager.load_registry()
+
+    assert registry.get_spec("remote-events").server_config["transport"] == "sse"
+
+
+def test_load_registry_preserves_explicit_opencode_remote_transport(
+    tmp_path: Path,
+) -> None:
+    app_config_dir = tmp_path / ".agent-teams"
+    app_config_dir.mkdir(parents=True)
+    (app_config_dir / "mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "remote-events": {
+                        "type": "remote",
+                        "transport": "sse",
+                        "url": "https://example.com/events",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    manager = config_manager.McpConfigManager(app_config_dir=app_config_dir)
+
+    registry = manager.load_registry()
+
+    assert registry.get_spec("remote-events").server_config["transport"] == "sse"
+
+
+def test_load_registry_preserves_explicit_opencode_local_transport(
+    tmp_path: Path,
+) -> None:
+    app_config_dir = tmp_path / ".agent-teams"
+    app_config_dir.mkdir(parents=True)
+    (app_config_dir / "mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "remote-docs": {
+                        "type": "local",
+                        "transport": "http",
+                        "url": "https://example.com/mcp",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    manager = config_manager.McpConfigManager(app_config_dir=app_config_dir)
+
+    registry = manager.load_registry()
+
+    assert registry.get_spec("remote-docs").server_config["transport"] == "http"
+
+
+def test_load_registry_ignores_invalid_mcp_servers_value(tmp_path: Path) -> None:
+    app_config_dir = tmp_path / ".agent-teams"
+    app_config_dir.mkdir(parents=True)
+    (app_config_dir / "mcp.json").write_text(
+        json.dumps({"mcpServers": []}),
+        encoding="utf-8",
+    )
+    manager = config_manager.McpConfigManager(app_config_dir=app_config_dir)
+
+    registry = manager.load_registry()
+
+    assert registry.list_names() == ()
+
+
+def test_load_registry_syncs_app_environment_for_stdio_mcp(
+    tmp_path: Path,
+) -> None:
+    app_config_dir = tmp_path / ".agent-teams"
+    app_config_dir.mkdir(parents=True)
+    env_key = "MCP_SYNCED_APP_ENV"
+    (app_config_dir / ".env").write_text(f"{env_key}=from-app\n", encoding="utf-8")
+    (app_config_dir / "mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "time-mcp": {
+                        "command": "npx",
+                        "args": ["-y", "@upstash/context7-mcp"],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    manager = config_manager.McpConfigManager(app_config_dir=app_config_dir)
+
+    registry = manager.load_registry()
+    server = build_mcp_server(registry.get_spec("time-mcp"))
+
+    assert isinstance(server, MCPServerStdio)
+    assert os.environ[env_key] == "from-app"
+    assert server.env is not None
+    assert server.env[env_key] == "from-app"
+
+
+def test_stdio_mcp_env_templates_resolve_from_app_environment(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app_config_dir = tmp_path / ".agent-teams"
+    app_config_dir.mkdir(parents=True)
+    env_key = "MCP_APP_ENV_TEMPLATE_TEST"
+    monkeypatch.delenv(env_key, raising=False)
+    (app_config_dir / ".env").write_text(f"{env_key}=from-app\n", encoding="utf-8")
+    (app_config_dir / "mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "time-mcp": {
+                        "command": "npx",
+                        "args": ["-y", "@upstash/context7-mcp"],
+                        "env": {
+                            env_key: f"{{{{{env_key}}}}}",
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    manager = config_manager.McpConfigManager(app_config_dir=app_config_dir)
+
+    registry = manager.load_registry()
+    server = build_mcp_server(registry.get_spec("time-mcp"))
+
+    assert isinstance(server, MCPServerStdio)
+    assert server.env is not None
+    assert os.environ[env_key] == "from-app"
+    assert server.env[env_key] == "from-app"
 
 
 def test_get_mcp_file_paths_follow_scope_conventions(

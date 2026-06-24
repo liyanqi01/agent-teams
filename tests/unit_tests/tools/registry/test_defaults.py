@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from agent_teams.tools.registry import build_default_registry
+from relay_teams.tools.registry.defaults import build_default_registry
 
 
 def test_registry_rejects_unknown_tools() -> None:
@@ -15,16 +15,48 @@ def test_registry_rejects_unknown_tools() -> None:
 def test_registry_contains_registered_local_tools() -> None:
     registry = build_default_registry()
     assert registry.list_names() == (
-        "create_tasks",
-        "dispatch_task",
+        "activate_skill_roles",
+        "ask_question",
+        "auto_harness_disable_tool",
+        "auto_harness_enable_tool",
+        "auto_harness_synthesize_tool",
+        "auto_harness_upgrade_tool",
+        "capture_screen",
+        "click_at",
+        "create_monitor",
+        "double_click_at",
+        "drag_between",
         "edit",
+        "focus_window",
         "glob",
         "grep",
+        "hotkey",
         "im_send",
-        "list_delegated_tasks",
+        "launch_app",
+        "list_background_tasks",
+        "list_monitors",
+        "list_skill_roles",
+        "list_windows",
+        "notebook_edit",
+        "notify",
+        "office_read_markdown",
+        "orch_create_tasks",
+        "orch_create_temporary_role",
+        "orch_dispatch_task",
+        "orch_list_available_roles",
+        "orch_list_delegated_tasks",
+        "orch_update_task",
         "read",
+        "scroll_view",
         "shell",
-        "update_task",
+        "spawn_subagent",
+        "stop_background_task",
+        "stop_monitor",
+        "todo_read",
+        "todo_write",
+        "type_text",
+        "wait_background_task",
+        "wait_for_window",
         "webfetch",
         "websearch",
         "write",
@@ -36,3 +68,28 @@ def test_registry_hides_im_send_from_manual_role_configuration() -> None:
     registry = build_default_registry()
 
     assert "im_send" not in registry.list_configurable_names()
+    assert "notify" in registry.list_configurable_names()
+
+
+def test_default_registry_ignores_unknown_tools_for_runtime_resolution() -> None:
+    registry = build_default_registry()
+
+    assert registry.resolve_known(("shell",), strict=False) == ("shell",)
+    assert registry.resolve_known(("unknown_tool",), strict=False) == ()
+    assert registry.resolve_known(("missing_background_tool",), strict=False) == ()
+    assert registry.resolve_known(("deprecated_writer",), strict=False) == ()
+
+
+def test_default_registry_rejects_unknown_tools_for_explicit_validation() -> None:
+    registry = build_default_registry()
+
+    registry.validate_known(("shell",))
+    registry.validate_known(("list_background_tasks",))
+    registry.validate_known(("notebook_edit",))
+    registry.validate_known(("office_read_markdown",))
+    with pytest.raises(ValueError, match="Unknown tools"):
+        registry.validate_known(("unknown_tool",))
+    with pytest.raises(ValueError, match="Unknown tools"):
+        registry.validate_known(("missing_background_tool",))
+    with pytest.raises(ValueError, match="Unknown tools"):
+        registry.validate_known(("deprecated_writer",))

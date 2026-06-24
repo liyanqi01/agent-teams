@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import pytest
 
-from agent_teams.agents.orchestration.meta_agent import MetaAgent
-from agent_teams.sessions.runs.run_models import IntentInput
+from relay_teams.agents.orchestration.meta_agent import MetaAgent
+from relay_teams.agents.orchestration.coordinator import CoordinatorRunResult
+from relay_teams.media import content_parts_from_text
+from relay_teams.sessions.runs.assistant_errors import RunCompletionReason
+from relay_teams.sessions.runs.run_models import IntentInput
 
 
 class _CoordinatorStub:
@@ -17,20 +20,33 @@ class _CoordinatorStub:
         intent: IntentInput,
         *,
         trace_id: str | None = None,
-    ) -> tuple[str, str, str, str]:
+    ) -> CoordinatorRunResult:
         self.run_calls.append((intent, trace_id))
-        return ("trace-1", "task-1", "completed", "delegated")
+        return CoordinatorRunResult(
+            trace_id="trace-1",
+            root_task_id="task-1",
+            output="delegated",
+            completion_reason=RunCompletionReason.ASSISTANT_RESPONSE,
+        )
 
-    async def resume(self, *, trace_id: str) -> tuple[str, str, str, str]:
+    async def resume(self, *, trace_id: str) -> CoordinatorRunResult:
         self.resume_calls.append(trace_id)
-        return (trace_id, "task-2", "completed", "resumed")
+        return CoordinatorRunResult(
+            trace_id=trace_id,
+            root_task_id="task-2",
+            output="resumed",
+            completion_reason=RunCompletionReason.ASSISTANT_RESPONSE,
+        )
 
 
 @pytest.mark.asyncio
 async def test_handle_intent_delegates_to_coordinator() -> None:
     coordinator = _CoordinatorStub()
     meta_agent = MetaAgent.model_construct(coordinator=coordinator)
-    intent = IntentInput(session_id="session-1", intent="plan this")
+    intent = IntentInput(
+        session_id="session-1",
+        input=content_parts_from_text("plan this"),
+    )
 
     result = await meta_agent.handle_intent(intent, trace_id="trace-in")
 
@@ -38,7 +54,7 @@ async def test_handle_intent_delegates_to_coordinator() -> None:
     assert result.trace_id == "trace-1"
     assert result.root_task_id == "task-1"
     assert result.status == "completed"
-    assert result.output == "delegated"
+    assert result.output_text == "delegated"
 
 
 @pytest.mark.asyncio
@@ -52,4 +68,4 @@ async def test_resume_run_delegates_to_coordinator() -> None:
     assert result.trace_id == "trace-resume"
     assert result.root_task_id == "task-2"
     assert result.status == "completed"
-    assert result.output == "resumed"
+    assert result.output_text == "resumed"

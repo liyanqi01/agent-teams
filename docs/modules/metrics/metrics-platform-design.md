@@ -1,0 +1,104 @@
+# Metrics Platform Design
+
+## Summary
+
+`agent-teams` now exposes a dedicated `metrics/` platform layer for system metrics. Business modules register metric definitions and emit normalized metric events through a shared recorder. Consumers such as the frontend observability view, CLI commands, prettylog output, and future Grafana exporters all read from the same metric domain.
+
+## Layers
+
+1. `metrics core`
+   - `MetricDefinition`
+   - `MetricRegistry`
+   - `MetricRecorder`
+   - `MetricEvent`
+2. `domain adapters`
+   - session metrics
+   - llm metrics
+   - tool metrics
+   - retrieval metrics
+3. `sinks`
+   - aggregate store sink
+   - prettylog sink
+   - Grafana exporter sink placeholder
+4. `consumers`
+   - `/api/observability/*`
+   - `agent-teams metrics ...`
+   - frontend observability view
+
+## Naming And Tags
+
+Built-in metrics:
+- `relay_teams.session.steps`
+- `relay_teams.llm.input_tokens`
+- `relay_teams.llm.cached_input_tokens`
+- `relay_teams.llm.output_tokens`
+- `relay_teams.tool.calls`
+- `relay_teams.tool.duration_ms`
+- `relay_teams.tool.failures`
+- `relay_teams.skill.calls`
+- `relay_teams.mcp.calls`
+- `relay_teams.retrieval.searches`
+- `relay_teams.retrieval.search_duration_ms`
+- `relay_teams.retrieval.search_failures`
+- `relay_teams.retrieval.rebuilds`
+- `relay_teams.retrieval.rebuild_duration_ms`
+- `relay_teams.retrieval.document_count`
+- `relay_teams.gateway.operations`
+- `relay_teams.gateway.operation_duration_ms`
+- `relay_teams.gateway.operation_failures`
+
+Standard tags:
+- `workspace_id`
+- `session_id`
+- `run_id`
+- `instance_id`
+- `role_id`
+- `tool_name`
+- `tool_source`
+- `mcp_server`
+- `retrieval_backend`
+- `retrieval_scope_kind`
+- `retrieval_operation`
+- `gateway_channel`
+- `gateway_operation`
+- `gateway_phase`
+- `gateway_transport`
+- `gateway_cold_start`
+- `status`
+
+## Storage And Queries
+
+The current aggregate store writes normalized metric points into SQLite and expands every event into `global`, `session`, and `run` scopes. Query services derive:
+- cached token ratio
+- tool success rate
+- average tool duration
+- gateway request failure rate
+- gateway request average latency
+- ACP prompt run-start and first-update average latency
+
+## Extension Rules
+
+When a new module adds metrics:
+1. Register the metric definition.
+2. Add or extend a metrics adapter for that module.
+3. Emit metrics through `MetricRecorder`.
+4. Do not add a module-specific exporter path.
+
+## Consumers
+
+CLI:
+- `agent-teams metrics overview`
+- `agent-teams metrics breakdowns`
+- `agent-teams metrics tail`
+
+HTTP API:
+- `GET /api/observability/overview`
+- `GET /api/observability/breakdowns`
+
+Frontend:
+- topbar `Observability` view
+  - cached vs uncached input token split
+  - retrieval search volume/failure/latency/index-size KPIs
+  - tool breakdown and role breakdown panels
+  - gateway ACP request volume/failure/latency KPIs
+  - gateway operation breakdown panel

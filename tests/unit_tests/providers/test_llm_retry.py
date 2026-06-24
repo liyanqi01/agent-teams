@@ -1,16 +1,32 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 from openai import APIError, APIStatusError
+from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
 
-from agent_teams.providers.llm_retry import (
+from relay_teams.providers.llm_retry import (
     compute_retry_delay_ms,
     extract_retry_error_info,
     run_with_llm_retry,
 )
-from agent_teams.providers.model_config import LlmRetryConfig
+from relay_teams.providers.model_config import LlmRetryConfig
+
+
+class _HeaderAPIError(APIError):
+    def __init__(
+        self,
+        message: str,
+        request: httpx.Request,
+        *,
+        body: object | None,
+        headers: dict[str, str],
+    ) -> None:
+        super().__init__(message, request=request, body=body)
+        self.headers = headers
 
 
 def test_extract_retry_error_info_reads_status_code_and_retry_after() -> None:
@@ -32,6 +48,7 @@ def test_extract_retry_error_info_reads_status_code_and_retry_after() -> None:
     assert info.status_code == 429
     assert info.error_code == "rate_limited"
     assert info.retry_after_ms == 7000
+    assert info.rate_limited is True
 
 
 def test_extract_retry_error_info_reads_provider_code_without_status() -> None:
@@ -48,6 +65,173 @@ def test_extract_retry_error_info_reads_provider_code_without_status() -> None:
     assert info.status_code is None
     assert info.error_code == "2062"
     assert info.message == "busy"
+    assert info.retryable is False
+    assert info.rate_limited is False
+
+
+def test_extract_retry_error_info_marks_maas_stream_rate_limit_as_retryable() -> None:
+    request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+    exc = APIError(
+        "An error occurred during streaming",
+        request=request,
+        body={
+            "error_msg": "Too many requests, the rate limit is 8000000 tokens per minute.",
+            "error_code": "InferHub.ModelArts.81101.429",
+        },
+    )
+
+    info = extract_retry_error_info(exc)
+
+    assert info is not None
+    assert info.status_code == 429
+    assert info.error_code == "InferHub.ModelArts.81101.429"
+    assert (
+        info.message
+        == "Too many requests, the rate limit is 8000000 tokens per minute."
+    )
+    assert info.retryable is True
+
+
+def test_extract_retry_error_info_marks_408_and_409_as_retryable() -> None:
+    request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+    response_408 = httpx.Response(408, request=request)
+    response_409 = httpx.Response(409, request=request)
+
+    info_408 = extract_retry_error_info(
+        APIStatusError("timeout", response=response_408, body={})
+    )
+    info_409 = extract_retry_error_info(
+        APIStatusError("lock timeout", response=response_409, body={})
+    )
+
+    assert info_408 is not None
+    assert info_408.status_code == 408
+    assert info_408.retryable is True
+    assert info_409 is not None
+    assert info_409.status_code == 409
+    assert info_409.retryable is True
+
+
+def test_extract_retry_error_info_obeys_explicit_retry_header() -> None:
+    request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+    allow_retry = _HeaderAPIError(
+        "provider error",
+        request=request,
+        body={"error": {"code": "2062", "message": "busy"}},
+        headers={"x-should-retry": "true"},
+    )
+    deny_retry = _HeaderAPIError(
+        "provider error",
+        request=request,
+        body={"error": {"code": "2062", "message": "busy"}},
+        headers={"x-should-retry": "false"},
+    )
+
+    allow_info = extract_retry_error_info(allow_retry)
+    deny_info = extract_retry_error_info(deny_retry)
+
+    assert allow_info is not None
+    assert allow_info.retryable is True
+    assert deny_info is not None
+    assert deny_info.retryable is False
+
+
+def test_extract_retry_error_info_marks_model_api_error_without_status_non_retryable() -> (
+    None
+):
+    info = extract_retry_error_info(
+        ModelAPIError(model_name="gpt-test", message="provider busy code=2062")
+    )
+
+    assert info is not None
+    assert info.status_code is None
+    assert info.error_code == "2062"
+    assert info.retryable is False
+
+
+def test_extract_retry_error_info_maps_enterprise_proxy_block_to_proxy_blocked() -> (
+    None
+):
+    info = extract_retry_error_info(
+        ModelHTTPError(
+            status_code=403,
+            model_name="deepseek-v4-flash",
+            body=(
+                '<html><head><meta name="keywords" '
+                'content="SWG,Proxy,NetentSec" /><title>HIS Proxy</title></head></html>'
+            ),
+        )
+    )
+
+    assert info is not None
+    assert info.status_code == 403
+    assert info.error_code == "proxy_blocked"
+    assert info.retryable is False
+    assert info.transport_error is True
+
+
+def test_extract_retry_error_info_does_not_treat_this_proxy_as_his_proxy_block() -> (
+    None
+):
+    info = extract_retry_error_info(
+        ModelHTTPError(
+            status_code=503,
+            model_name="deepseek-v4-flash",
+            body="this proxy path returned a transient upstream error",
+        )
+    )
+
+    assert info is not None
+    assert info.error_code != "proxy_blocked"
+    assert info.retryable is True
+
+
+def test_extract_retry_error_info_marks_remote_protocol_interrupt_as_retryable() -> (
+    None
+):
+    info = extract_retry_error_info(
+        httpx.RemoteProtocolError("incomplete chunked read")
+    )
+
+    assert info is not None
+    assert info.error_code == "network_stream_interrupted"
+    assert info.retryable is True
+    assert info.transport_error is True
+    assert info.timeout_error is False
+
+
+def test_extract_retry_error_info_marks_invalid_tool_args_json_as_retryable() -> None:
+    info = extract_retry_error_info(
+        json.JSONDecodeError(
+            "Expecting property name enclosed in double quotes",
+            "{invalid: true}",
+            1,
+        )
+    )
+
+    assert info is not None
+    assert info.error_code == "model_tool_args_invalid_json"
+    assert info.retryable is False
+    assert info.transport_error is False
+    assert info.timeout_error is False
+
+
+def test_extract_retry_error_info_unwraps_invalid_tool_args_json_cause() -> None:
+    try:
+        raise json.JSONDecodeError(
+            "Expecting property name enclosed in double quotes",
+            "{invalid: true}",
+            1,
+        )
+    except json.JSONDecodeError as inner:
+        wrapped = RuntimeError("tool args parsing failed")
+        wrapped.__cause__ = inner
+
+    info = extract_retry_error_info(wrapped)
+
+    assert info is not None
+    assert info.error_code == "model_tool_args_invalid_json"
+    assert info.retryable is False
 
 
 def test_compute_retry_delay_ms_uses_exponential_backoff_without_jitter() -> None:
@@ -64,6 +248,43 @@ def test_compute_retry_delay_ms_uses_exponential_backoff_without_jitter() -> Non
     assert delay_ms == 4000
 
 
+def test_compute_retry_delay_ms_respects_retry_after_floor() -> None:
+    config = LlmRetryConfig(
+        jitter=False,
+        initial_delay_ms=2000,
+    )
+
+    delay_ms = compute_retry_delay_ms(
+        config=config,
+        retry_number=1,
+        retry_after_ms=7000,
+    )
+
+    assert delay_ms == 7000
+
+
+def test_compute_retry_delay_ms_keeps_retry_after_floor_with_jitter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = LlmRetryConfig(
+        jitter=True,
+        initial_delay_ms=2000,
+    )
+
+    monkeypatch.setattr(
+        "relay_teams.providers.llm_retry.random.randint",
+        lambda lower_bound, _upper_bound: lower_bound,
+    )
+
+    delay_ms = compute_retry_delay_ms(
+        config=config,
+        retry_number=1,
+        retry_after_ms=7000,
+    )
+
+    assert delay_ms == 7000
+
+
 @pytest.mark.asyncio
 async def test_run_with_llm_retry_retries_until_success() -> None:
     attempts = {"count": 0}
@@ -73,10 +294,11 @@ async def test_run_with_llm_retry_retries_until_success() -> None:
         attempts["count"] += 1
         if attempts["count"] < 3:
             request = httpx.Request("POST", "https://example.test/v1/chat/completions")
-            raise APIError(
-                "provider error",
-                request=request,
-                body={"error": {"code": "2062", "message": "busy"}},
+            response = httpx.Response(409, request=request)
+            raise APIStatusError(
+                "lock timeout",
+                response=response,
+                body={"error": {"code": "conflict", "message": "busy"}},
             )
         return "ok"
 
@@ -94,18 +316,53 @@ async def test_run_with_llm_retry_retries_until_success() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_with_llm_retry_uses_retry_after_when_larger_than_backoff() -> None:
+    recorded_delays: list[int] = []
+    attempts = {"count": 0}
+
+    async def operation() -> str:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+            response = httpx.Response(
+                429,
+                headers={"Retry-After": "7"},
+                request=request,
+            )
+            raise APIStatusError(
+                "rate limited",
+                response=response,
+                body={"error": {"code": "rate_limited", "message": "slow down"}},
+            )
+        return "ok"
+
+    result = await run_with_llm_retry(
+        operation=operation,
+        config=LlmRetryConfig(jitter=False, max_retries=2, initial_delay_ms=2000),
+        is_retry_allowed=lambda: True,
+        on_retry_scheduled=lambda schedule: recorded_delays.append(schedule.delay_ms),
+        sleep=lambda _seconds: _async_noop(),
+    )
+
+    assert result == "ok"
+    assert recorded_delays == [7000]
+
+
+@pytest.mark.asyncio
 async def test_run_with_llm_retry_reports_exhausted_after_max_retries() -> None:
     recorded_delays: list[int] = []
     exhausted: list[tuple[str, int]] = []
 
     async def operation() -> str:
-        raise APIError(
-            "provider error",
-            request=httpx.Request("POST", "https://example.test/v1/chat/completions"),
-            body={"error": {"code": "2062", "message": "busy"}},
+        request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+        response = httpx.Response(408, request=request)
+        raise APIStatusError(
+            "timeout",
+            response=response,
+            body={"error": {"code": "request_timeout", "message": "busy"}},
         )
 
-    with pytest.raises(APIError):
+    with pytest.raises(APIStatusError):
         await run_with_llm_retry(
             operation=operation,
             config=LlmRetryConfig(jitter=False, max_retries=2, initial_delay_ms=2000),

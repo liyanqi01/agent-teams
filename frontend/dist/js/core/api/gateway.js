@@ -4,8 +4,68 @@
  */
 import { requestJson } from './request.js';
 
-export async function fetchWeChatGatewayAccounts() {
-    return requestJson('/api/gateway/wechat/accounts', undefined, 'Failed to fetch WeChat gateway accounts');
+export async function fetchWeChatGatewayAccounts(options = {}) {
+    return requestJson(
+        '/api/gateway/wechat/accounts',
+        { signal: options.signal },
+        'Failed to fetch WeChat gateway accounts',
+    );
+}
+
+export async function fetchDiscordGatewayAccounts(options = {}) {
+    return requestJson(
+        '/api/gateway/discord/accounts',
+        { signal: options.signal },
+        'Failed to fetch Discord gateway accounts',
+    );
+}
+
+export async function fetchXiaolubanGatewayAccounts(options = {}) {
+    return requestJson(
+        '/api/gateway/xiaoluban/accounts',
+        { signal: options.signal },
+        'Failed to fetch Xiaoluban gateway accounts',
+    );
+}
+
+export async function createDiscordGatewayAccount(payload) {
+    return requestJson(
+        '/api/gateway/discord/accounts',
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        'Failed to create Discord account',
+    );
+}
+
+export async function createXiaolubanGatewayAccount(payload) {
+    return requestJson(
+        '/api/gateway/xiaoluban/accounts',
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        'Failed to create Xiaoluban account',
+    );
+}
+
+export async function prepareXiaolubanGatewayAccount() {
+    return requestJson(
+        '/api/gateway/xiaoluban/accounts:prepare',
+        { method: 'POST' },
+        'Failed to prepare Xiaoluban account',
+    );
+}
+
+export async function revealXiaolubanGatewayAccountToken(accountId) {
+    return requestJson(
+        `/api/gateway/xiaoluban/accounts/${encodeURIComponent(accountId)}:reveal-token`,
+        { method: 'POST' },
+        'Failed to reveal Xiaoluban token',
+    );
 }
 
 export async function startWeChatGatewayLogin(payload = {}) {
@@ -32,6 +92,18 @@ export async function waitWeChatGatewayLogin(payload) {
     );
 }
 
+export async function updateDiscordGatewayAccount(accountId, payload) {
+    return requestJson(
+        `/api/gateway/discord/accounts/${encodeURIComponent(accountId)}`,
+        {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        'Failed to update Discord account',
+    );
+}
+
 export async function updateWeChatGatewayAccount(accountId, payload) {
     return requestJson(
         `/api/gateway/wechat/accounts/${encodeURIComponent(accountId)}`,
@@ -44,11 +116,67 @@ export async function updateWeChatGatewayAccount(accountId, payload) {
     );
 }
 
+export async function updateXiaolubanGatewayAccount(accountId, payload) {
+    return requestJson(
+        `/api/gateway/xiaoluban/accounts/${encodeURIComponent(accountId)}`,
+        {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        'Failed to update Xiaoluban account',
+    );
+}
+
+export async function updateXiaolubanGatewayImConfig(accountId, payload) {
+    return requestJson(
+        `/api/gateway/xiaoluban/accounts/${encodeURIComponent(accountId)}/im`,
+        {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        'Failed to update Xiaoluban IM settings',
+    );
+}
+
+export async function fetchXiaolubanGatewayImForwardingCommand(accountId) {
+    return requestJson(
+        `/api/gateway/xiaoluban/accounts/${encodeURIComponent(accountId)}/im:forwarding-command`,
+        undefined,
+        'Failed to fetch Xiaoluban IM forwarding command',
+    );
+}
+
+export async function enableDiscordGatewayAccount(accountId) {
+    return requestJson(
+        `/api/gateway/discord/accounts/${encodeURIComponent(accountId)}:enable`,
+        { method: 'POST' },
+        'Failed to enable Discord account',
+    );
+}
+
 export async function enableWeChatGatewayAccount(accountId) {
     return requestJson(
         `/api/gateway/wechat/accounts/${encodeURIComponent(accountId)}:enable`,
         { method: 'POST' },
         'Failed to enable WeChat account',
+    );
+}
+
+export async function enableXiaolubanGatewayAccount(accountId) {
+    return requestJson(
+        `/api/gateway/xiaoluban/accounts/${encodeURIComponent(accountId)}:enable`,
+        { method: 'POST' },
+        'Failed to enable Xiaoluban account',
+    );
+}
+
+export async function disableDiscordGatewayAccount(accountId) {
+    return requestJson(
+        `/api/gateway/discord/accounts/${encodeURIComponent(accountId)}:disable`,
+        { method: 'POST' },
+        'Failed to disable Discord account',
     );
 }
 
@@ -60,11 +188,55 @@ export async function disableWeChatGatewayAccount(accountId) {
     );
 }
 
+export async function disableXiaolubanGatewayAccount(accountId) {
+    return requestJson(
+        `/api/gateway/xiaoluban/accounts/${encodeURIComponent(accountId)}:disable`,
+        { method: 'POST' },
+        'Failed to disable Xiaoluban account',
+    );
+}
+
+export async function deleteDiscordGatewayAccount(accountId) {
+    return requestJson(
+        `/api/gateway/discord/accounts/${encodeURIComponent(accountId)}`,
+        {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ force: true }),
+        },
+        'Failed to delete Discord account',
+    );
+}
+
 export async function deleteWeChatGatewayAccount(accountId) {
     return requestJson(
         `/api/gateway/wechat/accounts/${encodeURIComponent(accountId)}`,
-        { method: 'DELETE' },
+        {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ force: true }),
+        },
         'Failed to delete WeChat account',
+    );
+}
+
+export async function deleteXiaolubanGatewayAccount(accountId) {
+    return requestJson(
+        `/api/gateway/xiaoluban/accounts/${encodeURIComponent(accountId)}`,
+        {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ force: true }),
+        },
+        'Failed to delete Xiaoluban account',
+    );
+}
+
+export async function reloadDiscordGateway() {
+    return requestJson(
+        '/api/gateway/discord/reload',
+        { method: 'POST' },
+        'Failed to reload Discord gateway',
     );
 }
 

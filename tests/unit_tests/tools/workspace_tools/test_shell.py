@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import asyncio
-import os
+from collections.abc import Mapping
+from os import pathsep
 from pathlib import Path
 import subprocess
+from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -12,7 +14,7 @@ import pytest
 
 class TestExtractPathsFromCommand:
     def test_extract_cd_path(self):
-        from agent_teams.tools.workspace_tools.shell_executor import (
+        from relay_teams.tools.workspace_tools.shell_executor import (
             extract_paths_from_command,
         )
 
@@ -20,7 +22,7 @@ class TestExtractPathsFromCommand:
         assert "/tmp/test" in paths
 
     def test_extract_rm_path(self):
-        from agent_teams.tools.workspace_tools.shell_executor import (
+        from relay_teams.tools.workspace_tools.shell_executor import (
             extract_paths_from_command,
         )
 
@@ -28,7 +30,7 @@ class TestExtractPathsFromCommand:
         assert "/tmp/test" in paths
 
     def test_extract_mkdir_path(self):
-        from agent_teams.tools.workspace_tools.shell_executor import (
+        from relay_teams.tools.workspace_tools.shell_executor import (
             extract_paths_from_command,
         )
 
@@ -36,7 +38,7 @@ class TestExtractPathsFromCommand:
         assert "/tmp/newdir/subdir" in paths
 
     def test_extract_multiple_commands(self):
-        from agent_teams.tools.workspace_tools.shell_executor import (
+        from relay_teams.tools.workspace_tools.shell_executor import (
             extract_paths_from_command,
         )
 
@@ -50,7 +52,7 @@ class TestExtractPathsFromCommand:
         assert "/project/dist" in paths
 
     def test_ignore_flags(self):
-        from agent_teams.tools.workspace_tools.shell_executor import (
+        from relay_teams.tools.workspace_tools.shell_executor import (
             extract_paths_from_command,
         )
 
@@ -59,7 +61,7 @@ class TestExtractPathsFromCommand:
         assert "/tmp/test" in paths
 
     def test_quoted_paths(self):
-        from agent_teams.tools.workspace_tools.shell_executor import (
+        from relay_teams.tools.workspace_tools.shell_executor import (
             extract_paths_from_command,
         )
 
@@ -70,38 +72,38 @@ class TestExtractPathsFromCommand:
 
 class TestNormalizeTimeout:
     def test_none_timeout(self):
-        from agent_teams.tools.workspace_tools.shell_executor import normalize_timeout
+        from relay_teams.tools.workspace_tools.shell_executor import normalize_timeout
 
         result = normalize_timeout(None)
         assert result == 120_000
 
     def test_custom_timeout(self):
-        from agent_teams.tools.workspace_tools.shell_executor import normalize_timeout
+        from relay_teams.tools.workspace_tools.shell_executor import normalize_timeout
 
         result = normalize_timeout(60000)
         assert result == 60000
 
     def test_timeout_too_large(self):
-        from agent_teams.tools.workspace_tools.shell_executor import normalize_timeout
+        from relay_teams.tools.workspace_tools.shell_executor import normalize_timeout
 
         result = normalize_timeout(1_300_000)
         assert result == 1_200_000
 
     def test_timeout_too_small(self):
-        from agent_teams.tools.workspace_tools.shell_executor import normalize_timeout
+        from relay_teams.tools.workspace_tools.shell_executor import normalize_timeout
 
         with pytest.raises(ValueError):
             normalize_timeout(0)
 
     def test_negative_timeout(self):
-        from agent_teams.tools.workspace_tools.shell_executor import normalize_timeout
+        from relay_teams.tools.workspace_tools.shell_executor import normalize_timeout
 
         with pytest.raises(ValueError):
             normalize_timeout(-1)
 
 
 def test_resolve_bash_path_prefers_env_override(monkeypatch, tmp_path: Path) -> None:
-    from agent_teams.tools.workspace_tools import shell_executor
+    from relay_teams.tools.workspace_tools import shell_executor
 
     git_bash = tmp_path / "custom" / "bash.exe"
     git_bash.parent.mkdir(parents=True)
@@ -114,7 +116,7 @@ def test_resolve_bash_path_prefers_env_override(monkeypatch, tmp_path: Path) -> 
 def test_resolve_bash_path_prefers_git_bash_over_wsl_on_windows(
     monkeypatch, tmp_path: Path
 ) -> None:
-    from agent_teams.tools.workspace_tools import shell_executor
+    from relay_teams.tools.workspace_tools import shell_executor
 
     git_bash = tmp_path / "Git" / "bin" / "bash.exe"
     git_bash.parent.mkdir(parents=True)
@@ -139,7 +141,7 @@ def test_resolve_bash_path_prefers_git_bash_over_wsl_on_windows(
 def test_iter_windows_git_bash_candidates_includes_git_install_root(
     monkeypatch, tmp_path: Path
 ) -> None:
-    from agent_teams.tools.workspace_tools import shell_executor
+    from relay_teams.tools.workspace_tools import shell_executor
 
     git_exe = tmp_path / "Git" / "cmd" / "git.exe"
     git_exe.parent.mkdir(parents=True)
@@ -160,7 +162,7 @@ def test_iter_windows_git_bash_candidates_includes_git_install_root(
 
 
 def test_resolve_bash_path_rejects_wsl_bash_without_git_bash(monkeypatch) -> None:
-    from agent_teams.tools.workspace_tools import shell_executor
+    from relay_teams.tools.workspace_tools import shell_executor
 
     monkeypatch.delenv("GIT_BASH_PATH", raising=False)
     monkeypatch.setattr(shell_executor, "_is_windows", lambda: True)
@@ -176,7 +178,7 @@ def test_resolve_bash_path_rejects_wsl_bash_without_git_bash(monkeypatch) -> Non
 
 
 def test_resolve_bash_path_uses_system_bash_on_non_windows(monkeypatch) -> None:
-    from agent_teams.tools.workspace_tools import shell_executor
+    from relay_teams.tools.workspace_tools import shell_executor
 
     monkeypatch.delenv("GIT_BASH_PATH", raising=False)
     monkeypatch.setattr(shell_executor, "_is_windows", lambda: False)
@@ -187,6 +189,60 @@ def test_resolve_bash_path_uses_system_bash_on_non_windows(monkeypatch) -> None:
     )
 
     assert shell_executor.resolve_bash_path() == "/bin/bash"
+
+
+def test_resolve_exec_shell_falls_back_to_powershell_on_windows(
+    monkeypatch,
+) -> None:
+    from relay_teams.tools.workspace_tools import shell_executor
+
+    monkeypatch.setattr(shell_executor, "_is_windows", lambda: True)
+    monkeypatch.setattr(
+        shell_executor,
+        "resolve_bash_path",
+        lambda: (_ for _ in ()).throw(FileNotFoundError("missing bash")),
+    )
+    monkeypatch.setattr(
+        shell_executor.shutil,
+        "which",
+        lambda name: (
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+            if name == "powershell"
+            else None
+        ),
+    )
+
+    shell = shell_executor.resolve_exec_shell()
+
+    assert shell.kind == shell_executor.ShellKind.POWERSHELL
+    assert shell.executable.endswith("powershell.exe")
+
+
+def test_describe_runtime_shell_reports_powershell_when_git_bash_is_missing(
+    monkeypatch,
+) -> None:
+    from relay_teams.tools.workspace_tools import shell_executor
+
+    monkeypatch.setattr(shell_executor, "_is_windows", lambda: True)
+    monkeypatch.setattr(
+        shell_executor,
+        "resolve_bash_path",
+        lambda: (_ for _ in ()).throw(FileNotFoundError("missing bash")),
+    )
+    monkeypatch.setattr(
+        shell_executor.shutil,
+        "which",
+        lambda name: (
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+            if name == "powershell"
+            else None
+        ),
+    )
+
+    summary = shell_executor.describe_runtime_shell()
+
+    assert summary.shell_info == "PowerShell"
+    assert summary.shell_path.endswith("powershell.exe")
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +277,30 @@ class _FakeProcess:
         return self.returncode
 
 
+@pytest.mark.asyncio
+async def test_kill_process_tree_windows_falls_back_to_proc_kill_when_taskkill_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from relay_teams.tools.workspace_tools import shell_executor
+
+    proc = _FakeProcess()
+    monkeypatch.setattr(shell_executor, "_is_windows", lambda: True)
+
+    async def _fake_kill_process_tree_by_pid(pid: int) -> bool:
+        assert pid == proc.pid
+        return False
+
+    monkeypatch.setattr(
+        shell_executor,
+        "_kill_process_tree_by_pid",
+        _fake_kill_process_tree_by_pid,
+    )
+
+    await shell_executor._kill_process_tree(cast(asyncio.subprocess.Process, proc))
+
+    assert proc.returncode == -9
+
+
 def _make_fake_factory(
     proc: _FakeProcess, feed_stdout: bytes = b"", feed_exit: int = 0
 ):
@@ -248,7 +328,7 @@ def _make_fake_factory(
 
 @pytest.mark.asyncio
 async def test_spawn_shell_does_not_timeout_after_streams_finish(monkeypatch) -> None:
-    from agent_teams.tools.workspace_tools import shell_executor
+    from relay_teams.tools.workspace_tools import shell_executor
 
     proc = _FakeProcess()
     monkeypatch.setattr(shell_executor, "resolve_bash_path", lambda: "bash")
@@ -274,7 +354,7 @@ async def test_spawn_shell_does_not_timeout_after_streams_finish(monkeypatch) ->
 
 @pytest.mark.asyncio
 async def test_spawn_shell_yields_nonzero_exit_code(monkeypatch) -> None:
-    from agent_teams.tools.workspace_tools import shell_executor
+    from relay_teams.tools.workspace_tools import shell_executor
 
     proc = _FakeProcess()
     monkeypatch.setattr(shell_executor, "resolve_bash_path", lambda: "bash")
@@ -300,7 +380,7 @@ async def test_spawn_shell_yields_nonzero_exit_code(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_spawn_shell_creates_process_group(monkeypatch) -> None:
-    from agent_teams.tools.workspace_tools import shell_executor
+    from relay_teams.tools.workspace_tools import shell_executor
 
     captured_kwargs: dict[str, object] = {}
     proc = _FakeProcess()
@@ -338,11 +418,12 @@ async def test_spawn_shell_creates_process_group(monkeypatch) -> None:
         assert captured_kwargs.get("creationflags", 0) != 0
     else:
         assert captured_kwargs.get("start_new_session") is True
+    assert captured_kwargs.get("stdin") == asyncio.subprocess.DEVNULL
 
 
 @pytest.mark.asyncio
 async def test_spawn_shell_passes_role_env_to_subprocess(monkeypatch) -> None:
-    from agent_teams.tools.workspace_tools import shell_executor
+    from relay_teams.tools.workspace_tools import shell_executor
 
     captured_kwargs: dict[str, object] = {}
     proc = _FakeProcess()
@@ -387,7 +468,7 @@ async def test_spawn_shell_injects_github_token_and_bundled_path(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    from agent_teams.tools.workspace_tools import shell_executor
+    from relay_teams.tools.workspace_tools import shell_executor
 
     captured_kwargs: dict[str, object] = {}
     proc = _FakeProcess()
@@ -418,6 +499,7 @@ async def test_spawn_shell_injects_github_token_and_bundled_path(
             "GH_PROMPT_DISABLED": "1",
         },
     )
+    monkeypatch.setattr(shell_executor, "_load_clawhub_cli_env", lambda: {})
     monkeypatch.setattr(shell_executor, "_resolve_gh_path", AsyncMock(return_value=gh))
     monkeypatch.setattr(
         shell_executor.asyncio,
@@ -439,7 +521,506 @@ async def test_spawn_shell_injects_github_token_and_bundled_path(
     assert env["GH_TOKEN"] == "ghp_secret"
     assert env["GITHUB_TOKEN"] == "ghp_secret"
     assert env["GH_PROMPT_DISABLED"] == "1"
-    assert str(gh.parent) == env["PATH"].split(os.pathsep)[0]
+    assert str(gh.parent) == env["PATH"].split(pathsep)[0]
+
+
+@pytest.mark.asyncio
+async def test_spawn_shell_injects_clawhub_token(monkeypatch) -> None:
+    from relay_teams.tools.workspace_tools import shell_executor
+
+    captured_kwargs: dict[str, object] = {}
+    proc = _FakeProcess()
+
+    async def capturing_factory(*args: object, **kwargs: object) -> _FakeProcess:
+        captured_kwargs.update(kwargs)
+
+        async def _feed() -> None:
+            proc.stdout.feed_eof()
+            proc.stderr.feed_eof()
+            await asyncio.sleep(0.01)
+            proc.returncode = 0
+            proc._wait_event.set()
+
+        asyncio.create_task(_feed())
+        return proc
+
+    monkeypatch.setattr(shell_executor, "resolve_bash_path", lambda: "bash")
+    monkeypatch.setattr(shell_executor, "_load_github_cli_env", lambda: {})
+    monkeypatch.setattr(
+        shell_executor,
+        "_load_clawhub_cli_env",
+        lambda: {"CLAWHUB_TOKEN": "ch_secret"},
+    )
+    monkeypatch.setattr(
+        shell_executor, "_resolve_gh_path", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr(
+        shell_executor,
+        "_resolve_clawhub_path",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        shell_executor.asyncio,
+        "create_subprocess_exec",
+        capturing_factory,
+    )
+
+    _ = [
+        item
+        async for item in shell_executor.spawn_shell(
+            command="true",
+            cwd=Path("."),
+            timeout_ms=100,
+        )
+    ]
+
+    env = captured_kwargs.get("env")
+    assert isinstance(env, dict)
+    assert env["CLAWHUB_TOKEN"] == "ch_secret"
+
+
+@pytest.mark.asyncio
+async def test_spawn_shell_prepends_existing_clawhub_path(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from relay_teams.tools.workspace_tools import shell_executor
+
+    captured_kwargs: dict[str, object] = {}
+    proc = _FakeProcess()
+    clawhub = tmp_path / "bin" / "clawhub"
+    clawhub.parent.mkdir()
+    clawhub.write_text("fake", encoding="utf-8")
+
+    async def capturing_factory(*args: object, **kwargs: object) -> _FakeProcess:
+        captured_kwargs.update(kwargs)
+
+        async def _feed() -> None:
+            proc.stdout.feed_eof()
+            proc.stderr.feed_eof()
+            await asyncio.sleep(0.01)
+            proc.returncode = 0
+            proc._wait_event.set()
+
+        asyncio.create_task(_feed())
+        return proc
+
+    monkeypatch.setattr(shell_executor, "resolve_bash_path", lambda: "bash")
+    monkeypatch.setattr(shell_executor, "_load_github_cli_env", lambda: {})
+    monkeypatch.setattr(
+        shell_executor,
+        "_load_clawhub_cli_env",
+        lambda: {"CLAWHUB_SITE": "https://mirror-cn.clawhub.com"},
+    )
+    monkeypatch.setattr(
+        shell_executor, "_resolve_gh_path", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr(
+        shell_executor,
+        "_resolve_clawhub_path",
+        AsyncMock(return_value=clawhub),
+    )
+    monkeypatch.setattr(
+        shell_executor.os,
+        "environ",
+        {"PATH": "/usr/bin"},
+    )
+    monkeypatch.setattr(
+        shell_executor.asyncio,
+        "create_subprocess_exec",
+        capturing_factory,
+    )
+
+    _ = [
+        item
+        async for item in shell_executor.spawn_shell(
+            command="true",
+            cwd=Path("."),
+            timeout_ms=100,
+        )
+    ]
+
+    env = captured_kwargs.get("env")
+    assert isinstance(env, dict)
+    assert env["PATH"].split(pathsep)[0] == str(clawhub.parent)
+
+
+@pytest.mark.asyncio
+async def test_spawn_shell_strips_bash_startup_env(monkeypatch) -> None:
+    from relay_teams.tools.workspace_tools import shell_executor
+
+    captured_kwargs: dict[str, object] = {}
+    proc = _FakeProcess()
+
+    async def capturing_factory(*args: object, **kwargs: object) -> _FakeProcess:
+        captured_kwargs.update(kwargs)
+
+        async def _feed() -> None:
+            proc.stdout.feed_eof()
+            proc.stderr.feed_eof()
+            await asyncio.sleep(0.01)
+            proc.returncode = 0
+            proc._wait_event.set()
+
+        asyncio.create_task(_feed())
+        return proc
+
+    monkeypatch.setattr(shell_executor, "resolve_bash_path", lambda: "bash")
+    monkeypatch.setattr(shell_executor, "_load_github_cli_env", lambda: {})
+    monkeypatch.setattr(shell_executor, "_load_clawhub_cli_env", lambda: {})
+    monkeypatch.setattr(
+        shell_executor, "_resolve_gh_path", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr(
+        shell_executor.asyncio,
+        "create_subprocess_exec",
+        capturing_factory,
+    )
+    monkeypatch.setattr(
+        shell_executor.os,
+        "environ",
+        {
+            "PATH": "/usr/bin",
+            "BASH_ENV": "/tmp/hang.sh",
+            "ENV": "/tmp/posix.sh",
+            "PROMPT_COMMAND": "sleep 100",
+            "PS1": "bad-prompt",
+            "BASH_FUNC_module%%": "() { sleep 100; }",
+        },
+    )
+
+    _ = [
+        item
+        async for item in shell_executor.spawn_shell(
+            command="pwd",
+            cwd=Path("."),
+            timeout_ms=100,
+        )
+    ]
+
+    env = captured_kwargs.get("env")
+    assert isinstance(env, dict)
+    assert "PATH" in env
+    assert "BASH_ENV" not in env
+    assert "ENV" not in env
+    assert "PROMPT_COMMAND" not in env
+    assert "PS1" not in env
+    assert "BASH_FUNC_module%%" not in env
+
+
+@pytest.mark.asyncio
+async def test_build_shell_env_ignores_gh_lookup_errors(monkeypatch) -> None:
+    from relay_teams.tools.workspace_tools import shell_executor
+
+    shell = shell_executor.ResolvedShell(
+        kind=shell_executor.ShellKind.BASH,
+        executable="bash",
+        display_name="Bash",
+    )
+
+    monkeypatch.setattr(shell_executor, "_load_github_cli_env", lambda: {})
+    monkeypatch.setattr(shell_executor, "_load_clawhub_cli_env", lambda: {})
+    monkeypatch.setattr(
+        shell_executor,
+        "resolve_existing_gh_path",
+        lambda: (_ for _ in ()).throw(OSError("read-only")),
+    )
+    monkeypatch.setattr(
+        shell_executor.os,
+        "environ",
+        {"PATH": "/usr/bin"},
+    )
+
+    env = await shell_executor.build_shell_env(shell=shell)
+
+    assert env["PATH"] == "/usr/bin"
+
+
+@pytest.mark.asyncio
+async def test_build_shell_env_forces_utf8_python_io_on_windows(monkeypatch) -> None:
+    from relay_teams.tools.workspace_tools import shell_executor
+
+    shell = shell_executor.ResolvedShell(
+        kind=shell_executor.ShellKind.POWERSHELL,
+        executable="powershell.exe",
+        display_name="PowerShell",
+    )
+
+    monkeypatch.setattr(shell_executor, "_is_windows", lambda: True)
+    monkeypatch.setattr(shell_executor, "_load_github_cli_env", lambda: {})
+    monkeypatch.setattr(shell_executor, "_load_clawhub_cli_env", lambda: {})
+    monkeypatch.setattr(
+        shell_executor,
+        "_resolve_gh_path",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        shell_executor,
+        "_resolve_clawhub_path",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        shell_executor.os,
+        "environ",
+        {"PATH": r"C:\Windows\System32"},
+    )
+
+    env = await shell_executor.build_shell_env(
+        shell=shell,
+    )
+
+    assert env["PYTHONIOENCODING"] == "utf-8"
+    assert env["PYTHONUTF8"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_build_shell_env_respects_case_variant_python_env_on_windows(
+    monkeypatch,
+) -> None:
+    from relay_teams.tools.workspace_tools import shell_executor
+
+    shell = shell_executor.ResolvedShell(
+        kind=shell_executor.ShellKind.POWERSHELL,
+        executable="powershell.exe",
+        display_name="PowerShell",
+    )
+
+    monkeypatch.setattr(shell_executor, "_is_windows", lambda: True)
+    monkeypatch.setattr(shell_executor, "_load_github_cli_env", lambda: {})
+    monkeypatch.setattr(shell_executor, "_load_clawhub_cli_env", lambda: {})
+    monkeypatch.setattr(
+        shell_executor,
+        "_resolve_gh_path",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        shell_executor,
+        "_resolve_clawhub_path",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        shell_executor.os,
+        "environ",
+        {
+            "PATH": r"C:\Windows\System32",
+            "pythonioencoding": "cp1252",
+            "pythonutf8": "0",
+        },
+    )
+
+    env = await shell_executor.build_shell_env(shell=shell)
+
+    assert env["pythonioencoding"] == "cp1252"
+    assert env["pythonutf8"] == "0"
+    assert "PYTHONIOENCODING" not in env
+    assert "PYTHONUTF8" not in env
+
+
+@pytest.mark.asyncio
+async def test_build_shell_env_applies_w3_auth_token_overlay_for_declared_env(
+    monkeypatch,
+) -> None:
+    from relay_teams.tools.workspace_tools import shell_executor
+
+    async def fake_overlay(
+        env: Mapping[str, str],
+        *,
+        declared_env: Mapping[str, object] | None = None,
+        **_kwargs: object,
+    ) -> dict[str, str]:
+        result = dict(env)
+        if declared_env is not None and "x-auth-token" in declared_env:
+            result["x-auth-token"] = "runtime-token"
+        return result
+
+    shell = shell_executor.ResolvedShell(
+        kind=shell_executor.ShellKind.POWERSHELL,
+        executable="powershell.exe",
+        display_name="PowerShell",
+    )
+    monkeypatch.setattr(shell_executor, "_is_windows", lambda: True)
+    monkeypatch.setattr(shell_executor, "_load_github_cli_env", lambda: {})
+    monkeypatch.setattr(shell_executor, "_load_clawhub_cli_env", lambda: {})
+    monkeypatch.setattr(
+        shell_executor,
+        "_resolve_gh_path",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        shell_executor,
+        "_resolve_clawhub_path",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(shell_executor, "overlay_w3_x_auth_token_env", fake_overlay)
+    monkeypatch.setattr(shell_executor.os, "environ", {"PATH": "base"})
+
+    env = await shell_executor.build_shell_env(
+        {"x-auth-token": "placeholder", "AUTH_TOKEN": "keep"},
+        shell=shell,
+    )
+
+    assert env["x-auth-token"] == "runtime-token"
+    assert env["AUTH_TOKEN"] == "keep"
+
+
+@pytest.mark.asyncio
+async def test_build_shell_env_does_not_overlay_inherited_w3_auth_token(
+    monkeypatch,
+) -> None:
+    from relay_teams.tools.workspace_tools import shell_executor
+
+    observed_declared_env: list[Mapping[str, object] | None] = []
+
+    async def fake_overlay(
+        env: Mapping[str, str],
+        *,
+        declared_env: Mapping[str, object] | None = None,
+        **_kwargs: object,
+    ) -> dict[str, str]:
+        observed_declared_env.append(declared_env)
+        result = dict(env)
+        if declared_env is not None and "X_AUTH_TOKEN" in declared_env:
+            result["X_AUTH_TOKEN"] = "runtime-token"
+        return result
+
+    shell = shell_executor.ResolvedShell(
+        kind=shell_executor.ShellKind.POWERSHELL,
+        executable="powershell.exe",
+        display_name="PowerShell",
+    )
+    monkeypatch.setattr(shell_executor, "_is_windows", lambda: True)
+    monkeypatch.setattr(shell_executor, "_load_github_cli_env", lambda: {})
+    monkeypatch.setattr(shell_executor, "_load_clawhub_cli_env", lambda: {})
+    monkeypatch.setattr(
+        shell_executor,
+        "_resolve_gh_path",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        shell_executor,
+        "_resolve_clawhub_path",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(shell_executor, "overlay_w3_x_auth_token_env", fake_overlay)
+    monkeypatch.setattr(
+        shell_executor.os,
+        "environ",
+        {"PATH": "base", "X_AUTH_TOKEN": "ambient-token"},
+    )
+
+    env = await shell_executor.build_shell_env(shell=shell)
+
+    assert observed_declared_env == [{}]
+    assert env["X_AUTH_TOKEN"] == "ambient-token"
+
+
+@pytest.mark.asyncio
+async def test_create_shell_subprocess_uses_powershell_wrapper_and_keeps_env(
+    monkeypatch,
+) -> None:
+    from relay_teams.tools.workspace_tools import shell_executor
+
+    captured_args: list[object] = []
+    captured_kwargs: dict[str, object] = {}
+
+    async def capturing_factory(*args: object, **kwargs: object) -> _FakeProcess:
+        captured_args.extend(args)
+        captured_kwargs.update(kwargs)
+        proc = _FakeProcess()
+        proc.stdout.feed_eof()
+        proc.stderr.feed_eof()
+        proc.returncode = 0
+        proc._wait_event.set()
+        return proc
+
+    shell = shell_executor.ResolvedShell(
+        kind=shell_executor.ShellKind.POWERSHELL,
+        executable="powershell.exe",
+        display_name="PowerShell",
+    )
+    monkeypatch.setattr(shell_executor, "_load_github_cli_env", lambda: {})
+    monkeypatch.setattr(shell_executor, "_load_clawhub_cli_env", lambda: {})
+    monkeypatch.setattr(
+        shell_executor,
+        "_resolve_gh_path",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        shell_executor.asyncio,
+        "create_subprocess_exec",
+        capturing_factory,
+    )
+    monkeypatch.setattr(
+        shell_executor.os,
+        "environ",
+        {
+            "PATH": r"C:\Windows\System32",
+            "BASH_ENV": r"C:\tmp\bashrc",
+        },
+    )
+
+    _ = await shell_executor.create_shell_subprocess(
+        command="Write-Output 'hello'",
+        cwd=Path("."),
+        shell=shell,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    assert captured_args[0] == "powershell.exe"
+    assert captured_args[1] == "-NoProfile"
+    assert captured_args[2] == "-Command"
+    assert "OutputEncoding" in str(captured_args[3])
+    env = captured_kwargs.get("env")
+    assert isinstance(env, dict)
+    assert env["BASH_ENV"] == r"C:\tmp\bashrc"
+
+
+def test_run_git_bash_strips_bash_startup_env(monkeypatch, tmp_path: Path) -> None:
+    from relay_teams.tools.workspace_tools import shell_executor
+
+    captured_kwargs: dict[str, object] = {}
+
+    class _CompletedProcess:
+        returncode = 0
+        stdout = "/tmp\n"
+        stderr = ""
+
+    def fake_run(*args: object, **kwargs: object) -> _CompletedProcess:
+        _ = args
+        captured_kwargs.update(kwargs)
+        return _CompletedProcess()
+
+    monkeypatch.setattr(shell_executor, "resolve_bash_path", lambda: "bash")
+    monkeypatch.setattr(shell_executor, "_load_github_cli_env", lambda: {})
+    monkeypatch.setattr(shell_executor, "_load_clawhub_cli_env", lambda: {})
+    monkeypatch.setattr(shell_executor, "_resolve_gh_path_sync", lambda: None)
+    monkeypatch.setattr(shell_executor.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        shell_executor.os,
+        "environ",
+        {
+            "PATH": "/usr/bin",
+            "BASH_ENV": "/tmp/hang.sh",
+            "PROMPT_COMMAND": "sleep 100",
+            "BASH_FUNC_module%%": "() { sleep 100; }",
+        },
+    )
+
+    result = shell_executor.run_git_bash(
+        command="pwd",
+        workdir=tmp_path,
+        timeout_seconds=5,
+    )
+
+    env = captured_kwargs.get("env")
+    assert isinstance(env, dict)
+    assert "BASH_ENV" not in env
+    assert "PROMPT_COMMAND" not in env
+    assert "BASH_FUNC_module%%" not in env
+    assert captured_kwargs.get("stdin") == subprocess.DEVNULL
+    assert result == (0, "/tmp\n", "", False)
 
 
 # ---------------------------------------------------------------------------
@@ -449,14 +1030,14 @@ async def test_spawn_shell_injects_github_token_and_bundled_path(
 
 class TestValidateShellCommand:
     def test_accepts_normal_length_command(self):
-        from agent_teams.tools.workspace_tools.shell_policy import (
+        from relay_teams.tools.workspace_tools.shell_policy import (
             validate_shell_command,
         )
 
         validate_shell_command("echo hello")
 
     def test_accepts_long_inline_script(self):
-        from agent_teams.tools.workspace_tools.shell_policy import (
+        from relay_teams.tools.workspace_tools.shell_policy import (
             validate_shell_command,
         )
 
@@ -464,7 +1045,7 @@ class TestValidateShellCommand:
         validate_shell_command(long_cmd)
 
     def test_rejects_command_above_max_length(self):
-        from agent_teams.tools.workspace_tools.shell_policy import (
+        from relay_teams.tools.workspace_tools.shell_policy import (
             MAX_COMMAND_LENGTH,
             validate_shell_command,
         )
@@ -474,7 +1055,7 @@ class TestValidateShellCommand:
             validate_shell_command(cmd)
 
     def test_error_message_includes_length(self):
-        from agent_teams.tools.workspace_tools.shell_policy import (
+        from relay_teams.tools.workspace_tools.shell_policy import (
             MAX_COMMAND_LENGTH,
             validate_shell_command,
         )
@@ -484,98 +1065,15 @@ class TestValidateShellCommand:
             validate_shell_command(cmd)
 
 
-# ---------------------------------------------------------------------------
-# _save_overflow_output
-# ---------------------------------------------------------------------------
-
-
-class TestSaveOverflowOutput:
-    def test_returns_none_when_within_limit(self, tmp_path: Path) -> None:
-        from agent_teams.tools.workspace_tools.shell import (
-            MAX_OUTPUT_CHARS,
-            _save_overflow_output,
-        )
-
-        workspace = self._make_workspace(tmp_path)
-        content = "x" * MAX_OUTPUT_CHARS
-        assert _save_overflow_output(workspace, content, "stdout") is None
-
-    def test_creates_file_when_exceeding_limit(self, tmp_path: Path) -> None:
-        from agent_teams.tools.workspace_tools.shell import (
-            MAX_OUTPUT_CHARS,
-            _save_overflow_output,
-        )
-
-        workspace = self._make_workspace(tmp_path)
-        content = "x" * (MAX_OUTPUT_CHARS + 100)
-        result = _save_overflow_output(workspace, content, "stdout")
-        assert result is not None
-        assert result.exists()
-        assert result.read_text(encoding="utf-8") == content
-        assert "shell_output" in str(result)
-
-    @staticmethod
-    def _make_workspace(tmp_path: Path):
-        """Build a minimal WorkspaceHandle-like object for testing."""
-        from unittest.mock import MagicMock
-
-        workspace = MagicMock()
-        workspace.locations.workspace_dir = tmp_path
-        return workspace
-
-
-# ---------------------------------------------------------------------------
-# Existing helpers
-# ---------------------------------------------------------------------------
-
-
-def test_format_timeout_metadata_uses_normalized_timeout() -> None:
-    from agent_teams.tools.workspace_tools.shell import _format_timeout_metadata
-
-    metadata = _format_timeout_metadata(30000)
-
-    assert "30000ms" in metadata
-    assert "Nonems" not in metadata
-
-
-def test_project_shell_result_hides_raw_streams_from_visible_payload(
-    tmp_path: Path,
-) -> None:
-    from agent_teams.tools.workspace_tools.shell import _project_shell_result
-
-    stdout_path = tmp_path / "stdout.txt"
-    result = _project_shell_result(
-        exit_code=1,
-        timed_out=False,
-        stdout="stdout text",
-        stderr="stderr text",
-        output="combined output",
-        stdout_overflow=stdout_path,
-        stderr_overflow=None,
-    )
-
-    assert result.visible_data == {
-        "output": "combined output",
-        "exit_code": 1,
-        "timed_out": False,
-        "truncated": True,
-    }
-    assert result.internal_data == {
-        "exit_code": 1,
-        "timed_out": False,
-        "stdout": "stdout text",
-        "stderr": "stderr text",
-        "output": "combined output",
-        "stdout_overflow_path": str(stdout_path),
-    }
-
-
 def test_run_git_bash_uses_current_proxy_env(monkeypatch) -> None:
-    from agent_teams.tools.workspace_tools import shell_executor
+    from relay_teams.tools.workspace_tools import shell_executor
 
     captured: dict[str, object] = {}
     monkeypatch.setenv("HTTP_PROXY", "http://proxy.example:8080")
     monkeypatch.setattr(shell_executor, "resolve_bash_path", lambda: "bash")
+    monkeypatch.setattr(shell_executor, "_load_github_cli_env", lambda: {})
+    monkeypatch.setattr(shell_executor, "_load_clawhub_cli_env", lambda: {})
+    monkeypatch.setattr(shell_executor, "_resolve_gh_path_sync", lambda: None)
 
     def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
         _ = args
@@ -600,10 +1098,13 @@ def test_run_git_bash_uses_current_proxy_env(monkeypatch) -> None:
 
 
 def test_run_git_bash_uses_process_group(monkeypatch) -> None:
-    from agent_teams.tools.workspace_tools import shell_executor
+    from relay_teams.tools.workspace_tools import shell_executor
 
     captured_kwargs: dict[str, object] = {}
     monkeypatch.setattr(shell_executor, "resolve_bash_path", lambda: "bash")
+    monkeypatch.setattr(shell_executor, "_load_github_cli_env", lambda: {})
+    monkeypatch.setattr(shell_executor, "_load_clawhub_cli_env", lambda: {})
+    monkeypatch.setattr(shell_executor, "_resolve_gh_path_sync", lambda: None)
 
     def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
         _ = args

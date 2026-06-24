@@ -1,26 +1,122 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import asyncio
+from typing import cast
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from agent_teams.interfaces.server.deps import get_mcp_service
-from agent_teams.interfaces.server.routers import mcp
-from agent_teams.mcp.mcp_models import (
+from relay_teams.interfaces.server.deps import get_mcp_service
+from relay_teams.interfaces.server.routers import mcp
+from relay_teams.mcp.mcp_models import (
     McpConfigScope,
+    McpDiscoveryStatus,
+    McpServerAddResult,
+    McpServerConfigResult,
+    McpServerConnectionTestResult,
+    McpServerEnabledUpdateRequest,
     McpServerSummary,
     McpServerToolsSummary,
+    McpServerUpdateRequest,
     McpToolInfo,
 )
+from relay_teams.mcp.mcp_service import McpService
 
 
 class _FakeMcpService:
+    def add_server(
+        self,
+        *,
+        name: str,
+        server_config: dict[str, object],
+        overwrite: bool = False,
+    ) -> McpServerAddResult:
+        _ = overwrite
+        return McpServerAddResult(
+            server=McpServerSummary(
+                name=name,
+                source=McpConfigScope.APP,
+                transport=str(server_config.get("transport", "stdio")),
+            ),
+            config_path="C:/Users/test/.relay-teams/mcp.json",
+        )
+
+    def get_server_config(self, name: str) -> McpServerConfigResult:
+        if name != "filesystem":
+            raise ValueError(f"Unknown MCP server: {name}")
+        return McpServerConfigResult(
+            server=McpServerSummary(
+                name=name,
+                source=McpConfigScope.APP,
+                transport="stdio",
+            ),
+            config={
+                "transport": "stdio",
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-filesystem"],
+            },
+        )
+
+    def update_server(
+        self,
+        name: str,
+        request: McpServerUpdateRequest,
+    ) -> McpServerConfigResult:
+        if name != "filesystem":
+            raise ValueError(f"Unknown MCP server: {name}")
+        return McpServerConfigResult(
+            server=McpServerSummary(
+                name=name,
+                source=McpConfigScope.APP,
+                transport=str(request.config.get("transport", "stdio")),
+            ),
+            config=request.config,
+        )
+
+    def delete_server(self, name: str) -> McpServerSummary:
+        if name != "filesystem":
+            raise ValueError(f"Unknown MCP server: {name}")
+        return McpServerSummary(
+            name=name,
+            source=McpConfigScope.APP,
+            transport="stdio",
+        )
+
+    def set_server_enabled(
+        self,
+        name: str,
+        request: McpServerEnabledUpdateRequest,
+    ) -> McpServerSummary:
+        if name != "filesystem":
+            raise ValueError(f"Unknown MCP server: {name}")
+        return McpServerSummary(
+            name=name,
+            source=McpConfigScope.APP,
+            transport="stdio",
+            enabled=request.enabled,
+        )
+
     def list_servers(self) -> tuple[McpServerSummary, ...]:
         return (
             McpServerSummary(
                 name="filesystem",
                 source=McpConfigScope.APP,
                 transport="stdio",
+            ),
+        )
+
+    async def test_server_connection(self, name: str) -> McpServerConnectionTestResult:
+        if name != "filesystem":
+            raise ValueError(f"Unknown MCP server: {name}")
+        return McpServerConnectionTestResult(
+            server="filesystem",
+            source=McpConfigScope.APP,
+            transport="stdio",
+            ok=True,
+            tool_count=1,
+            tools=(
+                McpToolInfo(name="filesystem_read_file", description="Read a file"),
             ),
         )
 
@@ -36,12 +132,28 @@ class _FakeMcpService:
             ),
         )
 
+    def refresh_server_tools(self, name: str) -> McpServerToolsSummary:
+        if name != "filesystem":
+            raise ValueError(f"Unknown MCP server: {name}")
+        return McpServerToolsSummary(
+            server="filesystem",
+            source=McpConfigScope.APP,
+            transport="stdio",
+            status=McpDiscoveryStatus.LOADING,
+        )
+
 
 def _create_test_client(fake_service: object) -> TestClient:
     app = FastAPI()
     app.include_router(mcp.router, prefix="/api")
     app.dependency_overrides[get_mcp_service] = lambda: fake_service
     return TestClient(app)
+
+
+def _clear_route_guard_state() -> None:
+    with mcp._TOOLS_ROUTE_LOCK:
+        mcp._TOOLS_ROUTE_CACHE.clear()
+        mcp._TOOLS_ROUTE_IN_FLIGHT.clear()
 
 
 def test_list_mcp_servers() -> None:
@@ -55,11 +167,280 @@ def test_list_mcp_servers() -> None:
             "name": "filesystem",
             "source": "app",
             "transport": "stdio",
+            "enabled": True,
+            "discovery_status": "pending",
+            "tool_count": 0,
+            "last_checked_at": None,
+            "error": None,
         }
     ]
 
 
+def test_add_mcp_server() -> None:
+    client = _create_test_client(_FakeMcpService())
+
+    response = client.post(
+        "/api/mcp/servers",
+        json={
+            "name": "filesystem",
+            "config": {"transport": "stdio", "command": "npx"},
+            "overwrite": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "server": {
+            "name": "filesystem",
+            "source": "app",
+            "transport": "stdio",
+            "enabled": True,
+            "discovery_status": "pending",
+            "tool_count": 0,
+            "last_checked_at": None,
+            "error": None,
+        },
+        "config_path": "C:/Users/test/.relay-teams/mcp.json",
+    }
+
+
+def test_add_mcp_server_returns_400_for_invalid_request() -> None:
+    class _InvalidAddService(_FakeMcpService):
+        def add_server(
+            self,
+            *,
+            name: str,
+            server_config: dict[str, object],
+            overwrite: bool = False,
+        ) -> McpServerAddResult:
+            _ = name, server_config, overwrite
+            raise ValueError("MCP server already exists: filesystem")
+
+    client = _create_test_client(_InvalidAddService())
+
+    response = client.post(
+        "/api/mcp/servers",
+        json={
+            "name": "filesystem",
+            "config": {"transport": "stdio", "command": "npx"},
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "MCP server already exists: filesystem"}
+
+
+def test_add_mcp_server_returns_503_when_config_manager_is_unavailable() -> None:
+    class _UnavailableAddService(_FakeMcpService):
+        def add_server(
+            self,
+            *,
+            name: str,
+            server_config: dict[str, object],
+            overwrite: bool = False,
+        ) -> McpServerAddResult:
+            _ = name, server_config, overwrite
+            raise RuntimeError("MCP config manager is not available")
+
+    client = _create_test_client(_UnavailableAddService())
+
+    response = client.post(
+        "/api/mcp/servers",
+        json={
+            "name": "filesystem",
+            "config": {"transport": "stdio", "command": "npx"},
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "MCP config manager is not available"}
+
+
+def test_set_mcp_server_enabled() -> None:
+    client = _create_test_client(_FakeMcpService())
+
+    response = client.put(
+        "/api/mcp/servers/filesystem/enabled", json={"enabled": False}
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "name": "filesystem",
+        "source": "app",
+        "transport": "stdio",
+        "enabled": False,
+        "discovery_status": "pending",
+        "tool_count": 0,
+        "last_checked_at": None,
+        "error": None,
+    }
+
+
+def test_set_mcp_server_enabled_returns_503_when_unavailable() -> None:
+    class _UnavailableEnableService(_FakeMcpService):
+        def set_server_enabled(
+            self,
+            name: str,
+            request: McpServerEnabledUpdateRequest,
+        ) -> McpServerSummary:
+            _ = name, request
+            raise RuntimeError("MCP config manager is not available")
+
+    client = _create_test_client(_UnavailableEnableService())
+
+    response = client.put(
+        "/api/mcp/servers/filesystem/enabled", json={"enabled": False}
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "MCP config manager is not available"}
+
+
+def test_set_mcp_server_enabled_returns_404_for_unknown_server() -> None:
+    client = _create_test_client(_FakeMcpService())
+
+    response = client.put("/api/mcp/servers/missing/enabled", json={"enabled": True})
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Unknown MCP server: missing"}
+
+
+def test_get_mcp_server_config() -> None:
+    client = _create_test_client(_FakeMcpService())
+
+    response = client.get("/api/mcp/servers/filesystem")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "server": {
+            "name": "filesystem",
+            "source": "app",
+            "transport": "stdio",
+            "enabled": True,
+            "discovery_status": "pending",
+            "tool_count": 0,
+            "last_checked_at": None,
+            "error": None,
+        },
+        "config": {
+            "transport": "stdio",
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-filesystem"],
+        },
+    }
+
+
+def test_get_mcp_server_config_returns_404_for_unknown_server() -> None:
+    client = _create_test_client(_FakeMcpService())
+
+    response = client.get("/api/mcp/servers/missing")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Unknown MCP server: missing"}
+
+
+def test_get_mcp_server_config_returns_503_when_unavailable() -> None:
+    class _UnavailableGetService(_FakeMcpService):
+        def get_server_config(self, name: str) -> McpServerConfigResult:
+            _ = name
+            raise RuntimeError("MCP config manager is not available")
+
+    client = _create_test_client(_UnavailableGetService())
+
+    response = client.get("/api/mcp/servers/filesystem")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "MCP config manager is not available"}
+
+
+def test_update_mcp_server_config() -> None:
+    client = _create_test_client(_FakeMcpService())
+
+    response = client.put(
+        "/api/mcp/servers/filesystem",
+        json={"config": {"transport": "stdio", "command": "uvx"}},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["config"] == {"transport": "stdio", "command": "uvx"}
+
+
+def test_update_mcp_server_config_returns_404_for_unknown_server() -> None:
+    client = _create_test_client(_FakeMcpService())
+
+    response = client.put(
+        "/api/mcp/servers/missing",
+        json={"config": {"transport": "stdio", "command": "uvx"}},
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Unknown MCP server: missing"}
+
+
+def test_update_mcp_server_config_returns_503_when_unavailable() -> None:
+    class _UnavailableUpdateService(_FakeMcpService):
+        def update_server(
+            self,
+            name: str,
+            request: McpServerUpdateRequest,
+        ) -> McpServerConfigResult:
+            _ = name, request
+            raise RuntimeError("MCP config manager is not available")
+
+    client = _create_test_client(_UnavailableUpdateService())
+
+    response = client.put(
+        "/api/mcp/servers/filesystem",
+        json={"config": {"transport": "stdio", "command": "uvx"}},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "MCP config manager is not available"}
+
+
+def test_delete_mcp_server() -> None:
+    client = _create_test_client(_FakeMcpService())
+
+    response = client.delete("/api/mcp/servers/filesystem")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "name": "filesystem",
+        "source": "app",
+        "transport": "stdio",
+        "enabled": True,
+        "discovery_status": "pending",
+        "tool_count": 0,
+        "last_checked_at": None,
+        "error": None,
+    }
+
+
+def test_delete_mcp_server_returns_404_for_unknown_server() -> None:
+    client = _create_test_client(_FakeMcpService())
+
+    response = client.delete("/api/mcp/servers/missing")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Unknown MCP server: missing"}
+
+
+def test_delete_mcp_server_returns_503_when_unavailable() -> None:
+    class _UnavailableDeleteService(_FakeMcpService):
+        def delete_server(self, name: str) -> McpServerSummary:
+            _ = name
+            raise RuntimeError("MCP config manager is not available")
+
+    client = _create_test_client(_UnavailableDeleteService())
+
+    response = client.delete("/api/mcp/servers/filesystem")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "MCP config manager is not available"}
+
+
 def test_list_mcp_server_tools() -> None:
+    _clear_route_guard_state()
     client = _create_test_client(_FakeMcpService())
 
     response = client.get("/api/mcp/servers/filesystem/tools")
@@ -69,20 +450,111 @@ def test_list_mcp_server_tools() -> None:
         "server": "filesystem",
         "source": "app",
         "transport": "stdio",
+        "enabled": True,
         "tools": [{"name": "filesystem_read_file", "description": "Read a file"}],
+        "status": "pending",
+        "last_checked_at": None,
+        "error": None,
     }
 
 
-def test_list_mcp_server_tools_surfaces_connection_failures() -> None:
-    class _BrokenMcpService(_FakeMcpService):
+def test_list_mcp_server_tools_route_guard_reuses_short_interval_result() -> None:
+    _clear_route_guard_state()
+
+    class _CountingService(_FakeMcpService):
+        def __init__(self) -> None:
+            self.calls = 0
+
         async def list_server_tools(self, name: str) -> McpServerToolsSummary:
-            raise RuntimeError("Connection closed")
+            self.calls += 1
+            return await super().list_server_tools(name)
 
-    client = _create_test_client(_BrokenMcpService())
+    service = _CountingService()
 
-    response = client.get("/api/mcp/servers/filesystem/tools")
+    first = asyncio.run(
+        mcp._list_mcp_server_tools_with_route_guard(
+            "filesystem",
+            cast(McpService, service),
+        )
+    )
+    second = asyncio.run(
+        mcp._list_mcp_server_tools_with_route_guard(
+            "filesystem",
+            cast(McpService, service),
+        )
+    )
 
-    assert response.status_code == 502
-    assert response.json() == {
-        "detail": "Failed to load MCP tools for 'filesystem': Connection closed"
-    }
+    assert first.server == "filesystem"
+    assert second.server == "filesystem"
+    assert service.calls == 1
+
+
+def test_list_mcp_server_tools_route_guard_shares_concurrent_request() -> None:
+    _clear_route_guard_state()
+
+    class _BlockingService(_FakeMcpService):
+        def __init__(self) -> None:
+            self.calls = 0
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def list_server_tools(self, name: str) -> McpServerToolsSummary:
+            self.calls += 1
+            self.entered.set()
+            await self.release.wait()
+            return await super().list_server_tools(name)
+
+    async def run_guarded_calls(service: _BlockingService) -> None:
+        first_task = asyncio.create_task(
+            mcp._list_mcp_server_tools_with_route_guard(
+                "filesystem",
+                cast(McpService, service),
+            )
+        )
+        second_task = asyncio.create_task(
+            mcp._list_mcp_server_tools_with_route_guard(
+                "filesystem",
+                cast(McpService, service),
+            )
+        )
+        await asyncio.wait_for(service.entered.wait(), timeout=1)
+        service.release.set()
+        first, second = await asyncio.gather(first_task, second_task)
+        assert first.server == "filesystem"
+        assert second.server == "filesystem"
+
+    service = _BlockingService()
+
+    asyncio.run(run_guarded_calls(service))
+
+    assert service.calls == 1
+
+
+def test_refresh_mcp_server_tools() -> None:
+    _clear_route_guard_state()
+    client = _create_test_client(_FakeMcpService())
+
+    response = client.post("/api/mcp/servers/filesystem/tools:refresh")
+
+    assert response.status_code == 200
+    assert response.json()["server"] == "filesystem"
+    assert response.json()["status"] == "loading"
+
+
+def test_test_mcp_server_connection() -> None:
+    client = _create_test_client(_FakeMcpService())
+
+    response = client.post("/api/mcp/servers/filesystem/test")
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert response.json()["tool_count"] == 1
+
+
+def test_test_mcp_server_connection_returns_404_for_unknown_server() -> None:
+    client = _create_test_client(_FakeMcpService())
+
+    response = client.post("/api/mcp/servers/missing/test")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Unknown MCP server: missing"}

@@ -5,10 +5,25 @@ import httpx
 from pathlib import Path
 from typer.testing import CliRunner
 
-from agent_teams.interfaces.cli import app as cli_app
+from relay_teams.interfaces.cli import app_full as cli_app
 from integration_tests.support.environment import IntegrationEnvironment
 
 runner = CliRunner()
+
+
+def _workspace_response(root_path: Path) -> dict[str, object]:
+    return {
+        "workspace": {
+            "workspace_id": "workspace-1",
+            "root_path": str(root_path.resolve()),
+        }
+    }
+
+
+def _workspace_items(payload: object) -> list[dict[str, object]]:
+    raw_items = payload.get("items") if isinstance(payload, dict) else payload
+    assert isinstance(raw_items, list)
+    return [item for item in raw_items if isinstance(item, dict)]
 
 
 def test_root_message_prints_fake_llm_output(
@@ -28,10 +43,64 @@ def test_root_message_prints_fake_llm_output(
     assert after_calls > before_calls
 
 
-def test_root_message_uses_yolo_by_default(monkeypatch) -> None:
+def test_root_message_supports_workspace_selection(
+    integration_env: IntegrationEnvironment,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "cli-workspace"
+    project_root.mkdir()
+    monkeypatch.setattr(cli_app, "DEFAULT_BASE_URL", integration_env.api_base_url)
+
+    result = runner.invoke(
+        cli_app.app,
+        ["-m", "hello integration workspace", "--workspace", str(project_root)],
+    )
+
+    assert result.exit_code == 0
+    assert "[fake-llm] hello integration workspace" in result.output
+
+    response = httpx.get(
+        f"{integration_env.api_base_url}/api/workspaces",
+        timeout=5.0,
+        trust_env=False,
+    )
+    response.raise_for_status()
+    items = _workspace_items(response.json())
+    assert any(item.get("root_path") == str(project_root.resolve()) for item in items)
+
+
+def test_root_message_uses_current_directory_as_default_workspace(
+    integration_env: IntegrationEnvironment,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "default-cli-workspace"
+    project_root.mkdir()
+    monkeypatch.chdir(project_root)
+    monkeypatch.setattr(cli_app, "DEFAULT_BASE_URL", integration_env.api_base_url)
+
+    result = runner.invoke(cli_app.app, ["-m", "hello default workspace"])
+
+    assert result.exit_code == 0
+    assert "[fake-llm] hello default workspace" in result.output
+
+    response = httpx.get(
+        f"{integration_env.api_base_url}/api/workspaces",
+        timeout=5.0,
+        trust_env=False,
+    )
+    response.raise_for_status()
+    items = _workspace_items(response.json())
+    assert any(item.get("root_path") == str(project_root.resolve()) for item in items)
+
+
+def test_root_message_uses_yolo_by_default(monkeypatch, tmp_path: Path) -> None:
     calls: list[tuple[str, str, dict[str, object] | None]] = []
 
-    def fake_autostart(base_url: str, autostart: bool) -> None:
+    def fake_autostart(
+        base_url: str, autostart: bool, daemon: bool = False, force: bool = False
+    ) -> None:
         _ = (base_url, autostart)
 
     def fake_request_json(
@@ -43,6 +112,8 @@ def test_root_message_uses_yolo_by_default(monkeypatch) -> None:
     ) -> dict[str, object] | list[object]:
         _ = (base_url, timeout_seconds)
         calls.append((method, path, payload))
+        if path == "/api/workspaces/pick":
+            return _workspace_response(tmp_path)
         if path == "/api/sessions":
             return {"session_id": "session-1"}
         if path == "/api/runs":
@@ -55,6 +126,7 @@ def test_root_message_uses_yolo_by_default(monkeypatch) -> None:
     monkeypatch.setattr(cli_app, "_auto_start_if_needed", fake_autostart)
     monkeypatch.setattr(cli_app, "_request_json", fake_request_json)
     monkeypatch.setattr(cli_app, "_stream_events", fake_stream)
+    monkeypatch.chdir(tmp_path)
 
     result = runner.invoke(cli_app.app, ["-m", "hello"])
 
@@ -64,7 +136,7 @@ def test_root_message_uses_yolo_by_default(monkeypatch) -> None:
         "/api/runs",
         {
             "session_id": "session-1",
-            "intent": "hello",
+            "input": [{"kind": "text", "text": "hello"}],
             "execution_mode": "ai",
             "yolo": True,
         },

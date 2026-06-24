@@ -1,4 +1,4 @@
-# cool-play-agent-teams
+# relay-teams
 
 Role-driven multi-agent orchestration framework built with strong typing and tool-only collaboration flow.
 Runtime model execution uses `pydantic_ai` with OpenAI-compatible endpoints.
@@ -6,30 +6,57 @@ Runtime model execution uses `pydantic_ai` with OpenAI-compatible endpoints.
 ## Evaluation Snapshot
 
 Recent SWE-bench snapshots are archived under [`docs/evaluations/swebench/`](docs/evaluations/swebench/README.md).
-Current snapshots cover only the first `100` items from `SWE-bench Verified`, not the full benchmark.
+AgentBench OS/DB snapshots are archived under [`docs/evaluations/agentbench/`](docs/evaluations/agentbench/README.md).
+Current SWE-bench snapshots cover only the first `100` items from `SWE-bench Verified`, not the full benchmark.
 
-Using glm-5,Temperature: 0.7,Top P:0.95.
+SWE-bench snapshots include the previously archived `glm-5` runs and the newer `deepseek-v4-flash` runs from `2026-06-08`. AgentBench uses the archived `deepseek-v4-flash` run from `2026-05-26__00-38-21`.
 
-| Mode | Benchmark | Pass Rate | Passed | Failed | Mean Duration | Input Tokens | Cached Input | Output Tokens | Requests | Tool Calls | Report |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| Normal | SWE-bench Verified 100 | 72.0% | 72 | 28 | 369.2s | 60,265,198 | 58,214,976 | 451,537 | 2,432 | 2,484 | [HTML](docs/evaluations/swebench/normal-swebench-verified-100-report.html) |
-| Orchestration | SWE-bench Verified 100 | 73.0% | 73 | 27 | 704.2s | 103,016,077 | 95,659,776 | 1,886,195 | 6,026 | 7,171 | [HTML](docs/evaluations/swebench/orchestration-swebench-verified-100-report.html) |
+| Model | Mode | Benchmark | Pass Rate | Passed | Failed | Mean Duration | Input Tokens | Cached Input | Output Tokens | Requests | Tool Calls | Report |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| glm-5 | Normal | SWE-bench Verified 100 | 72.0% | 72 | 28 | 369.2s | 60,265,198 | 58,214,976 | 451,537 | 2,432 | 2,484 | [HTML](docs/evaluations/swebench/normal-swebench-verified-100-report.html) |
+| glm-5 | Orchestration | SWE-bench Verified 100 | 73.0% | 73 | 27 | 704.2s | 103,016,077 | 95,659,776 | 1,886,195 | 6,026 | 7,171 | [HTML](docs/evaluations/swebench/orchestration-swebench-verified-100-report.html) |
+| deepseek-v4-flash | Normal | SWE-bench Verified 100 | 71.0% | 71 | 29 | 316.1s | 97,209,524 | 94,190,336 | 864,680 | 1,900 | 968 | [HTML](docs/evaluations/swebench/deepseek-v4-flash-normal-swebench-verified-100-report.html) |
+| deepseek-v4-flash | Orchestration | SWE-bench Verified 100 | 72.0% | 72 | 28 | 379.4s | 201,439,841 | 179,946,112 | 3,054,858 | 7,729 | 4,416 | [HTML](docs/evaluations/swebench/deepseek-v4-flash-orchestration-swebench-verified-100-report.html) |
+| deepseek-v4-flash | Normal | AgentBench OS | 41.0% | 59 | 85 | 23.9s | 5,665,302 | 5,220,736 | 254,361 | 1,217 | 249 | [HTML](docs/evaluations/agentbench/agentbench-os-report.html) |
+| deepseek-v4-flash | Normal | AgentBench DB | 73.7% | 221 | 79 | 21.1s | 8,850,453 | 7,550,080 | 469,910 | 1,906 | 65 | [HTML](docs/evaluations/agentbench/agentbench-db-report.html) |
 
 Highlights:
 
-- `Orchestration` currently reaches `73/100` on `SWE-bench Verified 100`, with `96` runs finishing in `completed` state and `4` ending in `failed`.
-- `Normal` mode currently reaches `72/100` on `SWE-bench Verified 100`, with `97` runs finishing in `completed` state and `3` ending in `failed`.
+- The archived `glm-5` SWE-bench snapshots remain available under their original report filenames.
+- `deepseek-v4-flash` reaches `71/100` in normal mode and `72/100` in orchestration mode on the same SWE-bench Verified 100 subset.
+- In orchestration mode, `outcome` is the agent lifecycle status and can be `failed` even when the SWE-bench Docker scorer marks the patch as resolved.
+- AgentBench is reported as separate OS and DB suites from the archived 444-item run.
 - Token usage is reported directly in the table so model IO and tool activity can be compared without deriving cost assumptions.
 
 ## Web Interface
 
-![Agent Teams Web Interface](docs/agent_teams.png)
-
-Start the server with `uv run agent-teams server start` and open http://127.0.0.1:8000 in your browser.
-Use `uv run agent-teams server restart` to restart the managed server, and `uv run agent-teams server stop --force` to force stop it.
+Start the server with `uv run relay-teams server start` and open http://127.0.0.1:8000 in your browser.
+Use `uv run relay-teams server restart` to restart the managed server, and `uv run relay-teams server stop --force` to force stop it.
+Add `--daemon` to `server start` to run the server as a background process: `uv run relay-teams server start --daemon`.
+All CLI commands that support `--autostart` now also accept `--daemon` (`-d`) and `--force` to control background autostart behavior and force-restart an existing server.
 The web UI now includes a language toggle beside the settings button so you can switch between English and Simplified Chinese in-page.
 
 Frontend assets are now decoupled under `frontend/dist` and served by the backend.
+
+### Temporary Public URL for GitHub Webhooks
+
+The GitHub Webhook panel can create a temporary public URL for local testing.
+This uses `localhost.run` over `ssh` and the service assigns a random temporary hostname such as `*.lhr.life`.
+Users do not register the exact `lhr.life` hostname themselves.
+
+How to use it:
+
+1. Open `Automation -> GitHub -> GitHub Access`.
+2. In `GitHub Webhook`, click `Create Temporary URL`.
+3. Wait for the generated `Webhook Base URL` to be filled automatically.
+4. Copy the derived `Callback URL` into GitHub's `Payload URL`.
+5. Configure the same GitHub webhook `Secret` on both sides so GitHub sends `X-Hub-Signature-256`.
+
+Notes:
+
+- This feature requires `ssh` to be installed on the host running `relay-teams`.
+- The temporary public hostname only stays valid while the tunnel is running.
+- Use your own stable domain and reverse proxy for long-lived production webhooks.
 
 ## Quick start
 
@@ -52,21 +79,44 @@ sh setup.sh
 Install from PyPI:
 
 ```bash
-pip install cool-play-agent-teams
+pip install relay-teams
 ```
 
 Direct install:
 
-```bash
-uv sync --extra dev
+Windows:
+
+```powershell
+py -3 -m pip install uv
+py -3 -m uv sync --extra dev
+py -3 -m uv pip install -e .
 ```
+
+Linux/macOS:
+
+```bash
+python3 -m pip install uv
+python3 -m uv sync --extra dev
+python3 -m uv pip install -e .
+```
+
+For local development, prefer `uv run --extra dev ...` over raw `python`, `pytest`, or `ruff` so commands execute inside the repository environment instead of a system interpreter.
 
 ### 2) help
 
 ```bash
-agent-teams --help
+relay-teams --help
 
 # for evals
-agent-teams-evals --help
+relay-teams-evals --help
 ```
 
+If the `relay-teams` command is still missing in a fresh local checkout, the project package was not installed into the active virtual environment. Re-run the matching `-m uv pip install -e .` command above for your platform, or use `py -3 -m uv run python -m relay_teams --help` on Windows or `python3 -m uv run python -m relay_teams --help` on Linux/macOS as a fallback.
+
+Examples:
+
+```bash
+uv run --extra dev pytest -q
+uv run --extra dev ruff check --fix
+uv run --extra dev basedpyright
+```

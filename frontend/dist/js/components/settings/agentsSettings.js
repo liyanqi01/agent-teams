@@ -1,14 +1,15 @@
 /**
  * components/settings/agentsSettings.js
- * External ACP agent settings panel bindings.
+ * External agent runtime settings panel bindings.
  */
 import {
-    deleteExternalAgent,
-    fetchExternalAgent,
-    fetchExternalAgents,
+    deleteAgentRuntime,
+    fetchAgentRuntime,
+    fetchAgentRuntimeTestJob,
+    fetchAgentRuntimes,
     fetchEnvironmentVariables,
-    saveExternalAgent,
-    testExternalAgent,
+    saveAgentRuntime,
+    startAgentRuntimeTestJob,
 } from '../../core/api.js';
 import { showToast } from '../../utils/feedback.js';
 import { t } from '../../utils/i18n.js';
@@ -26,25 +27,50 @@ const HIDDEN_APP_ENV_KEYS = new Set([
     'SSL_VERIFY',
     'ssl_verify',
 ]);
+const AGENT_RUNTIME_TEST_POLL_MS = 600;
 
 let agentSummaries = [];
 let selectedAgentId = '';
 let selectedSourceAgentId = '';
+let currentProtocol = 'acp';
 let currentTransport = 'stdio';
 let currentStdioEnv = [];
 let currentHttpHeaders = [];
+let currentRegistryEnv = [];
+let currentRegistryEntry = null;
 let availableEnvironmentBindings = [];
 let languageBound = false;
+let agentActionBusy = false;
+let activeAgentTestJobId = '';
 
 export function bindAgentSettingsHandlers() {
     bindActionButton('add-agent-btn', handleAddAgent);
+    bindActionButton('agent-create-custom-btn', event => {
+        if (event?.stopPropagation) {
+            event.stopPropagation();
+        }
+        handleAddAgent();
+    });
+    bindActionButton('agent-registry-create-custom-btn', event => {
+        if (event?.stopPropagation) {
+            event.stopPropagation();
+        }
+        handleAddAgent();
+    });
     bindActionButton('save-agent-btn', handleSaveAgent);
     bindActionButton('test-agent-btn', handleTestAgent);
     bindActionButton('delete-agent-btn', handleDeleteAgent);
     bindActionButton('cancel-agent-btn', handleCancelAgent);
     bindActionButton('add-agent-stdio-env-btn', () => addBindingRow('stdio'));
+    bindActionButton('add-agent-registry-env-btn', () => addBindingRow('registry'));
     bindActionButton('add-agent-http-header-btn', () => addBindingRow('http'));
 
+    const protocolSelect = document.getElementById('agent-protocol-input');
+    if (protocolSelect) {
+        protocolSelect.onchange = () => {
+            currentProtocol = String(protocolSelect.value || 'acp').trim() || 'acp';
+        };
+    }
     const transportSelect = document.getElementById('agent-transport-input');
     if (transportSelect) {
         transportSelect.onchange = () => {
@@ -56,6 +82,7 @@ export function bindAgentSettingsHandlers() {
         document.addEventListener('agent-teams-language-changed', () => {
             renderAgentsList();
             renderBindingRows('stdio');
+            renderBindingRows('registry');
             renderBindingRows('http');
         });
         languageBound = true;
@@ -65,7 +92,7 @@ export function bindAgentSettingsHandlers() {
 export async function loadAgentSettingsPanel(preferredAgentId = '') {
     try {
         const [summaries, environmentBindings] = await Promise.all([
-            fetchExternalAgents(),
+            fetchAgentRuntimes(),
             loadEnvironmentBindings(),
         ]);
         agentSummaries = Array.isArray(summaries) ? summaries.map(normalizeAgentSummary) : [];
@@ -87,7 +114,7 @@ export async function loadAgentSettingsPanel(preferredAgentId = '') {
     } catch (error) {
         logError(
             'frontend.agents_settings.load_failed',
-            'Failed to load external agents',
+            'Failed to load agent runtimes',
             errorToPayload(error),
         );
         showAgentsList();
@@ -110,6 +137,7 @@ function normalizeAgentSummary(agent) {
         agent_id: String(agent?.agent_id || '').trim(),
         name: String(agent?.name || '').trim(),
         description: String(agent?.description || '').trim(),
+        protocol: String(agent?.protocol || 'acp').trim() || 'acp',
         transport: String(agent?.transport || 'stdio').trim() || 'stdio',
     };
 }
@@ -169,6 +197,7 @@ function createBlankAgentConfig() {
         agent_id: '',
         name: '',
         description: '',
+        protocol: 'acp',
         transport: {
             transport: 'stdio',
             command: '',
@@ -180,11 +209,13 @@ function createBlankAgentConfig() {
 
 function normalizeAgentConfig(config) {
     const safeTransport = String(config?.transport?.transport || 'stdio').trim() || 'stdio';
+    const safeProtocol = String(config?.protocol || 'acp').trim() || 'acp';
     if (safeTransport === 'streamable_http') {
         return {
             agent_id: String(config?.agent_id || '').trim(),
             name: String(config?.name || '').trim(),
             description: String(config?.description || '').trim(),
+            protocol: safeProtocol,
             transport: {
                 transport: 'streamable_http',
                 url: String(config?.transport?.url || '').trim(),
@@ -204,6 +235,7 @@ function normalizeAgentConfig(config) {
             agent_id: String(config?.agent_id || '').trim(),
             name: String(config?.name || '').trim(),
             description: String(config?.description || '').trim(),
+            protocol: safeProtocol,
             transport: {
                 transport: 'custom',
                 adapter_id: String(config?.transport?.adapter_id || '').trim(),
@@ -213,10 +245,32 @@ function normalizeAgentConfig(config) {
             },
         };
     }
+    if (safeTransport === 'registry') {
+        const registryEntry = config?.transport?.registry_entry;
+        return {
+            agent_id: String(config?.agent_id || '').trim(),
+            name: String(config?.name || '').trim(),
+            description: String(config?.description || '').trim(),
+            protocol: safeProtocol,
+            transport: {
+                transport: 'registry',
+                registry_id: String(config?.transport?.registry_id || '').trim(),
+                distribution: String(config?.transport?.distribution || 'auto').trim() || 'auto',
+                registry_version: String(config?.transport?.registry_version || '').trim(),
+                env: Array.isArray(config?.transport?.env)
+                    ? config.transport.env.map(normalizeBinding)
+                    : [],
+                registry_entry: registryEntry && typeof registryEntry === 'object'
+                    ? registryEntry
+                    : null,
+            },
+        };
+    }
     return {
         agent_id: String(config?.agent_id || '').trim(),
         name: String(config?.name || '').trim(),
         description: String(config?.description || '').trim(),
+        protocol: safeProtocol,
         transport: {
             transport: 'stdio',
             command: String(config?.transport?.command || '').trim(),
@@ -240,18 +294,19 @@ function renderAgentsList() {
     }
 
     listEl.innerHTML = `
-        <div class="role-records">
+        <div class="settings-record-list role-records">
             ${agentSummaries.map(agent => `
-                <div class="role-record${agent.agent_id === selectedAgentId ? ' active' : ''}" data-agent-id="${escapeHtml(agent.agent_id)}">
+                <div class="role-record settings-record${agent.agent_id === selectedAgentId ? ' active' : ''}" data-agent-id="${escapeHtml(agent.agent_id)}">
                     <div class="role-record-main">
                         <div class="role-record-title-row">
-                            <div class="role-record-title">${escapeHtml(agent.name || agent.agent_id)}</div>
+                            <div class="settings-record-title role-record-title">${escapeHtml(agent.name || agent.agent_id)}</div>
                             <div class="role-record-id">${escapeHtml(agent.agent_id)}</div>
                             <div class="profile-card-chips role-record-chips">
+                                <span class="profile-card-chip">${escapeHtml(formatProtocolLabel(agent.protocol))}</span>
                                 <span class="profile-card-chip">${escapeHtml(formatTransportLabel(agent.transport))}</span>
                             </div>
                         </div>
-                        <div class="role-record-meta">
+                        <div class="settings-record-meta role-record-meta">
                             <span>${escapeHtml(agent.description || t('settings.agents.no_description'))}</span>
                         </div>
                     </div>
@@ -283,7 +338,7 @@ function renderAgentsList() {
 async function loadAgentDocument(agentId) {
     selectedAgentId = String(agentId || '').trim();
     renderAgentsList();
-    const record = normalizeAgentConfig(await fetchExternalAgent(agentId));
+    const record = normalizeAgentConfig(await fetchAgentRuntime(agentId));
     selectedAgentId = record.agent_id;
     selectedSourceAgentId = record.agent_id;
     applyAgentRecord(record);
@@ -299,6 +354,7 @@ function applyAgentRecord(record) {
     if (formEl) formEl.style.display = 'block';
     if (emptyEl) emptyEl.style.display = 'none';
 
+    currentProtocol = String(record?.protocol || 'acp').trim() || 'acp';
     currentTransport = String(record?.transport?.transport || 'stdio').trim() || 'stdio';
     currentStdioEnv = currentTransport === 'stdio'
         ? record.transport.env.map(normalizeBinding)
@@ -306,10 +362,17 @@ function applyAgentRecord(record) {
     currentHttpHeaders = currentTransport === 'streamable_http'
         ? record.transport.headers.map(normalizeBinding)
         : [];
+    currentRegistryEnv = currentTransport === 'registry'
+        ? record.transport.env.map(normalizeBinding)
+        : [];
+    currentRegistryEntry = currentTransport === 'registry'
+        ? record.transport.registry_entry || null
+        : null;
 
     setInputValue('agent-id-input', record.agent_id || '');
     setInputValue('agent-name-input', record.name || '');
     setInputValue('agent-description-input', record.description || '');
+    setInputValue('agent-protocol-input', currentProtocol);
     setInputValue('agent-transport-input', currentTransport);
     setInputValue('agent-stdio-command-input', currentTransport === 'stdio' ? record.transport.command || '' : '');
     setInputValue('agent-stdio-args-input', currentTransport === 'stdio' ? serializeLines(record.transport.args || []) : '');
@@ -330,7 +393,11 @@ function applyAgentRecord(record) {
             ? JSON.stringify(record.transport.config || {}, null, 2)
             : '{}',
     );
+    setInputValue('agent-registry-id-input', currentTransport === 'registry' ? record.transport.registry_id || '' : '');
+    setInputValue('agent-registry-distribution-input', currentTransport === 'registry' ? record.transport.distribution || 'auto' : 'auto');
+    setInputValue('agent-registry-version-input', currentTransport === 'registry' ? record.transport.registry_version || '' : '');
     renderBindingRows('stdio');
+    renderBindingRows('registry');
     renderBindingRows('http');
     renderTransportSections();
     renderAgentStatus('', '');
@@ -339,11 +406,17 @@ function applyAgentRecord(record) {
 function renderBindingRows(kind) {
     const containerId = kind === 'stdio'
         ? 'agent-stdio-env-list'
-        : 'agent-http-header-list';
+        : kind === 'registry'
+            ? 'agent-registry-env-list'
+            : 'agent-http-header-list';
     const container = document.getElementById(containerId);
     if (!container) return;
 
-    const rows = kind === 'stdio' ? currentStdioEnv : currentHttpHeaders;
+    const rows = kind === 'stdio'
+        ? currentStdioEnv
+        : kind === 'registry'
+            ? currentRegistryEnv
+            : currentHttpHeaders;
     container.className = 'agent-binding-list';
     if (!rows.length) {
         container.innerHTML = renderEmptyBindingState(kind);
@@ -352,13 +425,13 @@ function renderBindingRows(kind) {
 
     container.innerHTML = rows
         .map((binding, index) =>
-            kind === 'stdio'
-                ? renderEnvironmentBindingRow(binding, index)
+            kind === 'stdio' || kind === 'registry'
+                ? renderEnvironmentBindingRow(binding, index, kind)
                 : renderHttpHeaderBindingRow(binding, index),
         )
         .join('');
 
-    if (kind === 'stdio') {
+    if (kind === 'stdio' || kind === 'registry') {
         container.querySelectorAll('.agent-binding-name-select').forEach(select => {
             select.onchange = event => updateBindingField(kind, event, 'name');
         });
@@ -381,10 +454,14 @@ function renderBindingRows(kind) {
 function updateBindingField(kind, event, field) {
     const target = event?.target;
     const index = Number(target?.dataset?.index || -1);
-    const rows = kind === 'stdio' ? currentStdioEnv : currentHttpHeaders;
+    const rows = kind === 'stdio'
+        ? currentStdioEnv
+        : kind === 'registry'
+            ? currentRegistryEnv
+            : currentHttpHeaders;
     if (index < 0 || index >= rows.length) return;
     const current = rows[index];
-    if (kind === 'stdio' && field === 'name') {
+    if ((kind === 'stdio' || kind === 'registry') && field === 'name') {
         const nextName = String(target?.value || '').trim();
         const matchedBinding = resolveEnvironmentBinding(nextName);
         rows[index] = matchedBinding
@@ -393,7 +470,7 @@ function updateBindingField(kind, event, field) {
                 ...current,
                 name: nextName,
             };
-        renderBindingRows('stdio');
+        renderBindingRows(kind);
         return;
     }
     if (field === 'secret') {
@@ -411,22 +488,26 @@ function updateBindingField(kind, event, field) {
 }
 
 function addBindingRow(kind) {
-    const rows = kind === 'stdio' ? currentStdioEnv : currentHttpHeaders;
-    if (kind === 'stdio') {
+    const rows = kind === 'stdio'
+        ? currentStdioEnv
+        : kind === 'registry'
+            ? currentRegistryEnv
+            : currentHttpHeaders;
+    if (kind === 'stdio' || kind === 'registry') {
         if (!availableEnvironmentBindings.length) {
             showToast({
                 title: t('settings.agents.no_env_options'),
                 message: t('settings.agents.no_env_options_copy'),
                 tone: 'warning',
             });
-            renderBindingRows('stdio');
+            renderBindingRows(kind);
             return;
         }
         const nextBinding = availableEnvironmentBindings.find(option =>
             !rows.some(item => item.name === option.key),
         ) || availableEnvironmentBindings[0];
         rows.push(createEnvironmentBinding(nextBinding));
-        renderBindingRows('stdio');
+        renderBindingRows(kind);
         return;
     }
     rows.push({
@@ -445,6 +526,11 @@ function removeBindingRow(kind, indexValue) {
         renderBindingRows('stdio');
         return;
     }
+    if (kind === 'registry') {
+        currentRegistryEnv = currentRegistryEnv.filter((_, itemIndex) => itemIndex !== index);
+        renderBindingRows('registry');
+        return;
+    }
     currentHttpHeaders = currentHttpHeaders.filter((_, itemIndex) => itemIndex !== index);
     renderBindingRows('http');
 }
@@ -453,9 +539,11 @@ function renderTransportSections() {
     const stdioSection = document.getElementById('agent-transport-stdio');
     const httpSection = document.getElementById('agent-transport-http');
     const customSection = document.getElementById('agent-transport-custom');
+    const registrySection = document.getElementById('agent-transport-registry');
     if (stdioSection) stdioSection.style.display = currentTransport === 'stdio' ? 'block' : 'none';
     if (httpSection) httpSection.style.display = currentTransport === 'streamable_http' ? 'block' : 'none';
     if (customSection) customSection.style.display = currentTransport === 'custom' ? 'block' : 'none';
+    if (registrySection) registrySection.style.display = currentTransport === 'registry' ? 'block' : 'none';
 }
 
 function renderEmptyAgentsList(
@@ -467,6 +555,7 @@ function renderEmptyAgentsList(
     if (editorPanel) {
         editorPanel.style.display = 'none';
     }
+    setAgentCreateMethodBarVisible(false);
     if (listEl) {
         listEl.innerHTML = `
             <div class="settings-empty-state">
@@ -482,9 +571,13 @@ function renderEmptyAgentsList(
 function handleAddAgent() {
     selectedAgentId = '';
     selectedSourceAgentId = '';
+    const runtimeView = document.getElementById('agent-runtime-settings-view');
+    const registryView = document.getElementById('agent-registry-view');
+    if (runtimeView) runtimeView.style.display = 'block';
+    if (registryView) registryView.style.display = 'none';
     renderAgentsList();
     applyAgentRecord(createBlankAgentConfig());
-    showAgentEditor();
+    showAgentEditor({ createMode: true });
     const idInput = document.getElementById('agent-id-input');
     if (idInput?.focus) {
         idInput.focus();
@@ -495,7 +588,7 @@ async function handleSaveAgent() {
     try {
         const draft = buildDraftFromForm();
         const pathAgentId = selectedSourceAgentId || draft.agent_id;
-        const saved = normalizeAgentConfig(await saveExternalAgent(pathAgentId, draft));
+        const saved = normalizeAgentConfig(await saveAgentRuntime(pathAgentId, draft));
         selectedAgentId = saved.agent_id;
         selectedSourceAgentId = saved.agent_id;
         showToast({
@@ -516,11 +609,39 @@ async function handleSaveAgent() {
 }
 
 async function handleTestAgent() {
+    if (agentActionBusy) return;
+    let jobId = '';
     try {
+        setAgentActionBusy(true);
         const draft = buildDraftFromForm();
         const pathAgentId = selectedSourceAgentId || draft.agent_id;
-        const saved = normalizeAgentConfig(await saveExternalAgent(pathAgentId, draft));
-        const result = await testExternalAgent(saved.agent_id);
+        const saved = normalizeAgentConfig(await saveAgentRuntime(pathAgentId, draft));
+        selectedAgentId = saved.agent_id;
+        selectedSourceAgentId = saved.agent_id;
+        const initialJob = normalizeTestJob(await startAgentRuntimeTestJob(saved.agent_id));
+        jobId = initialJob.job_id;
+        activeAgentTestJobId = jobId;
+        renderAgentTestJobStatus(initialJob);
+        const completedJob = await waitForAgentRuntimeTestJob(jobId);
+        if (activeAgentTestJobId !== jobId) {
+            return;
+        }
+        renderAgentTestJobStatus(completedJob);
+        if (completedJob.status === 'failed') {
+            throw new Error(
+                completedJob.error_message
+                || completedJob.message
+                || t('settings.agents.test_failed_message'),
+            );
+        }
+        const result = completedJob.result || {};
+        if (result.ok === false) {
+            throw new Error(
+                result.message
+                || completedJob.message
+                || t('settings.agents.test_failed_message'),
+            );
+        }
         selectedAgentId = saved.agent_id;
         selectedSourceAgentId = saved.agent_id;
         await loadAgentSettingsPanel(saved.agent_id);
@@ -537,6 +658,11 @@ async function handleTestAgent() {
             message: error.message || t('settings.agents.test_failed_message'),
             tone: 'danger',
         });
+    } finally {
+        if (!jobId || activeAgentTestJobId === jobId) {
+            activeAgentTestJobId = '';
+        }
+        setAgentActionBusy(false);
     }
 }
 
@@ -547,7 +673,7 @@ async function handleDeleteAgent() {
         return;
     }
     try {
-        await deleteExternalAgent(agentId);
+        await deleteAgentRuntime(agentId);
         selectedAgentId = '';
         selectedSourceAgentId = '';
         showToast({
@@ -580,7 +706,9 @@ function buildDraftFromForm() {
         throw new Error(t('settings.agents.name_required'));
     }
     const description = String(getInputValue('agent-description-input')).trim();
+    const protocol = String(getInputValue('agent-protocol-input')).trim() || 'acp';
     const transport = String(getInputValue('agent-transport-input')).trim() || 'stdio';
+    validateProtocolTransport(protocol, transport);
     if (transport === 'streamable_http') {
         const url = String(getInputValue('agent-http-url-input')).trim();
         if (!url) {
@@ -590,6 +718,7 @@ function buildDraftFromForm() {
             agent_id: agentId,
             name,
             description,
+            protocol,
             transport: {
                 transport: 'streamable_http',
                 url,
@@ -607,6 +736,7 @@ function buildDraftFromForm() {
             agent_id: agentId,
             name,
             description,
+            protocol,
             transport: {
                 transport: 'custom',
                 adapter_id: adapterId,
@@ -617,6 +747,31 @@ function buildDraftFromForm() {
             },
         };
     }
+    if (transport === 'registry') {
+        const registryId = String(getInputValue('agent-registry-id-input')).trim();
+        if (!registryId) {
+            throw new Error(t('settings.agents.registry_id_required'));
+        }
+        const registryVersion = String(getInputValue('agent-registry-version-input')).trim();
+        const registryTransport = {
+            transport: 'registry',
+            registry_id: registryId,
+            distribution: String(getInputValue('agent-registry-distribution-input')).trim() || 'auto',
+            registry_version: registryVersion,
+            env: normalizeBindingsForSave(syncEnvironmentBindings(currentRegistryEnv)),
+        };
+        const registryEntry = registryEntrySnapshotForSave(registryId, registryVersion);
+        if (registryEntry) {
+            registryTransport.registry_entry = registryEntry;
+        }
+        return {
+            agent_id: agentId,
+            name,
+            description,
+            protocol,
+            transport: registryTransport,
+        };
+    }
     const command = String(getInputValue('agent-stdio-command-input')).trim();
     if (!command) {
         throw new Error(t('settings.agents.stdio_command_required'));
@@ -625,6 +780,7 @@ function buildDraftFromForm() {
         agent_id: agentId,
         name,
         description,
+        protocol,
         transport: {
             transport: 'stdio',
             command,
@@ -645,11 +801,24 @@ function normalizeBindingsForSave(bindings) {
         .filter(item => item.name);
 }
 
+function validateProtocolTransport(protocol, transport) {
+    if (protocol === 'a2a' && transport !== 'streamable_http') {
+        throw new Error(t('settings.agents.a2a_requires_http'));
+    }
+    if (protocol === 'cli' && transport !== 'stdio') {
+        throw new Error(t('settings.agents.cli_requires_stdio'));
+    }
+    if (transport === 'registry' && protocol !== 'acp') {
+        throw new Error(t('settings.agents.registry_requires_acp'));
+    }
+}
+
 function showAgentsList() {
     const listEl = document.getElementById('agents-list');
     const editorPanel = document.getElementById('agent-editor-panel');
     if (listEl) listEl.style.display = 'block';
     if (editorPanel) editorPanel.style.display = 'none';
+    setAgentCreateMethodBarVisible(false);
     toggleAgentActions({
         add: true,
         test: false,
@@ -659,11 +828,12 @@ function showAgentsList() {
     });
 }
 
-function showAgentEditor() {
+function showAgentEditor(options = {}) {
     const listEl = document.getElementById('agents-list');
     const editorPanel = document.getElementById('agent-editor-panel');
     if (listEl) listEl.style.display = 'none';
     if (editorPanel) editorPanel.style.display = 'block';
+    setAgentCreateMethodBarVisible(options.createMode === true, 'custom');
     toggleAgentActions({
         add: false,
         test: true,
@@ -675,16 +845,40 @@ function showAgentEditor() {
 
 function toggleAgentActions(visibility) {
     setActionDisplay('add-agent-btn', visibility.add);
+    setActionDisplay('refresh-agent-registry-btn', false);
+    setActionDisplay('back-agents-btn', false);
     setActionDisplay('test-agent-btn', visibility.test);
     setActionDisplay('save-agent-btn', visibility.save);
     setActionDisplay('delete-agent-btn', visibility.delete);
     setActionDisplay('cancel-agent-btn', visibility.cancel);
+    setAgentActionBusy(agentActionBusy);
 }
 
 function setActionDisplay(id, visible) {
     const button = document.getElementById(id);
     if (button) {
         button.style.display = visible ? 'inline-flex' : 'none';
+    }
+}
+
+function setAgentActionBusy(isBusy) {
+    agentActionBusy = isBusy === true;
+    [
+        'test-agent-btn',
+        'save-agent-btn',
+        'delete-agent-btn',
+        'cancel-agent-btn',
+    ].forEach(id => {
+        const button = document.getElementById(id);
+        if (!button) return;
+        button.disabled = agentActionBusy;
+        button.setAttribute?.('aria-busy', agentActionBusy ? 'true' : 'false');
+    });
+    const testButton = document.getElementById('test-agent-btn');
+    if (testButton) {
+        testButton.textContent = agentActionBusy
+            ? t('settings.agents.testing')
+            : t('settings.action.test');
     }
 }
 
@@ -702,6 +896,125 @@ function renderAgentStatus(message, tone) {
         statusEl.classList.add(`role-editor-status-${tone}`);
     }
     statusEl.textContent = message;
+}
+
+function renderAgentTestJobStatus(job) {
+    const statusEl = document.getElementById('agent-editor-status');
+    if (!statusEl) return;
+    const normalizedJob = normalizeTestJob(job);
+    const percent = Number.isFinite(normalizedJob.progress_percent)
+        ? Math.max(0, Math.min(100, Number(normalizedJob.progress_percent)))
+        : null;
+    const byteText = formatByteProgress(
+        normalizedJob.downloaded_bytes,
+        normalizedJob.total_bytes,
+    );
+    statusEl.className = 'role-editor-status role-editor-status-progress';
+    if (normalizedJob.status === 'failed' || normalizedJob.phase === 'failed') {
+        statusEl.classList.add('role-editor-status-danger');
+    } else {
+        statusEl.classList.add('role-editor-status-warning');
+    }
+    statusEl.style.display = 'block';
+    statusEl.innerHTML = `
+        <div class="agent-runtime-test-status">
+            <div class="agent-runtime-test-status-main">
+                ${escapeHtml(normalizedJob.message || t('settings.agents.testing_message'))}
+            </div>
+            <div class="agent-runtime-test-status-meta">
+                ${escapeHtml(formatRuntimeTestMeta(normalizedJob, byteText))}
+            </div>
+            <div class="agent-runtime-test-progress${percent === null ? ' indeterminate' : ''}" aria-hidden="true">
+                <span style="width: ${percent === null ? 42 : percent}%;"></span>
+            </div>
+        </div>
+    `;
+}
+
+async function waitForAgentRuntimeTestJob(jobId) {
+    let latest = normalizeTestJob(await fetchAgentRuntimeTestJob(jobId));
+    renderAgentTestJobStatus(latest);
+    while (latest.status === 'queued' || latest.status === 'running') {
+        await delay(AGENT_RUNTIME_TEST_POLL_MS);
+        if (activeAgentTestJobId !== jobId) {
+            return latest;
+        }
+        latest = normalizeTestJob(await fetchAgentRuntimeTestJob(jobId));
+        renderAgentTestJobStatus(latest);
+    }
+    return latest;
+}
+
+function normalizeTestJob(job) {
+    return {
+        job_id: String(job?.job_id || '').trim(),
+        agent_id: String(job?.agent_id || '').trim(),
+        registry_id: String(job?.registry_id || '').trim(),
+        distribution: String(job?.distribution || '').trim(),
+        status: String(job?.status || 'running').trim() || 'running',
+        phase: String(job?.phase || 'queued').trim() || 'queued',
+        message: String(job?.message || '').trim(),
+        progress_percent: job?.progress_percent == null
+            ? null
+            : Number.isFinite(Number(job.progress_percent))
+            ? Number(job.progress_percent)
+            : null,
+        downloaded_bytes: Number.isFinite(Number(job?.downloaded_bytes))
+            ? Number(job.downloaded_bytes)
+            : 0,
+        total_bytes: job?.total_bytes == null
+            ? null
+            : Number.isFinite(Number(job.total_bytes))
+            ? Number(job.total_bytes)
+            : null,
+        result: job?.result && typeof job.result === 'object' ? job.result : null,
+        error_message: String(job?.error_message || '').trim(),
+    };
+}
+
+function formatRuntimeTestMeta(job, byteText) {
+    const parts = [];
+    if (job.phase) {
+        parts.push(job.phase.replaceAll('_', ' '));
+    }
+    if (job.registry_id) {
+        parts.push(job.registry_id);
+    }
+    if (job.distribution) {
+        parts.push(job.distribution);
+    }
+    if (byteText) {
+        parts.push(byteText);
+    }
+    return parts.join(' · ');
+}
+
+function formatByteProgress(downloadedBytes, totalBytes) {
+    if (!downloadedBytes && !totalBytes) return '';
+    if (totalBytes) {
+        return `${formatBytes(downloadedBytes)} / ${formatBytes(totalBytes)}`;
+    }
+    return formatBytes(downloadedBytes);
+}
+
+function formatBytes(value) {
+    const bytes = Number(value || 0);
+    if (bytes < 1024) {
+        return `${bytes} B`;
+    }
+    if (bytes < 1024 * 1024) {
+        return `${(bytes / 1024).toFixed(1)} KB`;
+    }
+    if (bytes < 1024 * 1024 * 1024) {
+        return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    }
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+function delay(ms) {
+    return new Promise(resolve => {
+        window.setTimeout(resolve, ms);
+    });
 }
 
 function setInputValue(id, value) {
@@ -757,11 +1070,40 @@ function serializeTriStateValue(value) {
 function formatTransportLabel(transport) {
     if (transport === 'streamable_http') return t('settings.agents.transport_http_label');
     if (transport === 'custom') return t('settings.agents.transport_custom_label');
+    if (transport === 'registry') return t('settings.agents.transport_registry_label');
     return t('settings.agents.transport_stdio_label');
 }
 
+export function setAgentCreateMethodBarVisible(visible, mode = 'custom') {
+    setElementDisplay('agent-create-method-bar', visible && mode !== 'registry');
+    setElementDisplay('agent-registry-create-method-bar', visible && mode === 'registry');
+    setAgentCreateMethodMode(mode);
+}
+
+export function setAgentCreateMethodMode(mode) {
+    const normalizedMode = mode === 'registry' ? 'registry' : 'custom';
+    document.querySelectorAll?.('.agent-create-method-tab').forEach(button => {
+        const active = String(button.dataset.agentCreateMethod || '') === normalizedMode;
+        button.classList.toggle('active', active);
+        button.setAttribute?.('aria-selected', active ? 'true' : 'false');
+    });
+}
+
+function setElementDisplay(id, visible) {
+    const element = document.getElementById(id);
+    if (element) {
+        element.style.display = visible ? 'flex' : 'none';
+    }
+}
+
+function formatProtocolLabel(protocol) {
+    if (protocol === 'a2a') return t('settings.agents.protocol_a2a_label');
+    if (protocol === 'cli') return t('settings.agents.protocol_cli_label');
+    return t('settings.agents.protocol_acp_label');
+}
+
 function renderEmptyBindingState(kind) {
-    if (kind === 'stdio' && !availableEnvironmentBindings.length) {
+    if ((kind === 'stdio' || kind === 'registry') && !availableEnvironmentBindings.length) {
         return `
             <div class="role-option-empty agent-binding-empty">
                 <div>${escapeHtml(t('settings.agents.no_env_options'))}</div>
@@ -769,23 +1111,23 @@ function renderEmptyBindingState(kind) {
             </div>
         `;
     }
-    if (kind === 'stdio') {
+    if (kind === 'stdio' || kind === 'registry') {
         return `<div class="role-option-empty agent-binding-empty">${escapeHtml(t('settings.agents.no_env_bindings'))}</div>`;
     }
     return `<div class="role-option-empty agent-binding-empty">${escapeHtml(t('settings.agents.no_headers'))}</div>`;
 }
 
-function renderEnvironmentBindingRow(binding, index) {
+function renderEnvironmentBindingRow(binding, index, kind = 'stdio') {
     const selectedName = String(binding?.name || '').trim();
     return `
-        <div class="agent-binding-row agent-env-binding-row" data-kind="stdio" data-index="${index}">
+        <div class="agent-binding-row agent-env-binding-row" data-kind="${escapeHtml(kind)}" data-index="${index}">
             <div class="agent-env-binding-main">
-                <select class="agent-binding-name-select agent-env-binding-select" data-kind="stdio" data-index="${index}" aria-label="${escapeHtml(t('settings.agents.select_env'))}">
+                <select class="agent-binding-name-select agent-env-binding-select" data-kind="${escapeHtml(kind)}" data-index="${index}" aria-label="${escapeHtml(t('settings.agents.select_env'))}">
                     ${renderEnvironmentBindingOptions(selectedName)}
                 </select>
                 <div class="agent-env-binding-meta">${escapeHtml(formatEnvironmentBindingMeta(selectedName))}</div>
             </div>
-            <button class="secondary-btn section-action-btn agent-binding-remove-btn agent-env-binding-remove" data-kind="stdio" data-index="${index}" type="button">${escapeHtml(t('settings.agents.action_remove'))}</button>
+            <button class="secondary-btn section-action-btn agent-binding-remove-btn agent-env-binding-remove" data-kind="${escapeHtml(kind)}" data-index="${index}" type="button">${escapeHtml(t('settings.agents.action_remove'))}</button>
         </div>
     `;
 }
@@ -851,8 +1193,26 @@ function syncEnvironmentBindings(bindings) {
     return (Array.isArray(bindings) ? bindings : []).map(binding => {
         const normalizedBinding = normalizeBinding(binding);
         const matchedBinding = resolveEnvironmentBinding(normalizedBinding.name);
-        return matchedBinding ? createEnvironmentBinding(matchedBinding) : normalizedBinding;
+        if (!matchedBinding) {
+            return normalizedBinding;
+        }
+        if (normalizedBinding.secret || normalizedBinding.configured) {
+            return normalizedBinding;
+        }
+        return createEnvironmentBinding(matchedBinding);
     });
+}
+
+function registryEntrySnapshotForSave(registryId, registryVersion) {
+    if (!currentRegistryEntry || typeof currentRegistryEntry !== 'object') {
+        return null;
+    }
+    const entryId = String(currentRegistryEntry.id || '').trim();
+    const entryVersion = String(currentRegistryEntry.version || '').trim();
+    if (entryId !== registryId || entryVersion !== registryVersion) {
+        return null;
+    }
+    return currentRegistryEntry;
 }
 
 function formatEnvironmentBindingMeta(bindingName) {

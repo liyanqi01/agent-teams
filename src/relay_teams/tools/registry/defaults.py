@@ -1,0 +1,38 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+from relay_teams.tools.auto_harness_tools import TOOLS as AUTO_HARNESS_TOOLS
+from relay_teams.tools.computer_tools import TOOLS as COMPUTER_TOOLS
+from relay_teams.tools.im_tools.im_send import register as register_im_send
+from relay_teams.tools.notify_tools import TOOLS as NOTIFY_TOOLS
+from relay_teams.tools.orchestration_tools import TOOLS as ORCHESTRATION_TOOLS
+from relay_teams.tools.registry.registry import ToolRegistry
+from relay_teams.tools.skill_team_tools import TOOLS as SKILL_TEAM_TOOLS
+from relay_teams.tools.task_tools import TOOLS as TASK_TOOLS
+from relay_teams.tools.todo_tools import TOOLS as TODO_TOOLS
+from relay_teams.tools.web_tools import TOOLS as WEB_TOOLS
+from relay_teams.tools.workspace_tools import TOOLS as WORKSPACE_TOOLS
+
+IM_TOOLS = {
+    "im_send": register_im_send,
+}
+HIDDEN_FROM_ROLE_CONFIG: tuple[str, ...] = ("im_send",)
+
+
+def build_default_registry() -> ToolRegistry:
+    tools = {
+        **ORCHESTRATION_TOOLS,
+        **SKILL_TEAM_TOOLS,
+        **TASK_TOOLS,
+        **TODO_TOOLS,
+        **WEB_TOOLS,
+        **WORKSPACE_TOOLS,
+        **COMPUTER_TOOLS,
+        **NOTIFY_TOOLS,
+        **AUTO_HARNESS_TOOLS,
+        **IM_TOOLS,
+    }
+    return ToolRegistry(
+        tools,
+        hidden_from_config=HIDDEN_FROM_ROLE_CONFIG,
+    )

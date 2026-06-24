@@ -1,0 +1,3860 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import base64
+import binascii
+import contextlib
+import json
+import logging
+import shutil
+import sqlite3
+import uuid
+from collections.abc import AsyncIterator, Callable, Mapping
+from typing import TYPE_CHECKING, NamedTuple, Protocol, cast
+
+from relay_teams.agent_runtimes.instances.models import AgentRuntimeRecord
+from relay_teams.logger import get_logger, log_event
+from relay_teams.media import ContentPart
+from relay_teams.media import content_parts_to_text
+from relay_teams.media import user_prompt_content_to_text
+from relay_teams.metrics import SqliteMetricAggregateStore
+from relay_teams.memory.event_handler import MemoryEventHandler
+from relay_teams.monitors.repository import MonitorRepository
+from relay_teams.persistence.scope_models import ScopeRef, ScopeType
+from relay_teams.validation import (
+    require_cascade_delete,
+    require_force_delete,
+)
+from relay_teams.sessions.session_metadata import (
+    SESSION_METADATA_TITLE_SOURCE_KEY,
+    SESSION_TITLE_SOURCE_AUTO,
+    SESSION_TITLE_SOURCE_MANUAL,
+)
+from relay_teams.sessions.session_list_cache import SessionListCache
+from relay_teams.sessions.session_read_models import (
+    CachedReadResult,
+    SessionRoundsQueryKey,
+    SessionSnapshotSection,
+    SessionSubagentsSnapshotResponse,
+)
+from relay_teams.sessions.runs.active_run_registry import ActiveSessionRunRegistry
+from relay_teams.sessions.runs.event_stream import RunEventHub
+from relay_teams.sessions.runs.runtime_config import RuntimeConfig
+from relay_teams.sessions.session_rounds_projection import (
+    DETAILED_ROUND_PROJECTION_EVENT_TYPES,
+    ROUND_PROJECTION_EVENT_TYPES,
+    approvals_to_projection,
+    build_session_rounds,
+    build_session_timeline_rounds,
+    find_round_by_run_id,
+    paginate_rounds,
+    timeline_rounds,
+)
+from relay_teams.agent_runtimes.instances.instance_repository import (
+    AgentInstanceRepository,
+)
+from relay_teams.tools.runtime.acp_approval import acp_options_projection
+from relay_teams.tools.runtime.approval_ticket_repo import ApprovalTicketRepository
+from relay_teams.sessions.runs.event_log import EventLog
+from relay_teams.agents.execution.message_repository import MessageRepository
+from relay_teams.sessions.runs.run_state_repo import RunStateRepository
+from relay_teams.sessions.runs.run_state_models import RunStateRecord
+from relay_teams.sessions.runs.todo_service import TodoService
+from relay_teams.sessions.runs.enums import RunEventType
+from relay_teams.sessions.runs.run_models import IntentInput, RunEvent
+from relay_teams.sessions.runs.background_tasks.models import BackgroundTaskRecord
+from relay_teams.sessions.runs.background_tasks.models import BackgroundTaskKind
+from relay_teams.sessions.runs.background_tasks.repository import (
+    BackgroundTaskRepository,
+)
+from relay_teams.sessions.runs.run_runtime_repo import (
+    RunRuntimePhase,
+    RunRuntimeRecord,
+    RunRuntimeRepository,
+    RunRuntimeStatus,
+)
+from relay_teams.sessions.runs.user_question_models import UserQuestionRequestRecord
+from relay_teams.sessions.runs.user_question_repository import UserQuestionRepository
+from relay_teams.sessions.external_session_binding_repository import (
+    ExternalSessionBindingRepository,
+)
+from relay_teams.tools.workspace_tools.edit_state import READ_STATE_PREFIX
+from relay_teams.sessions.session_models import (
+    ProjectKind,
+    SessionMetadataPatch,
+    SessionMode,
+    SessionRecord,
+    SessionSidebarPage,
+    SessionSidebarRecord,
+)
+from relay_teams.sessions.session_history_marker_repository import (
+    SessionHistoryMarkerRepository,
+)
+from relay_teams.sessions.session_history_marker_models import (
+    SessionHistoryMarkerRecord,
+    SessionHistoryMarkerType,
+)
+from relay_teams.sessions.session_repository import SessionRepository
+from relay_teams.persistence.shared_state_repo import SharedStateRepository
+from relay_teams.agents.tasks.enums import TaskStatus
+from relay_teams.agents.tasks.models import TaskRecord
+from relay_teams.agents.tasks.task_repository import TaskRepository
+from relay_teams.providers.token_usage_repo import (
+    RunTokenUsage,
+    SessionTokenUsage,
+    TokenUsageRepository,
+)
+from relay_teams.sessions.session_snapshot_cache import (
+    ProjectionRefreshRunner,
+    SessionSnapshotCache,
+)
+from relay_teams.workspace import (
+    WorkspaceManager,
+    WorkspaceService,
+    build_conversation_id,
+    build_instance_role_scope_id,
+    build_instance_session_scope_id,
+)
+
+import asyncio
+
+if TYPE_CHECKING:
+    from relay_teams.agents.orchestration.settings_service import (
+        OrchestrationSettingsService,
+    )
+    from relay_teams.media import MediaAssetService
+    from relay_teams.mcp.mcp_registry import McpRegistry
+    from relay_teams.roles.role_registry import RoleRegistry
+    from relay_teams.sessions.runs.run_intent_repo import RunIntentRepository
+    from relay_teams.skills.skill_registry import SkillRegistry
+
+
+from relay_teams.roles.role_registry import SystemRolesUnavailableError
+
+AUTOMATION_INTERNAL_WORKSPACE_ID = "automation-system"
+ACTIVE_RUN_REBIND_ERROR = (
+    "Cannot rebind workspace while session has active or recoverable run"
+)
+TERMINAL_RUN_STATUSES = frozenset(
+    {
+        RunRuntimeStatus.COMPLETED,
+        RunRuntimeStatus.FAILED,
+        RunRuntimeStatus.STOPPED,
+    }
+)
+_LEGACY_COORDINATOR_IDENTIFIERS = (
+    "coordinator",
+    "coordinator agent",
+    "coordinator_agent",
+)
+_MAIN_AGENT_IDENTIFIERS = ("mainagent", "main agent", "main_agent")
+_AUTO_SESSION_TITLE_MAX_CHARS = 120
+_SESSION_SIDEBAR_DEFAULT_LIMIT = 50
+_SESSION_SIDEBAR_MAX_LIMIT = 200
+LOGGER = get_logger(__name__)
+
+
+class _SessionDeleteContext(NamedTuple):
+    session: SessionRecord
+    task_records: tuple[TaskRecord, ...]
+    agent_records: tuple[AgentRuntimeRecord, ...]
+    background_task_records: tuple[BackgroundTaskRecord, ...]
+
+
+class _SessionSidebarCursor(NamedTuple):
+    updated_at: str
+    session_id: str
+
+
+_SNAPSHOT_DIRTY_EVENT_TYPES = frozenset(
+    {
+        *(RunEventType(event_type) for event_type in ROUND_PROJECTION_EVENT_TYPES),
+        RunEventType.RUN_STARTED,
+        RunEventType.RUN_PAUSED,
+        RunEventType.RUN_RESUMED,
+        RunEventType.RUN_COMPLETED,
+        RunEventType.RUN_FAILED,
+        RunEventType.RUN_STOPPED,
+        RunEventType.TOOL_CALL,
+        RunEventType.TOOL_RESULT,
+        RunEventType.TOOL_APPROVAL_REQUESTED,
+        RunEventType.TOOL_APPROVAL_RESOLVED,
+        RunEventType.TODO_UPDATED,
+        RunEventType.USER_QUESTION_REQUESTED,
+        RunEventType.USER_QUESTION_ANSWERED,
+        RunEventType.SUBAGENT_SESSION_STATUS_CHANGED,
+        RunEventType.SUBAGENT_STOPPED,
+        RunEventType.SUBAGENT_RESUMED,
+        RunEventType.BACKGROUND_TASK_STARTED,
+        RunEventType.BACKGROUND_TASK_UPDATED,
+        RunEventType.BACKGROUND_TASK_COMPLETED,
+        RunEventType.BACKGROUND_TASK_STOPPED,
+        RunEventType.TOKEN_USAGE,
+    }
+)
+_DETAILED_ROUND_DIRTY_EVENT_TYPES = frozenset(
+    {
+        RunEventType.TEXT_DELTA,
+        RunEventType.OUTPUT_DELTA,
+    }
+)
+_LIST_DIRTY_EVENT_TYPES = frozenset(
+    {
+        RunEventType.RUN_STARTED,
+        RunEventType.RUN_PAUSED,
+        RunEventType.RUN_RESUMED,
+        RunEventType.RUN_COMPLETED,
+        RunEventType.RUN_FAILED,
+        RunEventType.RUN_STOPPED,
+        RunEventType.TOOL_APPROVAL_REQUESTED,
+        RunEventType.TOOL_APPROVAL_RESOLVED,
+        RunEventType.USER_QUESTION_REQUESTED,
+        RunEventType.USER_QUESTION_ANSWERED,
+        RunEventType.BACKGROUND_TASK_STARTED,
+        RunEventType.BACKGROUND_TASK_UPDATED,
+        RunEventType.BACKGROUND_TASK_COMPLETED,
+        RunEventType.BACKGROUND_TASK_STOPPED,
+    }
+)
+_TERMINAL_RUN_EVENT_TYPES = frozenset(
+    {
+        RunEventType.RUN_COMPLETED,
+        RunEventType.RUN_FAILED,
+        RunEventType.RUN_STOPPED,
+    }
+)
+_FRESH_READ_EVENT_TYPES = frozenset(
+    {
+        RunEventType.TODO_UPDATED,
+        RunEventType.USER_QUESTION_REQUESTED,
+        RunEventType.USER_QUESTION_ANSWERED,
+        RunEventType.TOKEN_USAGE,
+    }
+)
+_LIST_FRESH_READ_EVENT_TYPES = frozenset(
+    {
+        RunEventType.TOOL_APPROVAL_REQUESTED,
+        RunEventType.TOOL_APPROVAL_RESOLVED,
+        RunEventType.USER_QUESTION_REQUESTED,
+        RunEventType.USER_QUESTION_ANSWERED,
+    }
+)
+
+
+class BoardTodoSessionLifecycleService(Protocol):
+    def mark_session_deleted(self, *, session_id: str) -> None:
+        raise NotImplementedError
+
+
+def _legacy_coordinator_identifiers() -> tuple[str, ...]:
+    return _LEGACY_COORDINATOR_IDENTIFIERS
+
+
+def _main_agent_identifiers() -> tuple[str, ...]:
+    return _MAIN_AGENT_IDENTIFIERS
+
+
+def _normalize_optional_identifier(value: str | None) -> str | None:
+    normalized = str(value or "").strip()
+    return normalized or None
+
+
+def _normalize_auto_session_title(value: str) -> str | None:
+    for raw_line in str(value or "").splitlines():
+        normalized = " ".join(raw_line.strip().split())
+        if not normalized:
+            continue
+        if len(normalized) <= _AUTO_SESSION_TITLE_MAX_CHARS:
+            return normalized
+        return f"{normalized[: _AUTO_SESSION_TITLE_MAX_CHARS - 3].rstrip()}..."
+    return None
+
+
+def _validate_session_sidebar_limit(limit: int) -> int:
+    safe_limit = int(limit)
+    if safe_limit < 1 or safe_limit > _SESSION_SIDEBAR_MAX_LIMIT:
+        raise ValueError("limit must be between 1 and 200")
+    return safe_limit
+
+
+def _encode_session_sidebar_cursor(*, sort_at: str, session_id: str) -> str:
+    payload = json.dumps(
+        {
+            "updated_at": sort_at,
+            "session_id": session_id,
+        },
+        separators=(",", ":"),
+    )
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _decode_session_sidebar_cursor(cursor: str | None) -> _SessionSidebarCursor | None:
+    safe_cursor = str(cursor or "").strip()
+    if not safe_cursor:
+        return None
+    padding = "=" * (-len(safe_cursor) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(f"{safe_cursor}{padding}".encode("ascii"))
+        decoded: object = json.loads(raw.decode("utf-8"))
+    except (binascii.Error, UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("Invalid session pagination cursor") from exc
+    if not isinstance(decoded, Mapping):
+        raise ValueError("Invalid session pagination cursor")
+    updated_at_raw = decoded.get("updated_at")
+    if updated_at_raw is None:
+        updated_at_raw = decoded.get("created_at")
+    session_id_raw = decoded.get("session_id")
+    if not isinstance(updated_at_raw, str) or not isinstance(session_id_raw, str):
+        raise ValueError("Invalid session pagination cursor")
+    updated_at = updated_at_raw.strip()
+    if not updated_at:
+        raise ValueError("Invalid session pagination cursor")
+    session_id = session_id_raw.strip()
+    if not session_id:
+        raise ValueError("Invalid session pagination cursor")
+    return _SessionSidebarCursor(updated_at=updated_at, session_id=session_id)
+
+
+def _terminal_run_status_for_event_type(event_type: RunEventType) -> str | None:
+    if event_type == RunEventType.RUN_COMPLETED:
+        return RunRuntimeStatus.COMPLETED.value
+    if event_type == RunEventType.RUN_FAILED:
+        return RunRuntimeStatus.FAILED.value
+    if event_type == RunEventType.RUN_STOPPED:
+        return RunRuntimeStatus.STOPPED.value
+    return None
+
+
+def _system_roles_unavailable_error_type() -> type[Exception]:
+    return SystemRolesUnavailableError
+
+
+class SessionService:
+    def __init__(
+        self,
+        *,
+        session_repo: SessionRepository,
+        task_repo: TaskRepository,
+        agent_repo: AgentInstanceRepository,
+        message_repo: MessageRepository,
+        approval_ticket_repo: ApprovalTicketRepository,
+        user_question_repo: UserQuestionRepository | None = None,
+        run_runtime_repo: RunRuntimeRepository,
+        token_usage_repo: TokenUsageRepository,
+        monitor_repository: MonitorRepository | None = None,
+        session_history_marker_repo: SessionHistoryMarkerRepository | None = None,
+        run_state_repo: RunStateRepository | None = None,
+        background_task_repository: BackgroundTaskRepository | None = None,
+        todo_service: TodoService | None = None,
+        run_event_hub: RunEventHub | None = None,
+        active_run_registry: ActiveSessionRunRegistry | None = None,
+        event_log: EventLog | None = None,
+        shared_store: SharedStateRepository | None = None,
+        metrics_store: SqliteMetricAggregateStore | None = None,
+        workspace_manager: WorkspaceManager | None = None,
+        workspace_service: WorkspaceService | None = None,
+        external_session_binding_repo: ExternalSessionBindingRepository | None = None,
+        role_registry: RoleRegistry | None = None,
+        skill_registry: SkillRegistry | None = None,
+        mcp_registry: McpRegistry | None = None,
+        orchestration_settings_service: OrchestrationSettingsService | None = None,
+        media_asset_service: MediaAssetService | None = None,
+        run_intent_repo: RunIntentRepository | None = None,
+        memory_event_handler: MemoryEventHandler | None = None,
+        get_runtime: Callable[[], RuntimeConfig] | None = None,
+        projection_refresh_runner: ProjectionRefreshRunner | None = None,
+    ) -> None:
+        self._session_repo = session_repo
+        self._task_repo = task_repo
+        self._agent_repo = agent_repo
+        self._message_repo = message_repo
+        self._approval_ticket_repo = approval_ticket_repo
+        self._user_question_repo = user_question_repo
+        self._run_runtime_repo = run_runtime_repo
+        self._token_usage_repo = token_usage_repo
+        self._monitor_repository = monitor_repository
+        self._session_history_marker_repo = session_history_marker_repo
+        self._run_state_repo = run_state_repo
+        self._background_task_repository = background_task_repository
+        self._todo_service = todo_service
+        self._run_event_hub = run_event_hub
+        self._active_run_registry = active_run_registry
+        self._event_log = event_log
+        self._shared_store = shared_store
+        self._metrics_store = metrics_store
+        self._workspace_manager = workspace_manager
+        self._workspace_service = workspace_service
+        self._external_session_binding_repo = external_session_binding_repo
+        self._role_registry = role_registry
+        self._skill_registry = skill_registry
+        self._mcp_registry = mcp_registry
+        self._orchestration_settings_service = orchestration_settings_service
+        self._media_asset_service = media_asset_service
+        self._run_intent_repo = run_intent_repo
+        self._memory_event_handler = memory_event_handler
+        self._get_runtime = get_runtime
+        self._board_todo_service: BoardTodoSessionLifecycleService | None = None
+        self._session_list_cache = SessionListCache(
+            refresh_runner=projection_refresh_runner,
+        )
+        self._session_snapshot_cache = SessionSnapshotCache(
+            refresh_runner=projection_refresh_runner,
+        )
+
+    def _invalidate_list_sessions_cache(
+        self,
+        *,
+        requires_fresh_read: bool = False,
+    ) -> None:
+        self._session_list_cache.mark_dirty(requires_fresh_read=requires_fresh_read)
+
+    def _merge_session_list_cache_record(self, record: SessionRecord) -> None:
+        self._session_list_cache.merge_record(record)
+
+    def _merge_enriched_session_list_cache_record(self, session_id: str) -> None:
+        with contextlib.suppress(KeyError):
+            for record in self.list_sessions():
+                if record.session_id == session_id:
+                    self._merge_session_list_cache_record(record)
+                    return
+            self._merge_session_list_cache_record(self.get_session(session_id))
+
+    def _remove_session_list_cache_record(self, session_id: str) -> None:
+        self._session_list_cache.remove_record(session_id)
+        self._session_list_cache.clear()
+
+    def _invalidate_session_read_cache(self, session_id: str) -> None:
+        self._session_snapshot_cache.mark_session_dirty(session_id)
+
+    def _invalidate_session_read_cache_for_event(
+        self,
+        session_id: str,
+        *,
+        requires_fresh_read: bool,
+    ) -> None:
+        self._session_snapshot_cache.mark_session_dirty(
+            session_id,
+            requires_fresh_read=requires_fresh_read,
+        )
+
+    def _clear_session_read_cache(self, session_id: str) -> None:
+        self._session_snapshot_cache.clear_session(session_id)
+
+    def mark_run_event_dirty(self, event: RunEvent) -> None:
+        safe_session_id = str(event.session_id or "").strip()
+        if not safe_session_id:
+            return
+        spawn_subagent_dirty = self._event_is_spawn_subagent_tool_event(event)
+        terminal_run_event = event.event_type in _TERMINAL_RUN_EVENT_TYPES
+        subagent_run_dirty = terminal_run_event and self._event_is_subagent_run_event(
+            event,
+            session_id=safe_session_id,
+        )
+        subagent_list_dirty = (
+            spawn_subagent_dirty
+            or subagent_run_dirty
+            or event.event_type
+            in {
+                RunEventType.SUBAGENT_SESSION_STATUS_CHANGED,
+                RunEventType.SUBAGENT_STOPPED,
+                RunEventType.SUBAGENT_RESUMED,
+            }
+        )
+        if event.event_type in _LIST_DIRTY_EVENT_TYPES or spawn_subagent_dirty:
+            self._invalidate_list_sessions_cache(
+                requires_fresh_read=event.event_type in _LIST_FRESH_READ_EVENT_TYPES,
+            )
+            if subagent_list_dirty:
+                self._schedule_subagent_count_cache_merge(safe_session_id)
+            if terminal_run_event and not subagent_run_dirty:
+                self._merge_terminal_event_into_list_cache(event)
+        elif subagent_list_dirty:
+            self._invalidate_list_sessions_cache()
+            self._schedule_subagent_count_cache_merge(safe_session_id)
+        if event.event_type in _DETAILED_ROUND_DIRTY_EVENT_TYPES:
+            self._session_snapshot_cache.mark_session_dirty(
+                safe_session_id,
+                section=SessionSnapshotSection.ROUNDS,
+                cache_key_predicate=self._is_detailed_rounds_cache_key,
+            )
+            return
+        if (
+            event.event_type not in _SNAPSHOT_DIRTY_EVENT_TYPES
+            and not spawn_subagent_dirty
+        ):
+            return
+        self._invalidate_session_read_cache_for_event(
+            safe_session_id,
+            requires_fresh_read=event.event_type in _FRESH_READ_EVENT_TYPES,
+        )
+
+    @staticmethod
+    def _event_is_spawn_subagent_tool_event(event: RunEvent) -> bool:
+        if event.event_type not in {RunEventType.TOOL_CALL, RunEventType.TOOL_RESULT}:
+            return False
+        try:
+            payload = json.loads(event.payload_json or "{}")
+        except ValueError:
+            return False
+        if not isinstance(payload, dict):
+            return False
+        tool_name = payload.get("tool_name")
+        return isinstance(tool_name, str) and tool_name.strip() == "spawn_subagent"
+
+    def _event_is_subagent_run_event(self, event: RunEvent, *, session_id: str) -> bool:
+        safe_run_id = str(event.run_id or event.trace_id or "").strip()
+        return bool(
+            safe_run_id
+            and (
+                self._is_subagent_run_id(safe_run_id)
+                or safe_run_id in self._subagent_run_ids(session_id)
+            )
+        )
+
+    @staticmethod
+    def _is_detailed_rounds_cache_key(cache_key: str) -> bool:
+        return "timeline=False" in cache_key and "summary=False" in cache_key
+
+    def _merge_terminal_session_projection_into_list_cache(
+        self,
+        session_id: str,
+    ) -> None:
+        with contextlib.suppress(KeyError):
+            self._merge_session_list_cache_record(self.get_session(session_id))
+
+    def _schedule_subagent_count_cache_merge(self, session_id: str) -> None:
+        if not self._is_running_async_publish_listener():
+            return
+        task = asyncio.create_task(
+            self._merge_subagent_count_into_list_cache_async(session_id)
+        )
+        task.add_done_callback(self._log_subagent_count_cache_merge_error)
+
+    @staticmethod
+    def _log_subagent_count_cache_merge_error(task: asyncio.Task[None]) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                event="session.subagent_count_cache_merge_failed",
+                message="Failed to merge subagent count into session list cache",
+                payload={"error": str(exc)},
+            )
+
+    async def _merge_subagent_count_into_list_cache_async(
+        self, session_id: str
+    ) -> None:
+        await asyncio.to_thread(self._merge_subagent_count_into_list_cache, session_id)
+
+    def _merge_subagent_count_into_list_cache(self, session_id: str) -> None:
+        safe_session_id = str(session_id or "").strip()
+        if not safe_session_id:
+            return
+        subagent_count = len(self.list_session_subagents(safe_session_id))
+
+        def mark_subagent_count(record: SessionRecord) -> SessionRecord:
+            return record.model_copy(
+                update={"subagent_session_count": subagent_count},
+            )
+
+        self._session_list_cache.update_record(
+            safe_session_id,
+            mark_subagent_count,
+        )
+
+    def _merge_terminal_event_into_list_cache(self, event: RunEvent) -> None:
+        terminal_status = _terminal_run_status_for_event_type(event.event_type)
+        if terminal_status is None:
+            return
+        safe_session_id = str(event.session_id or "").strip()
+        safe_run_id = str(event.run_id or event.trace_id or "").strip()
+        if not safe_session_id or not safe_run_id:
+            return
+        if self._is_subagent_run_id(
+            safe_run_id
+        ) or safe_run_id in self._subagent_run_ids(safe_session_id):
+            return
+
+        def mark_terminal(record: SessionRecord) -> SessionRecord:
+            active_run_id = str(record.active_run_id or "").strip()
+            updates: dict[str, object] = {
+                "latest_terminal_run_id": safe_run_id,
+                "latest_terminal_run_status": terminal_status,
+                "latest_terminal_run_updated_at": event.occurred_at,
+                "latest_terminal_run_verification_status": None,
+                "has_unread_terminal_run": (
+                    record.last_viewed_terminal_run_id != safe_run_id
+                ),
+            }
+            if terminal_status == RunRuntimeStatus.STOPPED.value and (
+                not active_run_id or active_run_id == safe_run_id
+            ):
+                updates.update(
+                    {
+                        "has_active_run": True,
+                        "active_run_id": safe_run_id,
+                        "active_run_status": terminal_status,
+                        "active_run_phase": "stopped",
+                        "pending_tool_approval_count": 0,
+                    }
+                )
+            elif not active_run_id or active_run_id == safe_run_id:
+                updates.update(
+                    {
+                        "has_active_run": False,
+                        "active_run_id": None,
+                        "active_run_status": None,
+                        "active_run_phase": None,
+                        "pending_tool_approval_count": 0,
+                    }
+                )
+            return record.model_copy(update=updates)
+
+        self._session_list_cache.update_record(safe_session_id, mark_terminal)
+
+    @staticmethod
+    def _is_running_async_publish_listener() -> bool:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        return True
+
+    def replace_role_registry(self, role_registry: RoleRegistry | None) -> None:
+        self._role_registry = role_registry
+
+    def replace_board_todo_service(
+        self,
+        board_todo_service: BoardTodoSessionLifecycleService | None,
+    ) -> None:
+        self._board_todo_service = board_todo_service
+
+    def create_session(
+        self,
+        *,
+        session_id: str | None = None,
+        workspace_id: str,
+        metadata: dict[str, str] | None = None,
+        project_kind: ProjectKind = ProjectKind.WORKSPACE,
+        project_id: str | None = None,
+        session_mode: SessionMode | None = None,
+        normal_root_role_id: str | None = None,
+        normal_model_profile: str | None = None,
+        orchestration_preset_id: str | None = None,
+    ) -> SessionRecord:
+        resolved_session_id = self._resolve_session_create_id(session_id)
+        self._require_workspace_for_session_create(
+            project_kind=project_kind,
+            workspace_id=workspace_id,
+        )
+        (
+            resolved_session_mode,
+            resolved_normal_root_role_id,
+            resolved_orchestration_preset_id,
+        ) = self._resolve_session_create_topology(
+            session_id=resolved_session_id,
+            workspace_id=workspace_id,
+            metadata=metadata,
+            project_kind=project_kind,
+            project_id=project_id,
+            session_mode=session_mode,
+            normal_root_role_id=normal_root_role_id,
+            orchestration_preset_id=orchestration_preset_id,
+        )
+        record = self._session_repo.create(
+            session_id=resolved_session_id,
+            workspace_id=workspace_id,
+            metadata=metadata,
+            project_kind=project_kind,
+            project_id=project_id,
+            session_mode=resolved_session_mode,
+            normal_root_role_id=resolved_normal_root_role_id,
+            normal_model_profile=_normalize_optional_identifier(normal_model_profile),
+            orchestration_preset_id=resolved_orchestration_preset_id,
+        )
+        self._invalidate_list_sessions_cache()
+        self._merge_session_list_cache_record(record)
+        self._invalidate_session_read_cache(resolved_session_id)
+        return record
+
+    async def create_session_async(
+        self,
+        *,
+        session_id: str | None = None,
+        workspace_id: str,
+        metadata: dict[str, str] | None = None,
+        project_kind: ProjectKind = ProjectKind.WORKSPACE,
+        project_id: str | None = None,
+        session_mode: SessionMode | None = None,
+        normal_root_role_id: str | None = None,
+        normal_model_profile: str | None = None,
+        orchestration_preset_id: str | None = None,
+    ) -> SessionRecord:
+        resolved_session_id = self._resolve_session_create_id(session_id)
+        await self._require_workspace_for_session_create_async(
+            project_kind=project_kind,
+            workspace_id=workspace_id,
+        )
+        (
+            resolved_session_mode,
+            resolved_normal_root_role_id,
+            resolved_orchestration_preset_id,
+        ) = self._resolve_session_create_topology(
+            session_id=resolved_session_id,
+            workspace_id=workspace_id,
+            metadata=metadata,
+            project_kind=project_kind,
+            project_id=project_id,
+            session_mode=session_mode,
+            normal_root_role_id=normal_root_role_id,
+            orchestration_preset_id=orchestration_preset_id,
+        )
+        record = await self._session_repo.create_async(
+            session_id=resolved_session_id,
+            workspace_id=workspace_id,
+            metadata=metadata,
+            project_kind=project_kind,
+            project_id=project_id,
+            session_mode=resolved_session_mode,
+            normal_root_role_id=resolved_normal_root_role_id,
+            normal_model_profile=_normalize_optional_identifier(normal_model_profile),
+            orchestration_preset_id=resolved_orchestration_preset_id,
+        )
+        self._invalidate_list_sessions_cache()
+        self._merge_session_list_cache_record(record)
+        self._invalidate_session_read_cache(resolved_session_id)
+        return record
+
+    @staticmethod
+    def _resolve_session_create_id(session_id: str | None) -> str:
+        if session_id:
+            return session_id
+        return f"session-{uuid.uuid4().hex[:8]}"
+
+    def _require_workspace_for_session_create(
+        self,
+        *,
+        project_kind: ProjectKind,
+        workspace_id: str,
+    ) -> None:
+        if self._workspace_service is None:
+            return
+        if (
+            project_kind == ProjectKind.AUTOMATION
+            and workspace_id == AUTOMATION_INTERNAL_WORKSPACE_ID
+        ):
+            return
+        self._workspace_service.require_workspace(workspace_id)
+
+    async def _require_workspace_for_session_create_async(
+        self,
+        *,
+        project_kind: ProjectKind,
+        workspace_id: str,
+    ) -> None:
+        if self._workspace_service is None:
+            return
+        if (
+            project_kind == ProjectKind.AUTOMATION
+            and workspace_id == AUTOMATION_INTERNAL_WORKSPACE_ID
+        ):
+            return
+        await self._workspace_service.require_workspace_async(workspace_id)
+
+    def _resolve_session_create_topology(
+        self,
+        *,
+        session_id: str,
+        workspace_id: str,
+        metadata: dict[str, str] | None,
+        project_kind: ProjectKind,
+        project_id: str | None,
+        session_mode: SessionMode | None,
+        normal_root_role_id: str | None,
+        orchestration_preset_id: str | None,
+    ) -> tuple[SessionMode, str | None, str | None]:
+        resolved_session_mode = session_mode or SessionMode.NORMAL
+        resolved_normal_root_role_id = normal_root_role_id
+        resolved_orchestration_preset_id = orchestration_preset_id
+        if (
+            session_mode is None
+            and orchestration_preset_id is None
+            and self._orchestration_settings_service is not None
+        ):
+            resolved_session_mode = (
+                self._orchestration_settings_service.default_session_mode()
+            )
+            resolved_orchestration_preset_id = (
+                self._orchestration_settings_service.default_orchestration_preset_id()
+            )
+        if (
+            resolved_normal_root_role_id is None
+            and self._orchestration_settings_service is not None
+        ):
+            resolved_normal_root_role_id = (
+                self._orchestration_settings_service.default_normal_root_role_id()
+            )
+        if resolved_normal_root_role_id is None and self._role_registry is not None:
+            resolved_normal_root_role_id = self._require_main_agent_role_id()
+        resolved_normal_root_role_id = self._resolve_normal_root_role_id(
+            resolved_normal_root_role_id
+        )
+        if (
+            resolved_session_mode == SessionMode.ORCHESTRATION
+            and self._orchestration_settings_service is not None
+        ):
+            probe = SessionRecord(
+                session_id=session_id,
+                workspace_id=workspace_id,
+                project_kind=project_kind,
+                project_id=project_id,
+                metadata={} if metadata is None else dict(metadata),
+                session_mode=SessionMode.ORCHESTRATION,
+                normal_root_role_id=resolved_normal_root_role_id,
+                orchestration_preset_id=resolved_orchestration_preset_id,
+            )
+            _ = self._orchestration_settings_service.resolve_run_topology(probe)
+        return (
+            resolved_session_mode,
+            resolved_normal_root_role_id,
+            resolved_orchestration_preset_id,
+        )
+
+    def update_session(self, session_id: str, patch: SessionMetadataPatch) -> None:
+        current = self._session_repo.get(session_id)
+        next_metadata = dict(current.metadata)
+
+        if "custom_metadata" in patch.model_fields_set:
+            next_metadata = self._replace_custom_metadata(
+                next_metadata,
+                patch.custom_metadata,
+            )
+
+        if "source_label" in patch.model_fields_set:
+            self._apply_optional_metadata_value(
+                next_metadata,
+                key="source_label",
+                value=patch.source_label,
+            )
+
+        if "source_icon" in patch.model_fields_set:
+            self._apply_optional_metadata_value(
+                next_metadata,
+                key="source_icon",
+                value=patch.source_icon,
+            )
+
+        if "title" in patch.model_fields_set:
+            title_value = str(patch.title or "").strip()
+            if title_value:
+                next_metadata["title"] = title_value
+                if "title_source" not in patch.model_fields_set:
+                    next_metadata[SESSION_METADATA_TITLE_SOURCE_KEY] = (
+                        SESSION_TITLE_SOURCE_MANUAL
+                    )
+            else:
+                next_metadata.pop("title", None)
+                next_metadata.pop(SESSION_METADATA_TITLE_SOURCE_KEY, None)
+
+        if "title_source" in patch.model_fields_set:
+            title_value = str(next_metadata.get("title") or "").strip()
+            if not title_value:
+                raise ValueError("title_source requires title to be set")
+            title_source = str(patch.title_source or "").strip()
+            if not title_source:
+                next_metadata.pop(SESSION_METADATA_TITLE_SOURCE_KEY, None)
+            else:
+                next_metadata[SESSION_METADATA_TITLE_SOURCE_KEY] = title_source
+
+        self._session_repo.update_metadata(session_id, next_metadata)
+        self._invalidate_list_sessions_cache()
+        self._merge_enriched_session_list_cache_record(session_id)
+        self._invalidate_session_read_cache(session_id)
+
+    async def update_session_async(
+        self, session_id: str, patch: SessionMetadataPatch
+    ) -> None:
+        await asyncio.to_thread(self.update_session, session_id, patch)
+
+    def sync_session_metadata(
+        self,
+        session_id: str,
+        metadata: dict[str, str],
+    ) -> None:
+        _ = self._session_repo.get(session_id)
+        self._session_repo.update_metadata(session_id, dict(metadata))
+        self._invalidate_list_sessions_cache()
+        self._merge_enriched_session_list_cache_record(session_id)
+        self._invalidate_session_read_cache(session_id)
+
+    def _replace_custom_metadata(
+        self,
+        metadata: dict[str, str],
+        custom_metadata: dict[str, str] | None,
+    ) -> dict[str, str]:
+        next_metadata = {
+            key: value
+            for key, value in metadata.items()
+            if self._is_reserved_session_metadata_key(key)
+        }
+        if custom_metadata is None:
+            return next_metadata
+        next_metadata.update(custom_metadata)
+        return next_metadata
+
+    def _apply_optional_metadata_value(
+        self,
+        metadata: dict[str, str],
+        *,
+        key: str,
+        value: str | None,
+    ) -> None:
+        normalized_value = str(value or "").strip()
+        if normalized_value:
+            metadata[key] = normalized_value
+            return
+        metadata.pop(key, None)
+
+    @staticmethod
+    def _is_reserved_session_metadata_key(key: str) -> bool:
+        return key in {
+            "title",
+            SESSION_METADATA_TITLE_SOURCE_KEY,
+            "source_label",
+            "source_icon",
+            "source_kind",
+            "source_provider",
+        } or key.startswith("feishu_")
+
+    def _with_auto_session_title(self, record: SessionRecord) -> SessionRecord:
+        metadata = dict(record.metadata)
+        title = str(metadata.get("title") or "").strip()
+        title_source = str(
+            metadata.get(SESSION_METADATA_TITLE_SOURCE_KEY) or ""
+        ).strip()
+        if title and title_source != SESSION_TITLE_SOURCE_AUTO:
+            return record
+        auto_title = self._resolve_auto_session_title(record.session_id)
+        if auto_title is None:
+            return record
+        metadata["title"] = auto_title
+        metadata[SESSION_METADATA_TITLE_SOURCE_KEY] = SESSION_TITLE_SOURCE_AUTO
+        return record.model_copy(update={"metadata": metadata})
+
+    def _with_auto_session_title_from_preloaded(
+        self,
+        record: SessionRecord,
+        *,
+        first_intent_titles: Mapping[str, str],
+        first_user_messages: Mapping[str, Mapping[str, object]],
+    ) -> SessionRecord:
+        metadata = dict(record.metadata)
+        title = str(metadata.get("title") or "").strip()
+        title_source = str(
+            metadata.get(SESSION_METADATA_TITLE_SOURCE_KEY) or ""
+        ).strip()
+        if title and title_source != SESSION_TITLE_SOURCE_AUTO:
+            return record
+        auto_title = self._resolve_auto_session_title_from_preloaded(
+            record.session_id,
+            first_intent_titles=first_intent_titles,
+            first_user_messages=first_user_messages,
+        )
+        if auto_title is None:
+            return record
+        metadata["title"] = auto_title
+        metadata[SESSION_METADATA_TITLE_SOURCE_KEY] = SESSION_TITLE_SOURCE_AUTO
+        return record.model_copy(update={"metadata": metadata})
+
+    def _resolve_auto_session_title(self, session_id: str) -> str | None:
+        run_intent_title = self._first_run_intent_title(session_id)
+        if run_intent_title is not None:
+            return run_intent_title
+        return self._first_user_message_title(session_id)
+
+    def _resolve_auto_session_title_from_preloaded(
+        self,
+        session_id: str,
+        *,
+        first_intent_titles: Mapping[str, str],
+        first_user_messages: Mapping[str, Mapping[str, object]],
+    ) -> str | None:
+        title = first_intent_titles.get(session_id)
+        if title is not None:
+            return title
+        message = first_user_messages.get(session_id)
+        if message is None:
+            return None
+        return self._user_message_title(message.get("message"))
+
+    @staticmethod
+    def _run_intent_title(intent: IntentInput) -> str | None:
+        return _normalize_auto_session_title(
+            content_parts_to_text(intent.display_input or intent.input)
+        )
+
+    def _first_run_intent_title(self, session_id: str) -> str | None:
+        if self._run_intent_repo is None:
+            return None
+        for intent in self._run_intent_repo.list_by_session(session_id).values():
+            title = self._run_intent_title(intent)
+            if title is not None:
+                return title
+        return None
+
+    def _first_user_message_title(self, session_id: str) -> str | None:
+        messages = self._message_repo.get_user_messages_by_session(
+            session_id,
+            include_cleared=True,
+            include_hidden_from_context=True,
+        )
+        for message in messages:
+            title = self._user_message_title(message.get("message"))
+            if title is not None:
+                return title
+        return None
+
+    @staticmethod
+    def _user_message_title(message: object) -> str | None:
+        if not isinstance(message, dict):
+            return None
+        raw_parts = message.get("parts")
+        if not isinstance(raw_parts, list):
+            return None
+        for raw_part in raw_parts:
+            if not isinstance(raw_part, dict):
+                continue
+            part_kind = str(raw_part.get("part_kind") or "").strip()
+            if part_kind != "user-prompt":
+                continue
+            title = _normalize_auto_session_title(
+                user_prompt_content_to_text(raw_part.get("content"))
+            )
+            if title is not None:
+                return title
+        return None
+
+    def update_session_topology(
+        self,
+        session_id: str,
+        *,
+        session_mode: SessionMode,
+        normal_root_role_id: str | None,
+        orchestration_preset_id: str | None,
+    ) -> SessionRecord:
+        session = self._session_repo.get(session_id)
+        if session.started_at is not None:
+            raise RuntimeError("Session mode can no longer be changed")
+        resolved_normal_root_role_id = self._resolve_normal_root_role_id(
+            normal_root_role_id
+            if normal_root_role_id is not None
+            else session.normal_root_role_id
+        )
+        if (
+            session_mode == SessionMode.ORCHESTRATION
+            and self._orchestration_settings_service is not None
+        ):
+            probe = session.model_copy(
+                update={
+                    "session_mode": SessionMode.ORCHESTRATION,
+                    "normal_root_role_id": resolved_normal_root_role_id,
+                    "orchestration_preset_id": orchestration_preset_id,
+                }
+            )
+            _ = self._orchestration_settings_service.resolve_run_topology(probe)
+        self._session_repo.update_topology(
+            session_id,
+            session_mode=session_mode,
+            normal_root_role_id=resolved_normal_root_role_id,
+            orchestration_preset_id=orchestration_preset_id,
+        )
+        self._invalidate_list_sessions_cache()
+        updated = self.get_session(session_id)
+        self._merge_session_list_cache_record(updated)
+        self._invalidate_session_read_cache(session_id)
+        return updated
+
+    async def update_session_topology_async(
+        self,
+        session_id: str,
+        *,
+        session_mode: SessionMode,
+        normal_root_role_id: str | None,
+        orchestration_preset_id: str | None,
+    ) -> SessionRecord:
+        return await asyncio.to_thread(
+            self.update_session_topology,
+            session_id,
+            session_mode=session_mode,
+            normal_root_role_id=normal_root_role_id,
+            orchestration_preset_id=orchestration_preset_id,
+        )
+
+    async def update_session_normal_model_profile_async(
+        self,
+        session_id: str,
+        *,
+        normal_model_profile: str | None,
+    ) -> SessionRecord:
+        await self._session_repo.update_normal_model_profile_async(
+            session_id,
+            normal_model_profile=_normalize_optional_identifier(normal_model_profile),
+        )
+        self._invalidate_list_sessions_cache()
+        updated = await self.get_session_async(session_id)
+        self._merge_session_list_cache_record(updated)
+        self._invalidate_session_read_cache(session_id)
+        return updated
+
+    def rebind_session_workspace(
+        self,
+        session_id: str,
+        *,
+        workspace_id: str,
+    ) -> SessionRecord:
+        session = self._session_repo.get(session_id)
+        if session.workspace_id == workspace_id:
+            return session
+        if self._workspace_service is not None:
+            self._workspace_service.require_workspace(workspace_id)
+        if self._select_active_run(session_id) is not None:
+            raise RuntimeError(ACTIVE_RUN_REBIND_ERROR)
+        project_id = session.project_id
+        if session.project_kind == ProjectKind.WORKSPACE:
+            project_id = workspace_id
+        self._session_repo.update_workspace(
+            session_id,
+            workspace_id=workspace_id,
+            project_id=project_id or workspace_id,
+        )
+        self._invalidate_list_sessions_cache()
+        self._invalidate_session_read_cache(session_id)
+        self._agent_repo.update_session_workspace(
+            session_id,
+            workspace_id=workspace_id,
+        )
+        updated = self.get_session(session_id)
+        self._merge_session_list_cache_record(updated)
+        return updated
+
+    def _resolve_normal_root_role_id(self, role_id: str | None) -> str | None:
+        if self._role_registry is None:
+            normalized = str(role_id or "").strip()
+            return normalized or None
+        _ = self._require_main_agent_role_id()
+        return self._role_registry.resolve_normal_mode_role_id(role_id)
+
+    def _require_main_agent_role_id(self) -> str:
+        error_type = _system_roles_unavailable_error_type()
+        if self._role_registry is None:
+            raise error_type(
+                "Required system roles are unavailable: main_agent: role registry is not configured"
+            )
+        try:
+            return self._role_registry.get_main_agent_role_id()
+        except (KeyError, ValueError) as exc:
+            raise error_type(
+                f"Required system roles are unavailable: main_agent: {exc}"
+            ) from exc
+
+    def delete_session(
+        self,
+        session_id: str,
+        *,
+        force: bool = False,
+        cascade: bool = False,
+    ) -> None:
+        delete_context = self._prepare_session_delete(
+            session_id,
+            force=force,
+            cascade=cascade,
+        )
+        self._delete_session_prepared(delete_context)
+
+    def _delete_session_prepared(self, delete_context: _SessionDeleteContext) -> None:
+        session = delete_context.session
+        session_id = session.session_id
+        task_records = delete_context.task_records
+        agent_records = delete_context.agent_records
+        background_task_records = delete_context.background_task_records
+        task_ids = [record.envelope.task_id for record in task_records]
+        instance_ids = [record.instance_id for record in agent_records]
+        role_scope_ids = sorted(
+            {f"{record.session_id}:{record.role_id}" for record in agent_records}
+            | {
+                build_instance_role_scope_id(
+                    record.session_id,
+                    record.role_id,
+                    record.instance_id,
+                )
+                for record in agent_records
+            }
+        )
+        session_scope_ids = sorted(
+            {
+                build_instance_session_scope_id(
+                    record.session_id,
+                    record.instance_id,
+                )
+                for record in agent_records
+            }
+        )
+        conversation_ids = sorted(
+            {
+                record.conversation_id
+                for record in agent_records
+                if record.conversation_id
+            }
+            | {
+                build_conversation_id(
+                    record.session_id,
+                    record.role_id,
+                )
+                for record in agent_records
+            }
+        )
+        self._message_repo.delete_by_session(session_id)
+        if self._event_log is not None:
+            self._event_log.delete_by_session(session_id)
+        if self._shared_store is not None:
+            self._shared_store.delete_by_session(
+                session_id,
+                task_ids=task_ids,
+                instance_ids=instance_ids,
+                role_scope_ids=role_scope_ids,
+                session_scope_ids=session_scope_ids,
+                conversation_ids=conversation_ids,
+                workspace_ids=[],
+            )
+        self._approval_ticket_repo.delete_by_session(session_id)
+        if self._background_task_repository is not None:
+            self._background_task_repository.delete_by_session(session_id)
+        self._delete_background_task_logs(
+            session=session,
+            background_task_records=background_task_records,
+        )
+        self._run_runtime_repo.delete_by_session(session_id)
+        if self._todo_service is not None:
+            self._todo_service.delete_for_session(session_id)
+        if self._monitor_repository is not None:
+            self._monitor_repository.delete_by_session(session_id)
+        self._task_repo.delete_by_session(session_id)
+        self._agent_repo.delete_by_session(session_id)
+        if self._session_history_marker_repo is not None:
+            self._session_history_marker_repo.delete_by_session(session_id)
+        if self._external_session_binding_repo is not None:
+            self._external_session_binding_repo.delete_by_session(session_id)
+        if self._media_asset_service is not None:
+            self._media_asset_service.delete_session_assets(session_id)
+        self._session_repo.delete(session_id)
+        self._token_usage_repo.delete_by_session(session_id)
+        if self._metrics_store is not None:
+            self._metrics_store.delete_by_session(session_id)
+        if self._board_todo_service is not None:
+            try:
+                self._board_todo_service.mark_session_deleted(session_id=session_id)
+            except Exception as exc:
+                LOGGER.warning(
+                    "Failed to update board todo items after deleting session %s: %s",
+                    session_id,
+                    exc,
+                )
+        if self._workspace_manager is not None:
+            session_dir = self._workspace_manager.session_artifact_dir(
+                workspace_id=session.workspace_id,
+                session_id=session_id,
+            )
+            if session_dir.exists():
+                shutil.rmtree(session_dir, ignore_errors=True)
+        self._invalidate_list_sessions_cache()
+        self._remove_session_list_cache_record(session_id)
+        self._clear_session_read_cache(session_id)
+
+    def _prepare_session_delete(
+        self,
+        session_id: str,
+        *,
+        force: bool = False,
+        cascade: bool = False,
+    ) -> _SessionDeleteContext:
+        session = self._session_repo.get(session_id)
+        if self._select_active_run(session_id) is not None:
+            require_force_delete(
+                force,
+                message="Cannot delete session while it has active or recoverable run",
+            )
+        task_records = self._task_repo.list_by_session(session_id)
+        agent_records = self._agent_repo.list_by_session(session_id)
+        background_task_records: tuple[BackgroundTaskRecord, ...] = ()
+        if self._background_task_repository is not None:
+            background_task_records = self._background_task_repository.list_by_session(
+                session_id
+            )
+        if self._has_dependent_session_data(
+            session_id,
+            task_records=task_records,
+            agent_records=agent_records,
+            background_task_records=background_task_records,
+        ):
+            require_cascade_delete(
+                cascade,
+                message="Cannot delete session without cascade while related session data exists",
+            )
+        return _SessionDeleteContext(
+            session=session,
+            task_records=task_records,
+            agent_records=agent_records,
+            background_task_records=background_task_records,
+        )
+
+    async def delete_session_async(
+        self,
+        session_id: str,
+        *,
+        force: bool = False,
+        cascade: bool = False,
+    ) -> None:
+        delete_context = await asyncio.to_thread(
+            self._delete_session_with_prepared_context,
+            session_id,
+            force=force,
+            cascade=cascade,
+        )
+        await self._consolidate_session_memory_after_delete_async(delete_context)
+
+    def _delete_session_with_prepared_context(
+        self,
+        session_id: str,
+        *,
+        force: bool = False,
+        cascade: bool = False,
+    ) -> _SessionDeleteContext:
+        delete_context = self._prepare_session_delete(
+            session_id,
+            force=force,
+            cascade=cascade,
+        )
+        self._delete_session_prepared(delete_context)
+        return delete_context
+
+    async def _consolidate_session_memory_after_delete_async(
+        self,
+        delete_context: _SessionDeleteContext,
+    ) -> None:
+        handler = self._memory_event_handler
+        if handler is None:
+            return
+        session = delete_context.session
+        session_id = session.session_id
+        try:
+            await handler.on_session_completed_async(
+                workspace_id=session.workspace_id,
+                session_id=session_id,
+            )
+            LOGGER.info(
+                "consolidated session memory before deleting session %s workspace=%s",
+                session_id,
+                session.workspace_id,
+            )
+        except (ValueError, OSError, RuntimeError, sqlite3.Error):
+            LOGGER.warning(
+                "failed to consolidate session memory before deleting session %s",
+                session_id,
+                exc_info=True,
+            )
+
+    def _has_dependent_session_data(
+        self,
+        session_id: str,
+        *,
+        task_records: tuple[object, ...],
+        agent_records: tuple[object, ...],
+        background_task_records: tuple[BackgroundTaskRecord, ...],
+    ) -> bool:
+        if task_records or agent_records or background_task_records:
+            return True
+        if self._message_repo.get_messages_by_session(session_id):
+            return True
+        if self._run_runtime_repo.list_by_session(session_id):
+            return True
+        if self._event_log is not None and self._event_log.list_by_session(session_id):
+            return True
+        if (
+            self._session_history_marker_repo is not None
+            and self._session_history_marker_repo.list_by_session(session_id)
+        ):
+            return True
+        if self._external_session_binding_repo is not None and any(
+            binding.session_id == session_id
+            for binding in self._external_session_binding_repo.list_by_platform(
+                "feishu"
+            )
+        ):
+            return True
+        return False
+
+    def delete_normal_mode_subagent(self, session_id: str, instance_id: str) -> None:
+        session = self._session_repo.get(session_id)
+        agent = self._require_session_agent(session_id, instance_id)
+        if not self._is_normal_mode_subagent_record(agent, session=session):
+            raise KeyError(instance_id)
+        runtime = self._run_runtime_repo.get(agent.run_id)
+        if runtime is not None and runtime.status in {
+            RunRuntimeStatus.QUEUED,
+            RunRuntimeStatus.RUNNING,
+            RunRuntimeStatus.STOPPING,
+            RunRuntimeStatus.PAUSED,
+        }:
+            raise RuntimeError("Cannot delete a running subagent")
+
+        background_task_records = self._list_subagent_background_tasks(
+            session_id=session_id,
+            instance_id=agent.instance_id,
+            run_id=agent.run_id,
+        )
+        if any(record.is_active for record in background_task_records):
+            raise RuntimeError("Cannot delete a running subagent")
+
+        task_ids = [
+            record.envelope.task_id
+            for record in self._task_repo.list_by_session(session_id)
+            if record.envelope.trace_id == agent.run_id
+        ]
+        self._message_repo.delete_by_instance(agent.instance_id)
+        if self._event_log is not None:
+            self._event_log.delete_by_trace(agent.run_id)
+        if self._run_state_repo is not None:
+            self._run_state_repo.delete(agent.run_id)
+        if self._shared_store is not None:
+            self._shared_store.delete_for_subagent(
+                instance_id=agent.instance_id,
+                session_scope_id=build_instance_session_scope_id(
+                    session_id,
+                    agent.instance_id,
+                ),
+                role_scope_id=build_instance_role_scope_id(
+                    session_id,
+                    agent.role_id,
+                    agent.instance_id,
+                ),
+                conversation_id=agent.conversation_id,
+                task_ids=task_ids,
+            )
+            self._shared_store.delete_by_scope_key_prefix(
+                ScopeRef(scope_type=ScopeType.SESSION, scope_id=session_id),
+                READ_STATE_PREFIX + agent.conversation_id + ":",
+            )
+        self._approval_ticket_repo.delete_by_run(agent.run_id)
+        for background_task_record in background_task_records:
+            if self._background_task_repository is None:
+                break
+            self._background_task_repository.delete(
+                background_task_record.background_task_id
+            )
+        self._delete_background_task_logs(
+            session=session,
+            background_task_records=background_task_records,
+        )
+        self._run_runtime_repo.delete(agent.run_id)
+        if self._todo_service is not None:
+            self._todo_service.delete_for_run(agent.run_id)
+        for task_id in task_ids:
+            self._task_repo.delete(task_id)
+        self._agent_repo.delete_instance(agent.instance_id)
+        if self._session_history_marker_repo is not None:
+            self._session_history_marker_repo.delete_by_conversation(
+                session_id,
+                agent.conversation_id,
+            )
+        self._token_usage_repo.delete_by_run(agent.run_id)
+        self._invalidate_list_sessions_cache()
+        self._invalidate_session_read_cache(session_id)
+
+    async def delete_normal_mode_subagent_async(
+        self, session_id: str, instance_id: str
+    ) -> None:
+        await asyncio.to_thread(
+            self.delete_normal_mode_subagent, session_id, instance_id
+        )
+
+    def _delete_background_task_logs(
+        self,
+        *,
+        session: SessionRecord,
+        background_task_records: tuple[BackgroundTaskRecord, ...],
+    ) -> None:
+        if self._workspace_manager is None or not background_task_records:
+            return
+        workspace = self._workspace_manager.resolve(
+            session_id=session.session_id,
+            role_id="background-task-cleanup",
+            instance_id=None,
+            workspace_id=session.workspace_id,
+        )
+        for record in background_task_records:
+            log_path = str(record.log_path).strip()
+            if not log_path:
+                continue
+            try:
+                resolved_log_path = workspace.resolve_read_path(log_path)
+            except Exception:
+                continue
+            if not resolved_log_path.is_file():
+                continue
+            with contextlib.suppress(OSError):
+                resolved_log_path.unlink()
+
+    def get_session(self, session_id: str) -> SessionRecord:
+        return self._with_terminal_run_projection(
+            self._with_auto_session_title(self._session_repo.get(session_id))
+        )
+
+    async def get_session_async(self, session_id: str) -> SessionRecord:
+        return await self._with_terminal_run_projection_async(
+            self._with_auto_session_title(
+                await self._session_repo.get_async(session_id)
+            )
+        )
+
+    def _list_subagent_background_tasks(
+        self,
+        *,
+        session_id: str,
+        instance_id: str,
+        run_id: str,
+    ) -> tuple[BackgroundTaskRecord, ...]:
+        if self._background_task_repository is None:
+            return ()
+        return tuple(
+            record
+            for record in self._background_task_repository.list_by_session(session_id)
+            if record.kind == BackgroundTaskKind.SUBAGENT
+            and (
+                record.subagent_instance_id == instance_id
+                or record.subagent_run_id == run_id
+            )
+        )
+
+    def list_sessions(self) -> tuple[SessionRecord, ...]:
+        return self._enrich_session_records_for_list(self._session_repo.list_all())
+
+    def _enrich_session_records_for_list(
+        self,
+        sessions: tuple[SessionRecord, ...],
+    ) -> tuple[SessionRecord, ...]:
+        if not sessions:
+            return ()
+        session_ids = tuple(record.session_id for record in sessions)
+        runtimes_by_session: dict[str, tuple[RunRuntimeRecord, ...]] = (
+            self._run_runtime_repo.list_by_session_ids(session_ids)
+        )
+        background_tasks_by_session: dict[str, tuple[BackgroundTaskRecord, ...]] = (
+            self._background_task_repository.list_by_session_ids(session_ids)
+            if self._background_task_repository is not None
+            else {}
+        )
+        excluded_run_ids_by_session = self._subagent_run_ids_by_session_ids(
+            session_ids=session_ids,
+            runtimes_by_session=runtimes_by_session,
+            background_tasks_by_session=background_tasks_by_session,
+        )
+        active_background_run_ids = self._active_background_run_ids(
+            background_tasks_by_session,
+        )
+        first_intent_titles: dict[str, str] = (
+            self._run_intent_repo.first_titles_by_session_ids(session_ids)
+            if self._run_intent_repo is not None
+            else {}
+        )
+        session_ids_needing_message_titles = tuple(
+            record.session_id
+            for record in sessions
+            if record.session_id not in first_intent_titles
+        )
+        first_user_messages = self._message_repo.first_user_messages_by_session_ids(
+            session_ids_needing_message_titles
+        )
+        subagent_counts = self._count_subagents_by_session(sessions)
+        selected_by_session: dict[str, tuple[str, RunRuntimeRecord]] = {}
+        latest_terminal_by_session: dict[str, RunRuntimeRecord] = {}
+        for session_id in session_ids:
+            runtimes = runtimes_by_session.get(session_id, ())
+            excluded_run_ids = excluded_run_ids_by_session.get(session_id, set())
+            selected = self._select_list_active_run_from_preloaded(
+                session_id=session_id,
+                runtimes=runtimes,
+                excluded_run_ids=excluded_run_ids,
+                active_background_run_ids=active_background_run_ids,
+            )
+            if selected is not None:
+                selected_by_session[session_id] = selected
+            latest_terminal = self._latest_terminal_run_from_preloaded(
+                runtimes,
+                excluded_run_ids,
+            )
+            if latest_terminal is not None:
+                latest_terminal_by_session[session_id] = latest_terminal
+        verification_status_by_run_id = self._runtime_verification_statuses_by_run_id(
+            tuple(runtime.run_id for runtime in latest_terminal_by_session.values())
+        )
+        selected_run_ids = tuple(
+            dict.fromkeys(run_id for run_id, _runtime in selected_by_session.values())
+        )
+        approval_counts = self._approval_ticket_repo.count_open_by_run_ids(
+            selected_run_ids
+        )
+        question_counts = (
+            self._user_question_repo.count_open_by_run_ids(selected_run_ids)
+            if self._user_question_repo is not None
+            else {}
+        )
+        enriched: list[SessionRecord] = []
+        for record in sessions:
+            record = self._with_auto_session_title_from_preloaded(
+                record,
+                first_intent_titles=first_intent_titles,
+                first_user_messages=first_user_messages,
+            )
+            selected = selected_by_session.get(record.session_id)
+            subagent_session_count = subagent_counts.get(record.session_id, 0)
+            runtimes = runtimes_by_session.get(record.session_id, ())
+            excluded_run_ids = excluded_run_ids_by_session.get(
+                record.session_id,
+                set(),
+            )
+            if selected is None:
+                enriched.append(
+                    self._with_terminal_run_projection_from_preloaded(
+                        record.model_copy(
+                            update={
+                                "subagent_session_count": subagent_session_count,
+                            }
+                        ),
+                        runtimes=runtimes,
+                        excluded_run_ids=excluded_run_ids,
+                        verification_status_by_run_id=verification_status_by_run_id,
+                    )
+                )
+                continue
+            run_id, runtime = selected
+            approval_count = approval_counts.get(run_id, 0)
+            question_count = question_counts.get(run_id, 0)
+            enriched.append(
+                self._with_terminal_run_projection_from_preloaded(
+                    record.model_copy(
+                        update={
+                            "has_active_run": True,
+                            "active_run_id": run_id,
+                            "active_run_status": runtime.status.value,
+                            "active_run_phase": self._public_phase(
+                                runtime,
+                                approval_count,
+                                question_count,
+                            ),
+                            "pending_tool_approval_count": approval_count,
+                            "subagent_session_count": subagent_session_count,
+                        }
+                    ),
+                    runtimes=runtimes,
+                    excluded_run_ids=excluded_run_ids,
+                    verification_status_by_run_id=verification_status_by_run_id,
+                )
+            )
+        return tuple(enriched)
+
+    async def _enrich_session_records_for_list_async(
+        self,
+        sessions: tuple[SessionRecord, ...],
+    ) -> tuple[SessionRecord, ...]:
+        if not sessions:
+            return ()
+        session_ids = tuple(record.session_id for record in sessions)
+        runtimes_by_session: dict[
+            str, tuple[RunRuntimeRecord, ...]
+        ] = await self._run_runtime_repo.list_by_session_ids_async(session_ids)
+        background_tasks_by_session: dict[str, tuple[BackgroundTaskRecord, ...]] = (
+            await self._background_task_repository.list_by_session_ids_async(
+                session_ids
+            )
+            if self._background_task_repository is not None
+            else {}
+        )
+        excluded_run_ids_by_session = self._subagent_run_ids_by_session_ids(
+            session_ids=session_ids,
+            runtimes_by_session=runtimes_by_session,
+            background_tasks_by_session=background_tasks_by_session,
+        )
+        active_background_run_ids = self._active_background_run_ids(
+            background_tasks_by_session,
+        )
+        first_intent_titles: dict[str, str] = (
+            await self._run_intent_repo.first_titles_by_session_ids_async(session_ids)
+            if self._run_intent_repo is not None
+            else {}
+        )
+        session_ids_needing_message_titles = tuple(
+            record.session_id
+            for record in sessions
+            if record.session_id not in first_intent_titles
+        )
+        first_user_messages = (
+            await self._message_repo.first_user_messages_by_session_ids_async(
+                session_ids_needing_message_titles
+            )
+        )
+        subagent_counts = await self._count_subagents_by_session_async(sessions)
+        selected_by_session: dict[str, tuple[str, RunRuntimeRecord]] = {}
+        latest_terminal_by_session: dict[str, RunRuntimeRecord] = {}
+        for session_id in session_ids:
+            runtimes = runtimes_by_session.get(session_id, ())
+            excluded_run_ids = excluded_run_ids_by_session.get(session_id, set())
+            selected = self._select_list_active_run_from_preloaded(
+                session_id=session_id,
+                runtimes=runtimes,
+                excluded_run_ids=excluded_run_ids,
+                active_background_run_ids=active_background_run_ids,
+            )
+            if selected is not None:
+                selected_by_session[session_id] = selected
+            latest_terminal = self._latest_terminal_run_from_preloaded(
+                runtimes,
+                excluded_run_ids,
+            )
+            if latest_terminal is not None:
+                latest_terminal_by_session[session_id] = latest_terminal
+        verification_status_by_run_id = (
+            await self._runtime_verification_statuses_by_run_id_async(
+                tuple(runtime.run_id for runtime in latest_terminal_by_session.values())
+            )
+        )
+        selected_run_ids = tuple(
+            dict.fromkeys(run_id for run_id, _runtime in selected_by_session.values())
+        )
+        approval_counts = await self._approval_ticket_repo.count_open_by_run_ids_async(
+            selected_run_ids
+        )
+        question_counts = (
+            await self._user_question_repo.count_open_by_run_ids_async(selected_run_ids)
+            if self._user_question_repo is not None
+            else {}
+        )
+        enriched: list[SessionRecord] = []
+        for record in sessions:
+            record = self._with_auto_session_title_from_preloaded(
+                record,
+                first_intent_titles=first_intent_titles,
+                first_user_messages=first_user_messages,
+            )
+            selected = selected_by_session.get(record.session_id)
+            subagent_session_count = subagent_counts.get(record.session_id, 0)
+            runtimes = runtimes_by_session.get(record.session_id, ())
+            excluded_run_ids = excluded_run_ids_by_session.get(
+                record.session_id,
+                set(),
+            )
+            if selected is None:
+                enriched.append(
+                    self._with_terminal_run_projection_from_preloaded(
+                        record.model_copy(
+                            update={
+                                "subagent_session_count": subagent_session_count,
+                            }
+                        ),
+                        runtimes=runtimes,
+                        excluded_run_ids=excluded_run_ids,
+                        verification_status_by_run_id=verification_status_by_run_id,
+                    )
+                )
+                continue
+            run_id, runtime = selected
+            approval_count = approval_counts.get(run_id, 0)
+            question_count = question_counts.get(run_id, 0)
+            enriched.append(
+                self._with_terminal_run_projection_from_preloaded(
+                    record.model_copy(
+                        update={
+                            "has_active_run": True,
+                            "active_run_id": run_id,
+                            "active_run_status": runtime.status.value,
+                            "active_run_phase": self._public_phase(
+                                runtime,
+                                approval_count,
+                                question_count,
+                            ),
+                            "pending_tool_approval_count": approval_count,
+                            "subagent_session_count": subagent_session_count,
+                        }
+                    ),
+                    runtimes=runtimes,
+                    excluded_run_ids=excluded_run_ids,
+                    verification_status_by_run_id=verification_status_by_run_id,
+                )
+            )
+        return tuple(enriched)
+
+    async def list_sessions_async(
+        self,
+        *,
+        force_refresh: bool = False,
+    ) -> tuple[SessionRecord, ...]:
+        result = await self._session_list_cache.read(
+            self.list_sessions,
+            force_refresh=force_refresh,
+        )
+        return result.value
+
+    async def list_sidebar_sessions_async(
+        self,
+        *,
+        force_refresh: bool = False,
+    ) -> tuple[SessionSidebarRecord, ...]:
+        records = await self.list_sessions_async(force_refresh=force_refresh)
+        return tuple(
+            SessionSidebarRecord.from_session_record(record) for record in records
+        )
+
+    async def list_workspace_sidebar_sessions_page_async(
+        self,
+        workspace_id: str,
+        *,
+        limit: int = _SESSION_SIDEBAR_DEFAULT_LIMIT,
+        cursor: str | None = None,
+    ) -> SessionSidebarPage:
+        safe_workspace_id = str(workspace_id or "").strip()
+        if not safe_workspace_id:
+            raise ValueError("workspace_id is required")
+        safe_limit = _validate_session_sidebar_limit(limit)
+        marker = _decode_session_sidebar_cursor(cursor)
+        page_records = await self._session_repo.list_by_workspace_page_entries_async(
+            safe_workspace_id,
+            limit=safe_limit + 1,
+            before_sort_at=marker.updated_at if marker is not None else None,
+            before_session_id=marker.session_id if marker is not None else None,
+        )
+        has_more = len(page_records) > safe_limit
+        selected_page_records = tuple(page_records[:safe_limit])
+        enriched = await self._enrich_session_records_for_list_async(
+            tuple(entry.record for entry in selected_page_records)
+        )
+        return SessionSidebarPage(
+            items=tuple(
+                SessionSidebarRecord.from_session_record(record) for record in enriched
+            ),
+            next_cursor=(
+                _encode_session_sidebar_cursor(
+                    sort_at=selected_page_records[-1].sort_at,
+                    session_id=selected_page_records[-1].record.session_id,
+                )
+                if has_more and selected_page_records
+                else None
+            ),
+            has_more=has_more,
+        )
+
+    async def list_sessions_by_project_refs_async(
+        self,
+        *,
+        project_kind: ProjectKind,
+        project_ids: tuple[str, ...],
+        session_ids: tuple[str, ...] = (),
+    ) -> tuple[SessionRecord, ...]:
+        project_records = await self._session_repo.list_by_project_refs_async(
+            project_kind=project_kind,
+            project_ids=project_ids,
+        )
+        explicit_records = await self._session_repo.list_by_ids_async(session_ids)
+        by_id: dict[str, SessionRecord] = {}
+        ordered: list[SessionRecord] = []
+        for record in (*project_records, *explicit_records):
+            if record.session_id in by_id:
+                continue
+            by_id[record.session_id] = record
+            ordered.append(record)
+        ordered.sort(
+            key=lambda session_record: (
+                session_record.created_at.isoformat(),
+                session_record.session_id,
+            ),
+            reverse=True,
+        )
+        return await self._enrich_session_records_for_list_async(tuple(ordered))
+
+    def mark_latest_terminal_run_viewed(self, session_id: str) -> None:
+        _ = self._session_repo.get(session_id)
+        runtimes = self._run_runtime_repo.list_by_session(session_id)
+        background_tasks = (
+            self._background_task_repository.list_by_session(session_id)
+            if self._background_task_repository is not None
+            else ()
+        )
+        latest_terminal = self._latest_terminal_run_from_preloaded(
+            runtimes,
+            self._subagent_run_ids_from_records(
+                runtimes=runtimes,
+                background_tasks=background_tasks,
+            ),
+        )
+        if latest_terminal is None:
+            return
+        self._session_repo.mark_terminal_run_viewed(
+            session_id,
+            latest_terminal.run_id,
+        )
+        self._invalidate_list_sessions_cache()
+        self._merge_session_list_cache_record(self.get_session(session_id))
+        self._invalidate_session_read_cache(session_id)
+
+    async def mark_latest_terminal_run_viewed_async(self, session_id: str) -> None:
+        await asyncio.to_thread(self.mark_latest_terminal_run_viewed, session_id)
+
+    def list_sessions_by_workspace(
+        self, workspace_id: str
+    ) -> tuple[SessionRecord, ...]:
+        return self._session_repo.list_by_workspace(workspace_id)
+
+    def list_sessions_by_project(
+        self,
+        *,
+        project_kind: ProjectKind,
+        project_id: str,
+    ) -> tuple[dict[str, object], ...]:
+        return tuple(
+            record.model_dump(mode="json")
+            for record in self.list_sessions()
+            if record.project_kind == project_kind and record.project_id == project_id
+        )
+
+    def list_normal_mode_subagents(
+        self, session_id: str
+    ) -> tuple[dict[str, object], ...]:
+        session = self._session_repo.get(session_id)
+        if session.session_mode != SessionMode.NORMAL:
+            return ()
+        root_tasks_by_run: dict[str, object] = {}
+        for task in self._task_repo.list_by_session(session_id):
+            if task.envelope.parent_task_id is None:
+                root_tasks_by_run[task.envelope.trace_id] = task
+        records = [
+            record
+            for record in self._agent_repo.list_by_session(session_id)
+            if self._is_normal_mode_subagent_record(record, session=session)
+        ]
+        records.sort(key=lambda item: (item.updated_at, item.created_at), reverse=True)
+        run_ids = tuple(dict.fromkeys(record.run_id for record in records))
+        runtime_by_run = {
+            runtime.run_id: runtime
+            for runtime in self._run_runtime_repo.list_by_session(session_id)
+            if runtime.run_id in run_ids
+        }
+        run_state_by_run = (
+            {
+                run_state.run_id: run_state
+                for run_state in self._run_state_repo.list_by_session(session_id)
+                if run_state.run_id in run_ids
+            }
+            if self._run_state_repo is not None
+            else {}
+        )
+        approval_counts = (
+            self._approval_ticket_repo.count_open_by_run_ids(run_ids)
+            if self._approval_ticket_repo is not None
+            else {}
+        )
+        question_counts = (
+            self._user_question_repo.count_open_by_run_ids(run_ids)
+            if self._user_question_repo is not None
+            else {}
+        )
+        return tuple(
+            {
+                **self._normal_mode_subagent_projection(
+                    record,
+                    runtime_by_run=runtime_by_run,
+                    run_state_by_run=run_state_by_run,
+                    approval_counts=approval_counts,
+                    question_counts=question_counts,
+                ),
+                "title": self._subagent_title_for_run(
+                    run_id=record.run_id,
+                    root_tasks_by_run=root_tasks_by_run,
+                ),
+            }
+            for record in records
+        )
+
+    def list_session_subagents(self, session_id: str) -> tuple[dict[str, object], ...]:
+        session = self._session_repo.get(session_id)
+        if session.session_mode == SessionMode.NORMAL:
+            return self.list_normal_mode_subagents(session_id)
+        return self._list_orchestration_subagents(session)
+
+    async def list_normal_mode_subagents_async(
+        self, session_id: str
+    ) -> tuple[dict[str, object], ...]:
+        return await asyncio.to_thread(self.list_normal_mode_subagents, session_id)
+
+    async def list_session_subagents_async(
+        self,
+        session_id: str,
+        *,
+        force_refresh: bool = False,
+    ) -> tuple[dict[str, object], ...]:
+        result = await self._read_session_subagents_async(
+            session_id,
+            force_refresh=force_refresh,
+        )
+        return result.value
+
+    async def list_session_subagents_snapshot_async(
+        self,
+        session_id: str,
+        *,
+        force_refresh: bool = False,
+    ) -> SessionSubagentsSnapshotResponse:
+        result = await self._read_session_subagents_async(
+            session_id,
+            force_refresh=force_refresh,
+        )
+        return SessionSubagentsSnapshotResponse(
+            session_id=session_id,
+            items=list(result.value),
+            cache=result.diagnostics,
+        )
+
+    async def _read_session_subagents_async(
+        self,
+        session_id: str,
+        *,
+        force_refresh: bool,
+    ) -> CachedReadResult[tuple[dict[str, object], ...]]:
+        return await self._session_snapshot_cache.read(
+            session_id=session_id,
+            section=SessionSnapshotSection.SUBAGENTS,
+            refresh=lambda: self.list_session_subagents(session_id),
+            force_refresh=force_refresh,
+        )
+
+    async def stream_normal_mode_subagent_events(
+        self,
+        session_id: str,
+        *,
+        after_event_id: int = 0,
+    ) -> AsyncIterator[RunEvent]:
+        session = self._session_repo.get(session_id)
+        if session.session_mode != SessionMode.NORMAL:
+            return
+
+        queue = (
+            self._run_event_hub.subscribe_session(session_id)
+            if self._run_event_hub is not None
+            else None
+        )
+        replay_high_watermark = max(0, int(after_event_id))
+        try:
+            if self._event_log is not None:
+                rows = await self._event_log.list_subagent_run_events_by_session_after_id_async(
+                    session_id,
+                    replay_high_watermark,
+                )
+                for row in rows:
+                    event = self._run_event_from_log_row(row)
+                    if event is None:
+                        continue
+                    if event.event_id is not None:
+                        replay_high_watermark = max(
+                            replay_high_watermark,
+                            event.event_id,
+                        )
+                    yield event
+
+            if queue is None:
+                return
+
+            while True:
+                event = await queue.get()
+                if event.session_id != session_id:
+                    continue
+                if not self._is_subagent_run_id(event.run_id):
+                    continue
+                event_id = event.event_id
+                if event_id is not None and event_id <= replay_high_watermark:
+                    continue
+                if event_id is not None:
+                    replay_high_watermark = max(
+                        replay_high_watermark,
+                        event_id,
+                    )
+                yield event
+        finally:
+            if queue is not None and self._run_event_hub is not None:
+                self._run_event_hub.unsubscribe_session(session_id, queue)
+
+    def list_agents_in_session(self, session_id: str) -> tuple[dict[str, object], ...]:
+        session = self._session_repo.get(session_id)
+        latest_by_role: dict[str, AgentRuntimeRecord] = {}
+        for record in self._agent_repo.list_by_session(session_id):
+            if self._is_normal_mode_subagent_record(record, session=session):
+                continue
+            existing = latest_by_role.get(record.role_id)
+            if existing is None or (
+                record.updated_at,
+                record.created_at,
+            ) >= (
+                existing.updated_at,
+                existing.created_at,
+            ):
+                latest_by_role[record.role_id] = record
+        return tuple(
+            self._agent_projection(latest_by_role[role_id])
+            for role_id in sorted(latest_by_role.keys())
+        )
+
+    async def list_agents_in_session_async(
+        self,
+        session_id: str,
+        *,
+        force_refresh: bool = False,
+    ) -> tuple[dict[str, object], ...]:
+        result = await self._session_snapshot_cache.read(
+            session_id=session_id,
+            section=SessionSnapshotSection.AGENTS,
+            refresh=lambda: self.list_agents_in_session(session_id),
+            force_refresh=force_refresh,
+        )
+        return result.value
+
+    def get_agent_messages(
+        self, session_id: str, instance_id: str
+    ) -> list[dict[str, object]]:
+        messages = cast(
+            list[dict[str, object]],
+            self._message_repo.get_messages_for_instance(
+                session_id,
+                instance_id,
+                include_cleared=True,
+                include_hidden_from_context=True,
+            ),
+        )
+        try:
+            agent = self._agent_repo.get_instance(instance_id)
+        except KeyError:
+            return [
+                self._project_message_timeline_entry(message) for message in messages
+            ]
+        for message in messages:
+            if "role_id" not in message or not message.get("role_id"):
+                message["role_id"] = agent.role_id
+        markers = self._list_agent_history_markers(
+            session_id=session_id,
+            conversation_id=agent.conversation_id,
+        )
+        entries = self._build_agent_timeline_entries(
+            messages=messages,
+            markers=markers,
+        )
+        return self._with_terminal_task_result_entry(
+            entries=entries,
+            session_id=session_id,
+            agent=agent,
+        )
+
+    async def get_agent_messages_async(
+        self, session_id: str, instance_id: str
+    ) -> list[dict[str, object]]:
+        return await asyncio.to_thread(self.get_agent_messages, session_id, instance_id)
+
+    def get_global_events(self, session_id: str) -> list[dict[str, object]]:
+        if self._event_log is None:
+            return []
+        events = self._event_log.list_by_session(session_id)
+        return cast(list[dict[str, object]], list(events))
+
+    async def get_global_events_async(self, session_id: str) -> list[dict[str, object]]:
+        return await asyncio.to_thread(self.get_global_events, session_id)
+
+    def _get_round_projection_events(self, session_id: str) -> list[dict[str, object]]:
+        if self._event_log is None:
+            return []
+        events = self._event_log.list_by_session_event_types(
+            session_id,
+            ROUND_PROJECTION_EVENT_TYPES,
+        )
+        return cast(list[dict[str, object]], list(events))
+
+    def _get_round_projection_events_for_runs(
+        self,
+        session_id: str,
+        run_ids: tuple[str, ...],
+    ) -> list[dict[str, object]]:
+        if self._event_log is None:
+            return []
+        events = self._event_log.list_by_session_run_ids_event_types(
+            session_id,
+            run_ids,
+            ROUND_PROJECTION_EVENT_TYPES,
+        )
+        return cast(list[dict[str, object]], list(events))
+
+    def _get_detailed_round_projection_events(
+        self, session_id: str
+    ) -> list[dict[str, object]]:
+        if self._event_log is None:
+            return []
+        events = self._event_log.list_by_session_event_types(
+            session_id,
+            DETAILED_ROUND_PROJECTION_EVENT_TYPES,
+        )
+        return cast(list[dict[str, object]], list(events))
+
+    def _get_detailed_round_projection_events_for_runs(
+        self,
+        session_id: str,
+        run_ids: tuple[str, ...],
+    ) -> list[dict[str, object]]:
+        if self._event_log is None:
+            return []
+        events = self._event_log.list_by_session_run_ids_event_types(
+            session_id,
+            run_ids,
+            DETAILED_ROUND_PROJECTION_EVENT_TYPES,
+        )
+        return cast(list[dict[str, object]], list(events))
+
+    def get_session_messages(self, session_id: str) -> list[dict[str, object]]:
+        return cast(
+            list[dict[str, object]],
+            self._message_repo.get_messages_by_session(session_id),
+        )
+
+    async def get_session_messages_async(
+        self, session_id: str
+    ) -> list[dict[str, object]]:
+        return await asyncio.to_thread(self.get_session_messages, session_id)
+
+    def get_session_tasks(self, session_id: str) -> list[dict[str, object]]:
+        records = self._task_repo.list_by_session(session_id)
+        return [
+            {
+                "task_id": record.envelope.task_id,
+                "title": record.envelope.title or record.envelope.objective[:80],
+                "assigned_role_id": record.envelope.role_id,
+                "status": record.status.value,
+                "assigned_instance_id": record.assigned_instance_id,
+                "role_id": record.envelope.role_id,
+                "instance_id": record.assigned_instance_id,
+                "run_id": record.envelope.trace_id,
+                "created_at": record.created_at.isoformat(),
+                "updated_at": record.updated_at.isoformat(),
+                "spec_artifact_id": record.envelope.spec_artifact_id,
+                "spec_source_task_id": record.envelope.spec_source_task_id,
+                "spec_summary": (
+                    record.envelope.spec.summary if record.envelope.spec else ""
+                ),
+                "spec_strictness": (
+                    record.envelope.spec.strictness.value
+                    if record.envelope.spec
+                    else ""
+                ),
+                "evidence_bundle": (
+                    record.envelope.evidence_bundle.model_dump(mode="json")
+                    if record.envelope.evidence_bundle
+                    else None
+                ),
+            }
+            for record in records
+            if record.envelope.parent_task_id is not None
+        ]
+
+    async def get_session_tasks_async(
+        self,
+        session_id: str,
+        *,
+        force_refresh: bool = False,
+    ) -> list[dict[str, object]]:
+        result = await self._session_snapshot_cache.read(
+            session_id=session_id,
+            section=SessionSnapshotSection.TASKS,
+            refresh=lambda: self.get_session_tasks(session_id),
+            force_refresh=force_refresh,
+        )
+        return result.value
+
+    def build_session_rounds(
+        self,
+        session_id: str,
+        *,
+        included_run_ids: set[str] | None = None,
+        include_history_markers: bool = True,
+    ) -> list[dict[str, object]]:
+        excluded_run_ids = self._subagent_run_ids(session_id)
+        selected_run_ids = (
+            tuple(sorted(included_run_ids)) if included_run_ids is not None else None
+        )
+        todos_by_run_id = (
+            {
+                snapshot.run_id: snapshot.model_dump(mode="json")
+                for snapshot in self._todo_service.list_for_session(session_id)
+                if included_run_ids is None or snapshot.run_id in included_run_ids
+            }
+            if self._todo_service is not None
+            else {}
+        )
+        intent_input_parts_by_run = (
+            self._session_run_intent_input_parts_by_run(session_id)
+            if included_run_ids is None
+            else {
+                run_id: parts
+                for run_id, parts in self._session_run_intent_input_parts_by_run(
+                    session_id
+                ).items()
+                if run_id in included_run_ids
+            }
+        )
+        runtime_by_run = {
+            run_id: runtime
+            for run_id, runtime in self._session_run_runtime_by_run(session_id).items()
+            if included_run_ids is None or run_id in included_run_ids
+        }
+        rounds = build_session_rounds(
+            session_id=session_id,
+            agent_repo=self._agent_repo,
+            task_repo=self._task_repo,
+            approval_tickets_by_run=approvals_to_projection(
+                [
+                    record
+                    for record in self._approval_ticket_repo.list_open_by_session(
+                        session_id
+                    )
+                    if included_run_ids is None or record.run_id in included_run_ids
+                ]
+            ),
+            run_runtime_repo=self._run_runtime_repo,
+            get_session_messages=lambda current_session_id: cast(
+                list[dict[str, object]],
+                (
+                    self._message_repo.get_messages_by_session(
+                        current_session_id,
+                        include_cleared=True,
+                        include_hidden_from_context=True,
+                    )
+                    if selected_run_ids is None
+                    else self._message_repo.get_messages_by_session_run_ids(
+                        current_session_id,
+                        selected_run_ids,
+                        include_cleared=True,
+                        include_hidden_from_context=True,
+                    )
+                ),
+            ),
+            get_run_intent_input=intent_input_parts_by_run.get,
+            get_session_history_markers=(
+                self._get_session_history_markers if include_history_markers else None
+            ),
+            get_session_events=(
+                self._get_detailed_round_projection_events
+                if selected_run_ids is None
+                else lambda current_session_id: (
+                    self._get_detailed_round_projection_events_for_runs(
+                        current_session_id,
+                        selected_run_ids,
+                    )
+                )
+            ),
+            excluded_run_ids=excluded_run_ids,
+            included_run_ids=included_run_ids,
+            run_runtime_by_run=runtime_by_run,
+        )
+        question_counts_by_run = self._pending_user_question_counts_by_run(session_id)
+        for round_item in rounds:
+            runtime = runtime_by_run.get(str(round_item.get("run_id") or ""))
+            pending = round_item.get("pending_tool_approvals")
+            approval_count = len(pending) if isinstance(pending, list) else 0
+            if runtime is None:
+                continue
+            question_count = question_counts_by_run.get(runtime.run_id, 0)
+            round_item["run_status"] = runtime.status.value
+            round_item["run_phase"] = self._public_phase(
+                runtime,
+                approval_count,
+                question_count,
+            )
+            round_item["is_recoverable"] = self._is_runtime_publicly_recoverable(
+                runtime
+            )
+            todo = todos_by_run_id.get(str(round_item.get("run_id") or ""))
+            if todo is not None:
+                round_item["todo"] = todo
+        return rounds
+
+    def build_session_timeline_rounds(self, session_id: str) -> list[dict[str, object]]:
+        excluded_run_ids = self._subagent_run_ids(session_id)
+        todos_by_run_id = (
+            {
+                snapshot.run_id: snapshot.model_dump(mode="json")
+                for snapshot in self._todo_service.list_for_session(session_id)
+            }
+            if self._todo_service is not None
+            else {}
+        )
+        intent_input_parts_by_run = self._session_run_intent_input_parts_by_run(
+            session_id
+        )
+        runtime_by_run = self._session_run_runtime_by_run(session_id)
+        rounds = build_session_timeline_rounds(
+            session_id=session_id,
+            task_repo=self._task_repo,
+            approval_tickets_by_run=approvals_to_projection(
+                self._approval_ticket_repo.list_open_by_session(session_id)
+            ),
+            run_runtime_repo=self._run_runtime_repo,
+            get_session_user_messages=lambda current_session_id: cast(
+                list[dict[str, object]],
+                self._message_repo.get_user_messages_by_session(
+                    current_session_id,
+                    include_cleared=True,
+                    include_hidden_from_context=True,
+                ),
+            ),
+            get_run_intent_input=intent_input_parts_by_run.get,
+            get_session_history_markers=self._get_session_history_markers,
+            get_session_events=self._get_round_projection_events,
+            excluded_run_ids=excluded_run_ids,
+            run_runtime_by_run=runtime_by_run,
+        )
+        question_counts_by_run = self._pending_user_question_counts_by_run(session_id)
+        for round_item in rounds:
+            runtime = runtime_by_run.get(str(round_item.get("run_id") or ""))
+            raw_approval_count = round_item.get("pending_tool_approval_count")
+            approval_count = (
+                raw_approval_count
+                if isinstance(raw_approval_count, int)
+                and not isinstance(raw_approval_count, bool)
+                else 0
+            )
+            if runtime is None:
+                continue
+            question_count = question_counts_by_run.get(runtime.run_id, 0)
+            round_item["run_status"] = runtime.status.value
+            round_item["run_phase"] = self._public_phase(
+                runtime,
+                approval_count,
+                question_count,
+            )
+            round_item["is_recoverable"] = self._is_runtime_publicly_recoverable(
+                runtime
+            )
+            todo = todos_by_run_id.get(str(round_item.get("run_id") or ""))
+            if todo is not None:
+                round_item["todo"] = todo
+        return rounds
+
+    def _session_run_runtime_by_run(
+        self,
+        session_id: str,
+    ) -> dict[str, RunRuntimeRecord]:
+        return {
+            runtime.run_id: runtime
+            for runtime in self._run_runtime_repo.list_by_session(session_id)
+        }
+
+    def _get_run_intent_input_parts(
+        self, run_id: str
+    ) -> tuple[ContentPart, ...] | None:
+        if self._run_intent_repo is None:
+            return None
+        try:
+            intent = self._run_intent_repo.get(run_id)
+        except KeyError:
+            return None
+        return intent.display_input or intent.input
+
+    def _session_run_intent_input_parts_by_run(
+        self, session_id: str
+    ) -> dict[str, tuple[ContentPart, ...]]:
+        if self._run_intent_repo is None:
+            return {}
+        return {
+            run_id: intent.display_input or intent.input
+            for run_id, intent in self._run_intent_repo.list_by_session(
+                session_id
+            ).items()
+        }
+
+    def get_session_rounds(
+        self,
+        session_id: str,
+        *,
+        limit: int = 8,
+        cursor_run_id: str | None = None,
+        timeline: bool = False,
+        summary: bool = False,
+    ) -> dict[str, object]:
+        if timeline:
+            rounds = self.build_session_timeline_rounds(session_id)
+            return timeline_rounds(rounds)
+        timeline_items = self.build_session_timeline_rounds(session_id)
+        page = paginate_rounds(
+            timeline_items,
+            limit=limit,
+            cursor_run_id=cursor_run_id,
+        )
+        if summary:
+            return page
+        page_items = page.get("items")
+        if not isinstance(page_items, list) or not page_items:
+            return page
+        page_run_ids = tuple(
+            str(item.get("run_id") or "")
+            for item in page_items
+            if isinstance(item, dict) and str(item.get("run_id") or "")
+        )
+        if not page_run_ids:
+            return page
+        full_rounds = self.build_session_rounds(
+            session_id,
+            included_run_ids=set(page_run_ids),
+            include_history_markers=False,
+        )
+        full_round_by_run = {
+            str(round_item.get("run_id") or ""): round_item
+            for round_item in full_rounds
+        }
+        page_marker_by_run = {
+            str(item.get("run_id") or ""): {
+                "clear_marker_before": item.get("clear_marker_before"),
+                "compaction_marker_before": item.get("compaction_marker_before"),
+            }
+            for item in page_items
+            if isinstance(item, dict) and str(item.get("run_id") or "")
+        }
+        resolved_items: list[dict[str, object]] = []
+        for run_id in page_run_ids:
+            full_round = full_round_by_run.get(run_id)
+            if full_round is None:
+                continue
+            markers = page_marker_by_run.get(run_id, {})
+            full_round["clear_marker_before"] = markers.get("clear_marker_before")
+            full_round["compaction_marker_before"] = markers.get(
+                "compaction_marker_before"
+            )
+            resolved_items.append(full_round)
+        page["items"] = resolved_items
+        return page
+
+    async def get_session_rounds_async(
+        self,
+        session_id: str,
+        *,
+        limit: int = 8,
+        cursor_run_id: str | None = None,
+        timeline: bool = False,
+        summary: bool = False,
+        force_refresh: bool = False,
+    ) -> dict[str, object]:
+        rounds_key = SessionRoundsQueryKey(
+            limit=limit,
+            cursor_run_id=cursor_run_id,
+            timeline=timeline,
+            summary=summary,
+        )
+        result = await self._session_snapshot_cache.read(
+            session_id=session_id,
+            section=SessionSnapshotSection.ROUNDS,
+            rounds_key=rounds_key,
+            refresh=lambda: self.get_session_rounds(
+                session_id,
+                limit=limit,
+                cursor_run_id=cursor_run_id,
+                timeline=timeline,
+                summary=summary,
+            ),
+            force_refresh=force_refresh,
+        )
+        return result.value
+
+    def get_round(self, session_id: str, run_id: str) -> dict[str, object]:
+        safe_run_id = str(run_id or "").strip()
+        timeline_item = next(
+            (
+                item
+                for item in self.build_session_timeline_rounds(session_id)
+                if str(item.get("run_id") or "") == safe_run_id
+            ),
+            None,
+        )
+        rounds = self.build_session_rounds(
+            session_id,
+            included_run_ids={safe_run_id},
+            include_history_markers=False,
+        )
+        round_item = find_round_by_run_id(rounds, session_id=session_id, run_id=run_id)
+        if timeline_item is not None:
+            round_item["clear_marker_before"] = timeline_item.get("clear_marker_before")
+            round_item["compaction_marker_before"] = timeline_item.get(
+                "compaction_marker_before"
+            )
+        return round_item
+
+    async def get_round_async(self, session_id: str, run_id: str) -> dict[str, object]:
+
+        return await asyncio.to_thread(self.get_round, session_id, run_id)
+
+    def get_recovery_snapshot(self, session_id: str) -> dict[str, object]:
+        _ = self._session_repo.get(session_id)
+        selected = self._select_active_run(session_id)
+        if selected is None:
+            return {
+                "active_run": None,
+                "background_tasks": [],
+                "pending_tool_approvals": [],
+                "pending_user_questions": [],
+                "paused_subagent": None,
+                "round_snapshot": None,
+            }
+
+        run_id, runtime = selected
+        stream_connected = (
+            self._run_event_hub.has_subscribers(run_id)
+            if self._run_event_hub is not None
+            else False
+        )
+        approvals = [
+            {
+                "tool_call_id": record.tool_call_id,
+                "tool_name": record.tool_name,
+                "args_preview": record.args_preview,
+                "role_id": record.role_id,
+                "instance_id": record.instance_id,
+                "requested_at": record.created_at.isoformat(),
+                "status": record.status.value,
+                "feedback": record.feedback,
+                "acp_options": acp_options_projection(record.metadata),
+            }
+            for record in self._approval_ticket_repo.list_open_by_run(run_id)
+        ]
+        user_questions = (
+            [
+                record.model_dump(mode="json")
+                for record in self._list_resolvable_user_questions_for_session(
+                    session_id
+                )
+            ]
+            if self._user_question_repo is not None
+            else []
+        )
+        run_state = (
+            self._run_state_repo.get_run_state(run_id)
+            if self._run_state_repo is not None
+            else None
+        )
+        background_tasks = [
+            record.model_dump(mode="json", exclude={"output_excerpt"})
+            for record in (
+                exec_record
+                for exec_record in (
+                    self._background_task_repository.list_by_run(run_id)
+                    if self._background_task_repository is not None
+                    else ()
+                )
+                if exec_record.execution_mode == "background"
+            )
+        ]
+        active_run = {
+            "run_id": run_id,
+            "status": runtime.status.value,
+            "phase": self._public_phase(runtime, len(approvals), len(user_questions)),
+            "is_recoverable": self._is_runtime_publicly_recoverable(runtime),
+            "last_event_id": (
+                int(run_state.last_event_id) if run_state is not None else 0
+            ),
+            "checkpoint_event_id": (
+                int(run_state.checkpoint_event_id) if run_state is not None else 0
+            ),
+            "pending_tool_approval_count": len(approvals),
+            "pending_user_question_count": len(user_questions),
+            "background_task_count": len(background_tasks),
+            "stream_connected": stream_connected,
+            "should_show_recover": self._is_runtime_publicly_recoverable(runtime)
+            and not stream_connected,
+        }
+        paused_subagent = self._paused_subagent_snapshot(runtime)
+        try:
+            round_snapshot = self.get_round(session_id, run_id)
+        except KeyError:
+            round_snapshot = None
+        if isinstance(round_snapshot, dict):
+            active_run["primary_role_id"] = round_snapshot.get("primary_role_id")
+            round_snapshot["background_task_count"] = len(background_tasks)
+        return {
+            "active_run": active_run,
+            "background_tasks": background_tasks,
+            "pending_tool_approvals": approvals,
+            "pending_user_questions": user_questions,
+            "paused_subagent": paused_subagent,
+            "round_snapshot": round_snapshot,
+        }
+
+    async def get_recovery_snapshot_async(
+        self,
+        session_id: str,
+        *,
+        force_refresh: bool = False,
+    ) -> dict[str, object]:
+        result = await self._session_snapshot_cache.read(
+            session_id=session_id,
+            section=SessionSnapshotSection.RECOVERY,
+            refresh=lambda: self.get_recovery_snapshot(session_id),
+            force_refresh=force_refresh,
+        )
+        log_event(
+            LOGGER,
+            logging.DEBUG,
+            event="session.recovery.seeded_or_refreshed",
+            message="Read session recovery snapshot",
+            payload={
+                "session_id": session_id,
+                "force_refresh": force_refresh,
+                "cache_hit": result.diagnostics.cache_hit,
+                "stale": result.diagnostics.stale,
+                "dirty": result.diagnostics.dirty,
+                "refresh_in_progress": result.diagnostics.refresh_in_progress,
+            },
+        )
+        return result.value
+
+    def get_token_usage_by_run(self, run_id: str) -> RunTokenUsage:
+        return self._token_usage_repo.get_by_run(run_id)
+
+    def get_token_usage_by_session(self, session_id: str) -> SessionTokenUsage:
+        return self._token_usage_repo.get_by_session(session_id)
+
+    async def get_token_usage_by_run_async(self, run_id: str) -> RunTokenUsage:
+
+        return await asyncio.to_thread(self._token_usage_repo.get_by_run, run_id)
+
+    async def get_token_usage_by_session_async(
+        self,
+        session_id: str,
+        *,
+        force_refresh: bool = False,
+    ) -> SessionTokenUsage:
+        result = await self._session_snapshot_cache.read(
+            session_id=session_id,
+            section=SessionSnapshotSection.TOKEN_USAGE,
+            refresh=lambda: self.get_token_usage_by_session(session_id),
+            force_refresh=force_refresh,
+        )
+        return result.value
+
+    @staticmethod
+    def _empty_rounds_snapshot() -> dict[str, object]:
+        return {"items": [], "next_cursor": None}
+
+    @staticmethod
+    def _empty_recovery_snapshot() -> dict[str, object]:
+        return {
+            "active_run": None,
+            "background_tasks": [],
+            "pending_tool_approvals": [],
+            "pending_user_questions": [],
+            "paused_subagent": None,
+            "round_snapshot": None,
+        }
+
+    @staticmethod
+    def _empty_token_usage_snapshot(session_id: str) -> SessionTokenUsage:
+        return SessionTokenUsage(
+            session_id=session_id,
+            total_input_tokens=0,
+            total_cached_input_tokens=0,
+            total_output_tokens=0,
+            total_reasoning_output_tokens=0,
+            total_tokens=0,
+            total_requests=0,
+            total_tool_calls=0,
+            by_role={},
+        )
+
+    def clear_session_messages(self, session_id: str) -> int:
+        _ = self._session_repo.get(session_id)
+        messages = self._message_repo.get_messages_by_session(session_id)
+        count = len(messages)
+        if self._session_history_marker_repo is not None:
+            self._session_history_marker_repo.create_clear_marker(session_id)
+        else:
+            self._message_repo.delete_by_session(session_id)
+            self._token_usage_repo.delete_by_session(session_id)
+        self._invalidate_session_read_cache_for_event(
+            session_id,
+            requires_fresh_read=True,
+        )
+        return count
+
+    def _get_session_history_markers(
+        self,
+        session_id: str,
+    ) -> list[dict[str, object]]:
+        if self._session_history_marker_repo is None:
+            return []
+        markers = self._session_history_marker_repo.list_by_session(session_id)
+        return [marker.model_dump(mode="json") for marker in markers]
+
+    def _list_agent_history_markers(
+        self,
+        *,
+        session_id: str,
+        conversation_id: str,
+    ) -> tuple[SessionHistoryMarkerRecord, ...]:
+        if self._session_history_marker_repo is None:
+            return ()
+        markers = self._session_history_marker_repo.list_by_session(session_id)
+        return tuple(
+            marker
+            for marker in markers
+            if marker.marker_type == SessionHistoryMarkerType.CLEAR
+            or (
+                marker.marker_type == SessionHistoryMarkerType.COMPACTION
+                and marker.metadata.get("conversation_id") == conversation_id
+            )
+        )
+
+    @staticmethod
+    def _project_message_timeline_entry(
+        message: dict[str, object],
+    ) -> dict[str, object]:
+        return {
+            "entry_type": "message",
+            **message,
+        }
+
+    @staticmethod
+    def _project_history_marker_entry(
+        marker: SessionHistoryMarkerRecord,
+    ) -> dict[str, object]:
+        label = _history_marker_label(marker)
+        return {
+            "entry_type": "marker",
+            "marker_id": marker.marker_id,
+            "marker_type": marker.marker_type.value,
+            "created_at": marker.created_at.isoformat(),
+            "label": label,
+        }
+
+    def _build_agent_timeline_entries(
+        self,
+        *,
+        messages: list[dict[str, object]],
+        markers: tuple[SessionHistoryMarkerRecord, ...],
+    ) -> list[dict[str, object]]:
+        clear_markers = [
+            marker
+            for marker in markers
+            if marker.marker_type == SessionHistoryMarkerType.CLEAR
+        ]
+        compaction_markers = {
+            marker.marker_id: marker
+            for marker in markers
+            if marker.marker_type == SessionHistoryMarkerType.COMPACTION
+        }
+        clear_index = 0
+        entries: list[dict[str, object]] = []
+
+        for index, message in enumerate(messages):
+            created_at = str(message.get("created_at") or "")
+            while clear_index < len(clear_markers):
+                marker = clear_markers[clear_index]
+                if marker.created_at.isoformat() > created_at:
+                    break
+                entries.append(self._project_history_marker_entry(marker))
+                clear_index += 1
+
+            entries.append(self._project_message_timeline_entry(message))
+            hidden_marker_id = str(message.get("hidden_marker_id") or "")
+            if not hidden_marker_id:
+                continue
+            next_hidden_marker_id = ""
+            if index + 1 < len(messages):
+                next_hidden_marker_id = str(
+                    messages[index + 1].get("hidden_marker_id") or ""
+                )
+            if next_hidden_marker_id == hidden_marker_id:
+                continue
+            marker = compaction_markers.get(hidden_marker_id)
+            if marker is None:
+                continue
+            entries.append(self._project_history_marker_entry(marker))
+
+        while clear_index < len(clear_markers):
+            entries.append(
+                self._project_history_marker_entry(clear_markers[clear_index])
+            )
+            clear_index += 1
+        return entries
+
+    def _with_terminal_task_result_entry(
+        self,
+        *,
+        entries: list[dict[str, object]],
+        session_id: str,
+        agent: AgentRuntimeRecord,
+    ) -> list[dict[str, object]]:
+        if not agent.run_id.startswith("subagent_run_"):
+            return entries
+        terminal_task = self._terminal_task_result_for_agent(
+            session_id=session_id,
+            agent=agent,
+        )
+        if terminal_task is None:
+            return entries
+        result_text = str(terminal_task.result or "").strip()
+        if not result_text:
+            return entries
+        if not self._should_append_terminal_task_result(entries):
+            return entries
+        return [
+            *entries,
+            self._project_terminal_task_result_entry(
+                task=terminal_task,
+                agent=agent,
+                result_text=result_text,
+            ),
+        ]
+
+    def _terminal_task_result_for_agent(
+        self,
+        *,
+        session_id: str,
+        agent: AgentRuntimeRecord,
+    ) -> TaskRecord | None:
+        records = [
+            record
+            for record in self._task_repo.list_by_session(session_id)
+            if record.assigned_instance_id == agent.instance_id
+            and record.status == TaskStatus.COMPLETED
+            and str(record.result or "").strip()
+        ]
+        exact_run_records = [
+            record for record in records if record.envelope.trace_id == agent.run_id
+        ]
+        candidates = exact_run_records or records
+        if not candidates:
+            return None
+        return max(candidates, key=lambda record: record.updated_at)
+
+    @staticmethod
+    def _should_append_terminal_task_result(
+        entries: list[dict[str, object]],
+    ) -> bool:
+        last_assistant_text_index = -1
+        last_tool_return_index = -1
+        for index, entry in enumerate(entries):
+            if SessionService._entry_has_assistant_text(entry):
+                last_assistant_text_index = index
+            if SessionService._entry_has_tool_return(entry):
+                last_tool_return_index = index
+        return last_assistant_text_index <= last_tool_return_index
+
+    @staticmethod
+    def _entry_has_assistant_text(entry: dict[str, object]) -> bool:
+        if str(entry.get("role") or "") != "assistant":
+            return False
+        message = entry.get("message")
+        if not isinstance(message, dict):
+            return False
+        parts = message.get("parts")
+        if not isinstance(parts, list):
+            return False
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            part_kind = str(part.get("part_kind") or "").strip()
+            if part_kind != "text":
+                continue
+            if str(part.get("content") or "").strip():
+                return True
+        return False
+
+    @staticmethod
+    def _entry_has_tool_return(entry: dict[str, object]) -> bool:
+        message = entry.get("message")
+        if not isinstance(message, dict):
+            return False
+        parts = message.get("parts")
+        if not isinstance(parts, list):
+            return False
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            part_kind = str(part.get("part_kind") or "").strip()
+            if part_kind == "tool-return":
+                return True
+            has_legacy_tool_return_shape = (
+                part.get("tool_name") is not None
+                and part.get("content") is not None
+                and part.get("args") is None
+            )
+            if has_legacy_tool_return_shape:
+                return True
+        return False
+
+    @staticmethod
+    def _project_terminal_task_result_entry(
+        *,
+        task: TaskRecord,
+        agent: AgentRuntimeRecord,
+        result_text: str,
+    ) -> dict[str, object]:
+        return {
+            "entry_type": "terminal_result",
+            "conversation_id": agent.conversation_id,
+            "agent_role_id": agent.role_id,
+            "instance_id": agent.instance_id,
+            "role_id": agent.role_id,
+            "task_id": task.envelope.task_id,
+            "trace_id": task.envelope.trace_id,
+            "run_id": agent.run_id,
+            "role": "assistant",
+            "label": agent.role_id,
+            "created_at": task.updated_at.isoformat(),
+            "hidden_from_context": False,
+            "hidden_reason": "",
+            "hidden_at": "",
+            "hidden_marker_id": "",
+            "message": {
+                "parts": [
+                    {
+                        "part_kind": "text",
+                        "content": result_text,
+                    },
+                ],
+            },
+        }
+
+    def _with_terminal_run_projection(self, record: SessionRecord) -> SessionRecord:
+        latest_terminal = self._latest_terminal_run(record.session_id)
+        if latest_terminal is None:
+            return record
+        last_viewed_run_id = str(record.last_viewed_terminal_run_id or "").strip()
+        return record.model_copy(
+            update={
+                "latest_terminal_run_id": latest_terminal.run_id,
+                "latest_terminal_run_status": latest_terminal.status.value,
+                "latest_terminal_run_verification_status": self._runtime_verification_status(
+                    latest_terminal
+                ),
+                "latest_terminal_run_updated_at": latest_terminal.updated_at,
+                "has_unread_terminal_run": last_viewed_run_id != latest_terminal.run_id,
+            }
+        )
+
+    async def _with_terminal_run_projection_async(
+        self,
+        record: SessionRecord,
+    ) -> SessionRecord:
+        latest_terminal = await self._latest_terminal_run_async(record.session_id)
+        if latest_terminal is None:
+            return record
+        last_viewed_run_id = str(record.last_viewed_terminal_run_id or "").strip()
+        return record.model_copy(
+            update={
+                "latest_terminal_run_id": latest_terminal.run_id,
+                "latest_terminal_run_status": latest_terminal.status.value,
+                "latest_terminal_run_verification_status": await self._runtime_verification_status_async(
+                    latest_terminal
+                ),
+                "latest_terminal_run_updated_at": latest_terminal.updated_at,
+                "has_unread_terminal_run": last_viewed_run_id != latest_terminal.run_id,
+            }
+        )
+
+    def _with_terminal_run_projection_from_preloaded(
+        self,
+        record: SessionRecord,
+        *,
+        runtimes: tuple[RunRuntimeRecord, ...],
+        excluded_run_ids: set[str],
+        verification_status_by_run_id: Mapping[str, str] | None = None,
+    ) -> SessionRecord:
+        latest_terminal = self._latest_terminal_run_from_preloaded(
+            runtimes,
+            excluded_run_ids,
+        )
+        if latest_terminal is None:
+            return record
+        last_viewed_run_id = str(record.last_viewed_terminal_run_id or "").strip()
+        return record.model_copy(
+            update={
+                "latest_terminal_run_id": latest_terminal.run_id,
+                "latest_terminal_run_status": latest_terminal.status.value,
+                "latest_terminal_run_verification_status": (
+                    verification_status_by_run_id.get(latest_terminal.run_id)
+                    if verification_status_by_run_id is not None
+                    else self._runtime_verification_status(latest_terminal)
+                ),
+                "latest_terminal_run_updated_at": latest_terminal.updated_at,
+                "has_unread_terminal_run": last_viewed_run_id != latest_terminal.run_id,
+            }
+        )
+
+    def _runtime_verification_status(self, runtime: RunRuntimeRecord) -> str | None:
+        if self._event_log is None:
+            return None
+        events = self._event_log.list_by_session_run_ids_event_types(
+            runtime.session_id,
+            (runtime.run_id,),
+            (
+                RunEventType.RUN_COMPLETED.value,
+                RunEventType.RUN_FAILED.value,
+            ),
+        )
+        for event in reversed(events):
+            if self._event_has_verification_failed_error_code(event):
+                return "failed"
+        return None
+
+    def _runtime_verification_statuses_by_run_id(
+        self,
+        run_ids: tuple[str, ...],
+    ) -> dict[str, str]:
+        if self._event_log is None:
+            return {}
+        events = self._event_log.list_by_run_ids_event_types(
+            run_ids,
+            (
+                RunEventType.RUN_COMPLETED.value,
+                RunEventType.RUN_FAILED.value,
+            ),
+        )
+        statuses: dict[str, str] = {}
+        for event in reversed(events):
+            run_id = str(event.get("trace_id") or "").strip()
+            if not run_id or run_id in statuses:
+                continue
+            if self._event_has_verification_failed_error_code(event):
+                statuses[run_id] = "failed"
+        return statuses
+
+    async def _runtime_verification_statuses_by_run_id_async(
+        self,
+        run_ids: tuple[str, ...],
+    ) -> dict[str, str]:
+        if self._event_log is None:
+            return {}
+        events = await self._event_log.list_by_run_ids_event_types_async(
+            run_ids,
+            (
+                RunEventType.RUN_COMPLETED.value,
+                RunEventType.RUN_FAILED.value,
+            ),
+        )
+        statuses: dict[str, str] = {}
+        for event in reversed(events):
+            run_id = str(event.get("trace_id") or "").strip()
+            if not run_id or run_id in statuses:
+                continue
+            if self._event_has_verification_failed_error_code(event):
+                statuses[run_id] = "failed"
+        return statuses
+
+    async def _runtime_verification_status_async(
+        self,
+        runtime: RunRuntimeRecord,
+    ) -> str | None:
+        if self._event_log is None:
+            return None
+        events = await self._event_log.list_by_session_run_ids_event_types_async(
+            runtime.session_id,
+            (runtime.run_id,),
+            (
+                RunEventType.RUN_COMPLETED.value,
+                RunEventType.RUN_FAILED.value,
+            ),
+        )
+        for event in reversed(events):
+            if self._event_has_verification_failed_error_code(event):
+                return "failed"
+        return None
+
+    @staticmethod
+    def _event_has_verification_failed_error_code(event: Mapping[str, object]) -> bool:
+        payload_json = event.get("payload_json")
+        if not isinstance(payload_json, str):
+            return False
+        try:
+            payload = json.loads(payload_json)
+        except ValueError:
+            return False
+        if not isinstance(payload, dict):
+            return False
+        error_code = str(payload.get("error_code") or "").strip().lower()
+        return error_code == "verification_failed"
+
+    def _latest_terminal_run(self, session_id: str) -> RunRuntimeRecord | None:
+        excluded_run_ids = self._subagent_run_ids(session_id)
+        for runtime in self._run_runtime_repo.list_by_session(session_id):
+            if runtime.run_id in excluded_run_ids:
+                continue
+            if runtime.status in TERMINAL_RUN_STATUSES:
+                return runtime
+        return None
+
+    async def _latest_terminal_run_async(
+        self,
+        session_id: str,
+    ) -> RunRuntimeRecord | None:
+        runtimes = await self._run_runtime_repo.list_by_session_async(session_id)
+        background_tasks = (
+            await self._background_task_repository.list_by_session_async(session_id)
+            if self._background_task_repository is not None
+            else ()
+        )
+        excluded_run_ids = self._subagent_run_ids_from_records(
+            runtimes=runtimes,
+            background_tasks=background_tasks,
+        )
+        return self._latest_terminal_run_from_preloaded(
+            runtimes,
+            excluded_run_ids,
+        )
+
+    @staticmethod
+    def _latest_terminal_run_from_preloaded(
+        runtimes: tuple[RunRuntimeRecord, ...],
+        excluded_run_ids: set[str],
+    ) -> RunRuntimeRecord | None:
+        for runtime in sorted(runtimes, key=lambda item: item.updated_at, reverse=True):
+            if runtime.run_id in excluded_run_ids:
+                continue
+            if runtime.status in TERMINAL_RUN_STATUSES:
+                return runtime
+        return None
+
+    def _select_active_run(
+        self, session_id: str
+    ) -> tuple[str, RunRuntimeRecord] | None:
+        excluded_run_ids = self._subagent_run_ids(session_id)
+        hinted_run_id = (
+            self._active_run_registry.get_active_run_id(session_id)
+            if self._active_run_registry is not None
+            else None
+        )
+        if hinted_run_id and hinted_run_id not in excluded_run_ids:
+            hinted_runtime = self._run_runtime_repo.get(hinted_run_id)
+            if hinted_runtime is not None:
+                return hinted_run_id, hinted_runtime
+
+        runtimes = list(self._run_runtime_repo.list_by_session(session_id))
+        if not runtimes:
+            return None
+        runtimes.sort(key=lambda item: item.updated_at, reverse=True)
+        for runtime in runtimes:
+            if runtime.run_id in excluded_run_ids:
+                continue
+            if runtime.status in {
+                RunRuntimeStatus.RUNNING,
+                RunRuntimeStatus.STOPPING,
+                RunRuntimeStatus.PAUSED,
+                RunRuntimeStatus.STOPPED,
+                RunRuntimeStatus.QUEUED,
+            }:
+                return runtime.run_id, runtime
+        for runtime in runtimes:
+            if runtime.run_id in excluded_run_ids:
+                continue
+            if runtime.status not in {
+                RunRuntimeStatus.COMPLETED,
+                RunRuntimeStatus.FAILED,
+            }:
+                continue
+            if self._has_background_tasks(runtime.run_id):
+                return runtime.run_id, runtime
+        return None
+
+    def _select_list_active_run_from_preloaded(
+        self,
+        *,
+        session_id: str,
+        runtimes: tuple[RunRuntimeRecord, ...],
+        excluded_run_ids: set[str],
+        active_background_run_ids: set[str],
+    ) -> tuple[str, RunRuntimeRecord] | None:
+        hinted_run_id = (
+            self._active_run_registry.get_active_run_id(session_id)
+            if self._active_run_registry is not None
+            else None
+        )
+        sorted_runtimes = sorted(
+            runtimes, key=lambda item: item.updated_at, reverse=True
+        )
+        if hinted_run_id and hinted_run_id not in excluded_run_ids:
+            hinted_runtime = next(
+                (
+                    runtime
+                    for runtime in sorted_runtimes
+                    if runtime.run_id == hinted_run_id
+                ),
+                None,
+            )
+            if hinted_runtime is not None and (
+                self._is_list_active_runtime(hinted_runtime, allow_stopped=True)
+                or (
+                    hinted_runtime.status
+                    in {RunRuntimeStatus.COMPLETED, RunRuntimeStatus.FAILED}
+                    and hinted_runtime.run_id in active_background_run_ids
+                )
+            ):
+                return hinted_run_id, hinted_runtime
+
+        for runtime in sorted_runtimes:
+            if runtime.run_id in excluded_run_ids:
+                continue
+            if self._is_list_active_runtime(runtime):
+                return runtime.run_id, runtime
+        for runtime in sorted_runtimes:
+            if runtime.run_id in excluded_run_ids:
+                continue
+            if runtime.status not in {
+                RunRuntimeStatus.COMPLETED,
+                RunRuntimeStatus.FAILED,
+            }:
+                continue
+            if runtime.run_id in active_background_run_ids:
+                return runtime.run_id, runtime
+        return None
+
+    @staticmethod
+    def _is_list_active_runtime(
+        runtime: RunRuntimeRecord,
+        *,
+        allow_stopped: bool = False,
+    ) -> bool:
+        if runtime.is_live_active or runtime.status == RunRuntimeStatus.PAUSED:
+            return True
+        return allow_stopped and runtime.status == RunRuntimeStatus.STOPPED
+
+    def _select_active_run_from_preloaded(
+        self,
+        *,
+        session_id: str,
+        runtimes: tuple[RunRuntimeRecord, ...],
+        excluded_run_ids: set[str],
+        active_background_run_ids: set[str],
+    ) -> tuple[str, RunRuntimeRecord] | None:
+        hinted_run_id = (
+            self._active_run_registry.get_active_run_id(session_id)
+            if self._active_run_registry is not None
+            else None
+        )
+        sorted_runtimes = sorted(
+            runtimes, key=lambda item: item.updated_at, reverse=True
+        )
+        if hinted_run_id and hinted_run_id not in excluded_run_ids:
+            hinted_runtime = next(
+                (
+                    runtime
+                    for runtime in sorted_runtimes
+                    if runtime.run_id == hinted_run_id
+                ),
+                None,
+            )
+            if hinted_runtime is not None:
+                return hinted_run_id, hinted_runtime
+
+        for runtime in sorted_runtimes:
+            if runtime.run_id in excluded_run_ids:
+                continue
+            if runtime.status in {
+                RunRuntimeStatus.RUNNING,
+                RunRuntimeStatus.STOPPING,
+                RunRuntimeStatus.PAUSED,
+                RunRuntimeStatus.STOPPED,
+                RunRuntimeStatus.QUEUED,
+            }:
+                return runtime.run_id, runtime
+        for runtime in sorted_runtimes:
+            if runtime.run_id in excluded_run_ids:
+                continue
+            if runtime.status not in {
+                RunRuntimeStatus.COMPLETED,
+                RunRuntimeStatus.FAILED,
+            }:
+                continue
+            if runtime.run_id in active_background_run_ids:
+                return runtime.run_id, runtime
+        return None
+
+    def _subagent_run_ids(self, session_id: str) -> set[str]:
+        run_ids = {
+            runtime.run_id
+            for runtime in self._run_runtime_repo.list_by_session(session_id)
+            if str(runtime.run_id).strip().startswith("subagent_run_")
+        }
+        if self._background_task_repository is None:
+            return run_ids
+        return run_ids | {
+            record.subagent_run_id
+            for record in self._background_task_repository.list_by_session(session_id)
+            if (
+                record.kind == BackgroundTaskKind.SUBAGENT
+                and record.subagent_run_id is not None
+            )
+        }
+
+    @staticmethod
+    def _subagent_run_ids_from_records(
+        *,
+        runtimes: tuple[RunRuntimeRecord, ...],
+        background_tasks: tuple[BackgroundTaskRecord, ...],
+    ) -> set[str]:
+        run_ids = {
+            runtime.run_id
+            for runtime in runtimes
+            if str(runtime.run_id).strip().startswith("subagent_run_")
+        }
+        run_ids.update(
+            record.subagent_run_id
+            for record in background_tasks
+            if (
+                record.kind == BackgroundTaskKind.SUBAGENT
+                and record.subagent_run_id is not None
+            )
+        )
+        return run_ids
+
+    def _subagent_run_ids_by_session_ids(
+        self,
+        *,
+        session_ids: tuple[str, ...],
+        runtimes_by_session: Mapping[str, tuple[RunRuntimeRecord, ...]],
+        background_tasks_by_session: Mapping[str, tuple[BackgroundTaskRecord, ...]],
+    ) -> dict[str, set[str]]:
+        return {
+            session_id: self._subagent_run_ids_from_records(
+                runtimes=runtimes_by_session.get(session_id, ()),
+                background_tasks=background_tasks_by_session.get(session_id, ()),
+            )
+            for session_id in session_ids
+        }
+
+    @staticmethod
+    def _active_background_run_ids(
+        background_tasks_by_session: Mapping[str, tuple[BackgroundTaskRecord, ...]],
+    ) -> set[str]:
+        return {
+            record.run_id
+            for records in background_tasks_by_session.values()
+            for record in records
+            if record.execution_mode == "background" and record.is_active
+        }
+
+    def _has_background_tasks(self, run_id: str) -> bool:
+        if self._background_task_repository is None:
+            return False
+        return any(
+            record.execution_mode == "background" and record.is_active
+            for record in self._background_task_repository.list_by_run(run_id)
+        )
+
+    def _paused_subagent_snapshot(
+        self,
+        runtime: RunRuntimeRecord,
+    ) -> dict[str, object] | None:
+        if runtime.phase not in {
+            RunRuntimePhase.AWAITING_SUBAGENT_FOLLOWUP,
+            RunRuntimePhase.SUBAGENT_RUNNING,
+        }:
+            return None
+        instance_id = runtime.active_subagent_instance_id or runtime.active_instance_id
+        if not instance_id:
+            return None
+        role_id = runtime.active_role_id or ""
+        if self._is_reserved_system_role(role_id):
+            return None
+        try:
+            agent = self._agent_repo.get_instance(instance_id)
+        except KeyError:
+            return {
+                "instance_id": instance_id,
+                "role_id": role_id,
+                "task_id": runtime.active_task_id,
+            }
+        if self._is_reserved_system_role(agent.role_id):
+            return None
+        return {
+            "instance_id": agent.instance_id,
+            "role_id": agent.role_id,
+            "task_id": runtime.active_task_id,
+        }
+
+    def _is_reserved_system_role(self, role_id: str) -> bool:
+        safe_role_id = str(role_id or "").strip()
+        if not safe_role_id:
+            return False
+        if self._role_registry is not None and (
+            self._role_registry.is_coordinator_role(safe_role_id)
+            or self._role_registry.is_main_agent_role(safe_role_id)
+        ):
+            return True
+        normalized = safe_role_id.casefold()
+        return (
+            normalized in _legacy_coordinator_identifiers()
+            or normalized in _main_agent_identifiers()
+        )
+
+    def _count_subagents_by_session(
+        self,
+        sessions: tuple[SessionRecord, ...],
+    ) -> dict[str, int]:
+        session_ids = tuple(session.session_id for session in sessions)
+        records_by_session = self._agent_repo.list_by_session_ids(session_ids)
+        counts: dict[str, int] = {}
+        for session in sessions:
+            records = records_by_session.get(session.session_id, ())
+            if session.session_mode == SessionMode.NORMAL:
+                counts[session.session_id] = sum(
+                    1
+                    for record in records
+                    if self._is_normal_mode_subagent_record(record, session=session)
+                )
+                continue
+            latest_by_role = self._latest_orchestration_subagents_by_role(
+                records,
+                session=session,
+            )
+            counts[session.session_id] = len(latest_by_role)
+        return counts
+
+    async def _count_subagents_by_session_async(
+        self,
+        sessions: tuple[SessionRecord, ...],
+    ) -> dict[str, int]:
+        session_ids = tuple(session.session_id for session in sessions)
+        records_by_session = await self._agent_repo.list_by_session_ids_async(
+            session_ids
+        )
+        counts: dict[str, int] = {}
+        for session in sessions:
+            records = records_by_session.get(session.session_id, ())
+            if session.session_mode == SessionMode.NORMAL:
+                counts[session.session_id] = sum(
+                    1
+                    for record in records
+                    if self._is_normal_mode_subagent_record(record, session=session)
+                )
+                continue
+            latest_by_role = self._latest_orchestration_subagents_by_role(
+                records,
+                session=session,
+            )
+            counts[session.session_id] = len(latest_by_role)
+        return counts
+
+    def _list_orchestration_subagents(
+        self,
+        session: SessionRecord,
+    ) -> tuple[dict[str, object], ...]:
+        records = self._latest_orchestration_subagents_by_role(
+            self._agent_repo.list_by_session(session.session_id),
+            session=session,
+        )
+        rows = tuple(records[role_id] for role_id in sorted(records.keys()))
+        run_ids = tuple(dict.fromkeys(record.run_id for record in rows))
+        runtime_by_run = {
+            runtime.run_id: runtime
+            for runtime in self._run_runtime_repo.list_by_session(session.session_id)
+            if runtime.run_id in run_ids
+        }
+        return tuple(
+            self._orchestration_subagent_projection(
+                record,
+                runtime_by_run=runtime_by_run,
+            )
+            for record in rows
+        )
+
+    def _latest_orchestration_subagents_by_role(
+        self,
+        records: tuple[AgentRuntimeRecord, ...],
+        *,
+        session: SessionRecord,
+    ) -> dict[str, AgentRuntimeRecord]:
+        latest_by_role: dict[str, AgentRuntimeRecord] = {}
+        for record in records:
+            if self._is_normal_mode_subagent_record(record, session=session):
+                continue
+            if self._is_reserved_system_role(record.role_id):
+                continue
+            existing = latest_by_role.get(record.role_id)
+            if existing is None or (
+                record.updated_at,
+                record.created_at,
+            ) >= (
+                existing.updated_at,
+                existing.created_at,
+            ):
+                latest_by_role[record.role_id] = record
+        return latest_by_role
+
+    def _require_session_agent(
+        self,
+        session_id: str,
+        instance_id: str,
+    ) -> AgentRuntimeRecord:
+        agent = self._agent_repo.get_instance(instance_id)
+        if agent.session_id != session_id:
+            raise KeyError(instance_id)
+        return agent
+
+    async def _require_session_agent_async(
+        self,
+        session_id: str,
+        instance_id: str,
+    ) -> AgentRuntimeRecord:
+        agent = await self._agent_repo.get_instance_async(instance_id)
+        if agent.session_id != session_id:
+            raise KeyError(instance_id)
+        return agent
+
+    @staticmethod
+    def _agent_projection(record: AgentRuntimeRecord) -> dict[str, object]:
+        return record.model_dump(mode="json")
+
+    @staticmethod
+    async def _agent_projection_async(
+        record: AgentRuntimeRecord,
+    ) -> dict[str, object]:
+        return record.model_dump(mode="json")
+
+    def _orchestration_subagent_projection(
+        self,
+        record: AgentRuntimeRecord,
+        *,
+        runtime_by_run: Mapping[str, RunRuntimeRecord] | None = None,
+    ) -> dict[str, object]:
+        projected = self._agent_projection(record)
+        runtime = (
+            runtime_by_run.get(record.run_id)
+            if runtime_by_run is not None
+            else self._run_runtime_repo.get(record.run_id)
+        )
+        projected["title"] = record.role_id
+        projected["subagent_kind"] = "orchestration"
+        projected["interactive"] = True
+        projected["deletable"] = False
+        projected["run_status"] = (
+            runtime.status.value if runtime is not None else projected["status"]
+        )
+        projected["run_phase"] = (
+            self._public_phase(runtime, 0, 0) if runtime is not None else ""
+        )
+        projected["last_event_id"] = 0
+        projected["checkpoint_event_id"] = 0
+        projected["stream_connected"] = False
+        return projected
+
+    def _normal_mode_subagent_projection(
+        self,
+        record: AgentRuntimeRecord,
+        *,
+        runtime_by_run: Mapping[str, RunRuntimeRecord] | None = None,
+        run_state_by_run: Mapping[str, RunStateRecord] | None = None,
+        approval_counts: Mapping[str, int] | None = None,
+        question_counts: Mapping[str, int] | None = None,
+    ) -> dict[str, object]:
+        projected = self._agent_projection(record)
+        runtime = (
+            runtime_by_run.get(record.run_id)
+            if runtime_by_run is not None
+            else self._run_runtime_repo.get(record.run_id)
+        )
+        run_state = (
+            run_state_by_run.get(record.run_id)
+            if run_state_by_run is not None
+            else (
+                self._run_state_repo.get_run_state(record.run_id)
+                if self._run_state_repo is not None
+                else None
+            )
+        )
+        approval_count = (
+            approval_counts.get(record.run_id, 0)
+            if approval_counts is not None
+            else None
+        )
+        if approval_count is None:
+            approval_count = 0
+            if runtime is not None and self._approval_ticket_repo is not None:
+                approval_count = len(
+                    self._approval_ticket_repo.list_open_by_run(runtime.run_id)
+                )
+        question_count = (
+            question_counts.get(record.run_id, 0)
+            if question_counts is not None
+            else self._pending_user_question_count(record.run_id)
+        )
+        stream_connected = False
+        if self._run_event_hub is not None:
+            stream_connected = self._run_event_hub.has_subscribers(
+                record.run_id
+            ) or self._run_event_hub.has_session_subscribers(record.session_id)
+        projected["subagent_kind"] = "normal"
+        projected["interactive"] = False
+        projected["deletable"] = True
+        projected["run_status"] = (
+            runtime.status.value if runtime is not None else projected["status"]
+        )
+        projected["run_phase"] = (
+            self._public_phase(runtime, approval_count, question_count)
+            if runtime is not None
+            else ""
+        )
+        projected["last_event_id"] = (
+            int(run_state.last_event_id) if run_state is not None else 0
+        )
+        projected["checkpoint_event_id"] = (
+            int(run_state.checkpoint_event_id) if run_state is not None else 0
+        )
+        projected["stream_connected"] = stream_connected
+        return projected
+
+    def _public_phase(
+        self,
+        runtime: RunRuntimeRecord,
+        approval_count: int,
+        question_count: int = 0,
+    ) -> str:
+        if runtime.status == RunRuntimeStatus.STOPPING:
+            return "stopping"
+        if approval_count > 0:
+            return "awaiting_tool_approval"
+        if (
+            question_count > 0
+            or runtime.phase == RunRuntimePhase.AWAITING_MANUAL_ACTION
+        ):
+            return "awaiting_manual_action"
+        if runtime.phase == RunRuntimePhase.AWAITING_SUBAGENT_FOLLOWUP:
+            return "awaiting_subagent_followup"
+        if runtime.phase == RunRuntimePhase.AWAITING_RECOVERY:
+            return "awaiting_recovery"
+        if runtime.status == RunRuntimeStatus.RUNNING:
+            return "running"
+        if runtime.status == RunRuntimeStatus.PAUSED:
+            return (
+                "awaiting_manual_action"
+                if runtime.phase == RunRuntimePhase.AWAITING_MANUAL_ACTION
+                else (
+                    "awaiting_subagent_followup"
+                    if runtime.phase == RunRuntimePhase.AWAITING_SUBAGENT_FOLLOWUP
+                    else "awaiting_recovery"
+                )
+            )
+        if runtime.status == RunRuntimeStatus.STOPPED:
+            return "stopped"
+        if runtime.status == RunRuntimeStatus.QUEUED:
+            return "queued"
+        if runtime.status == RunRuntimeStatus.COMPLETED:
+            return "completed"
+        if runtime.status == RunRuntimeStatus.FAILED:
+            return "failed"
+        return runtime.phase.value
+
+    def _pending_user_question_count(self, run_id: str) -> int:
+        if self._user_question_repo is None:
+            return 0
+        return len(self._user_question_repo.list_by_run(run_id))
+
+    def _pending_user_question_counts_by_run(self, session_id: str) -> dict[str, int]:
+        if self._user_question_repo is None:
+            return {}
+        counts: dict[str, int] = {}
+        for record in self._user_question_repo.list_by_session(session_id):
+            counts[record.run_id] = counts.get(record.run_id, 0) + 1
+        return counts
+
+    def _list_resolvable_user_questions_for_session(
+        self, session_id: str
+    ) -> tuple[UserQuestionRequestRecord, ...]:
+        if self._user_question_repo is None:
+            return ()
+        records = self._user_question_repo.list_by_session(session_id)
+        if self._run_runtime_repo is None:
+            return records
+        return tuple(
+            record
+            for record in records
+            if self._run_runtime_repo.get(record.run_id) is not None
+        )
+
+    @staticmethod
+    def _is_runtime_publicly_recoverable(runtime: RunRuntimeRecord) -> bool:
+        return runtime.is_recoverable and runtime.status != RunRuntimeStatus.STOPPING
+
+    @staticmethod
+    def _subagent_title_for_run(
+        *,
+        run_id: str,
+        root_tasks_by_run: dict[str, object],
+    ) -> str:
+        root_task = root_tasks_by_run.get(run_id)
+        if root_task is None:
+            return ""
+        envelope = getattr(root_task, "envelope", None)
+        title = str(getattr(envelope, "title", "") or "").strip()
+        if title:
+            return title
+        objective = str(getattr(envelope, "objective", "") or "").strip()
+        if not objective:
+            return ""
+        return objective[:80]
+
+    @staticmethod
+    def _run_event_from_log_row(row: Mapping[str, object]) -> RunEvent | None:
+        row_id = row.get("id")
+        if not isinstance(row_id, int):
+            return None
+        try:
+            event_type = RunEventType(str(row["event_type"]))
+        except (KeyError, ValueError):
+            return None
+        trace_id = str(row.get("trace_id") or "").strip()
+        session_id = str(row.get("session_id") or "").strip()
+        if not trace_id or not session_id:
+            return None
+        return RunEvent(
+            session_id=session_id,
+            run_id=trace_id,
+            trace_id=trace_id,
+            task_id=(str(row["task_id"]) if row.get("task_id") is not None else None),
+            instance_id=(
+                str(row["instance_id"]) if row.get("instance_id") is not None else None
+            ),
+            event_type=event_type,
+            payload_json=str(row.get("payload_json") or "{}"),
+            event_id=row_id,
+        )
+
+    @staticmethod
+    def _is_subagent_run_id(run_id: str) -> bool:
+        return str(run_id or "").strip().startswith("subagent_run_")
+
+    @staticmethod
+    def _is_normal_mode_subagent_record(
+        record: AgentRuntimeRecord,
+        *,
+        session: SessionRecord,
+    ) -> bool:
+        return session.session_mode == SessionMode.NORMAL and str(
+            record.run_id
+        ).strip().startswith("subagent_run_")
+
+
+def _history_marker_label(marker: SessionHistoryMarkerRecord) -> str:
+    if marker.marker_type == SessionHistoryMarkerType.CLEAR:
+        return "History cleared"
+    if marker.metadata.get("compaction_strategy") == "rolling_summary":
+        return "History compacted (rolling summary)"
+    return "History compacted"

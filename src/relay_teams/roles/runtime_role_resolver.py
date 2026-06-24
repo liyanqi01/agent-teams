@@ -1,0 +1,259 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import logging
+
+from relay_teams.roles.role_models import RoleDefinition, RoleMode
+from relay_teams.logger import get_logger, log_event
+from relay_teams.roles.default_role_tools import COORDINATOR_ONLY_TOOLS
+from relay_teams.roles.role_registry import is_coordinator_role_definition
+from relay_teams.roles.role_registry import RoleRegistry
+from relay_teams.roles.temporary_role_models import (
+    TemporaryRoleRecord,
+    TemporaryRoleSource,
+    TemporaryRoleSpec,
+)
+from relay_teams.roles.temporary_role_repository import TemporaryRoleRepository
+
+LOGGER = get_logger(__name__)
+
+
+class RuntimeRoleResolver:
+    def __init__(
+        self,
+        *,
+        role_registry: RoleRegistry,
+        temporary_role_repository: TemporaryRoleRepository,
+    ) -> None:
+        self._role_registry = role_registry
+        self._temporary_role_repository = temporary_role_repository
+
+    def replace_role_registry(self, role_registry: RoleRegistry) -> None:
+        self._role_registry = role_registry
+
+    def get_effective_role(self, *, run_id: str | None, role_id: str) -> RoleDefinition:
+        if run_id is not None:
+            try:
+                temp = self._temporary_role_repository.get(
+                    run_id=run_id, role_id=role_id
+                )
+            except KeyError:
+                pass
+            else:
+                return temp.role.to_role_definition()
+        return self._role_registry.get(role_id)
+
+    async def get_effective_role_async(
+        self, *, run_id: str | None, role_id: str
+    ) -> RoleDefinition:
+        if run_id is not None:
+            try:
+                temp = await self._temporary_role_repository.get_async(
+                    run_id=run_id, role_id=role_id
+                )
+            except KeyError:
+                pass
+            else:
+                return temp.role.to_role_definition()
+        return self._role_registry.get(role_id)
+
+    def get_temporary_role(self, *, run_id: str | None, role_id: str) -> RoleDefinition:
+        if run_id is None:
+            raise KeyError(f"Unknown temporary role_id: {role_id}")
+        temp = self._temporary_role_repository.get(run_id=run_id, role_id=role_id)
+        return temp.role.to_role_definition()
+
+    def list_effective_roles(self, *, run_id: str | None) -> tuple[RoleDefinition, ...]:
+        static_roles = list(self._role_registry.list_roles())
+        if run_id is None:
+            return tuple(static_roles)
+        temp_roles = [
+            record.role.to_role_definition()
+            for record in self._temporary_role_repository.list_by_run(run_id)
+        ]
+        return tuple(static_roles + temp_roles)
+
+    async def list_effective_roles_async(
+        self, *, run_id: str | None
+    ) -> tuple[RoleDefinition, ...]:
+        static_roles = list(self._role_registry.list_roles())
+        if run_id is None:
+            return tuple(static_roles)
+        temp_roles = [
+            record.role.to_role_definition()
+            for record in await self._temporary_role_repository.list_by_run_async(
+                run_id
+            )
+        ]
+        return tuple(static_roles + temp_roles)
+
+    async def list_temporary_role_ids_async(self, *, run_id: str) -> tuple[str, ...]:
+        return tuple(
+            record.role.role_id
+            for record in await self._temporary_role_repository.list_by_run_async(
+                run_id
+            )
+        )
+
+    async def delete_temporary_role_async(self, *, run_id: str, role_id: str) -> None:
+        await self._temporary_role_repository.delete_async(
+            run_id=run_id,
+            role_id=role_id,
+        )
+
+    def create_temporary_role(
+        self,
+        *,
+        run_id: str,
+        session_id: str,
+        role: TemporaryRoleSpec,
+        source: TemporaryRoleSource = TemporaryRoleSource.META_AGENT_GENERATED,
+    ) -> RoleDefinition:
+        if self._role_registry.is_coordinator_role(role.role_id):
+            raise ValueError(
+                f"Temporary role id conflicts with coordinator role: {role.role_id}"
+            )
+        if self._role_registry.is_main_agent_role(role.role_id):
+            raise ValueError(
+                f"Temporary role id conflicts with main agent role: {role.role_id}"
+            )
+        if role.template_role_id is not None:
+            role = self._merge_with_template(run_id=run_id, role=role)
+        role = self._strip_coordinator_only_tools(role)
+        record = self._temporary_role_repository.upsert(
+            TemporaryRoleRecord(
+                run_id=run_id,
+                session_id=session_id,
+                source=source,
+                role=role,
+            )
+        )
+        return record.role.to_role_definition()
+
+    async def create_temporary_role_async(
+        self,
+        *,
+        run_id: str,
+        session_id: str,
+        role: TemporaryRoleSpec,
+        source: TemporaryRoleSource = TemporaryRoleSource.META_AGENT_GENERATED,
+    ) -> RoleDefinition:
+        if self._role_registry.is_coordinator_role(role.role_id):
+            raise ValueError(
+                f"Temporary role id conflicts with coordinator role: {role.role_id}"
+            )
+        if self._role_registry.is_main_agent_role(role.role_id):
+            raise ValueError(
+                f"Temporary role id conflicts with main agent role: {role.role_id}"
+            )
+        if role.template_role_id is not None:
+            role = await self._merge_with_template_async(run_id=run_id, role=role)
+        role = self._strip_coordinator_only_tools(role)
+        record = await self._temporary_role_repository.upsert_async(
+            TemporaryRoleRecord(
+                run_id=run_id,
+                session_id=session_id,
+                source=source,
+                role=role,
+            )
+        )
+        return record.role.to_role_definition()
+
+    def cleanup_run(self, *, run_id: str) -> None:
+        self._temporary_role_repository.delete_by_run(run_id)
+
+    async def cleanup_run_async(self, *, run_id: str) -> None:
+        await self._temporary_role_repository.delete_by_run_async(run_id)
+
+    def _merge_with_template(
+        self, *, run_id: str, role: TemporaryRoleSpec
+    ) -> TemporaryRoleSpec:
+        template_role_id = role.template_role_id
+        if template_role_id is None:
+            return role
+        template = self.get_effective_role(run_id=run_id, role_id=template_role_id)
+        if self._role_registry.is_coordinator_role(
+            template.role_id
+        ) or is_coordinator_role_definition(template):
+            raise ValueError(
+                "Coordinator role cannot be used as a temporary role template"
+            )
+        return TemporaryRoleSpec(
+            role_id=role.role_id,
+            name=role.name,
+            description=role.description,
+            version=role.version,
+            tools=template.tools if len(role.tools) == 0 else role.tools,
+            mcp_servers=(
+                template.mcp_servers if len(role.mcp_servers) == 0 else role.mcp_servers
+            ),
+            skills=template.skills if len(role.skills) == 0 else role.skills,
+            model_profile=template.model_profile
+            if role.model_profile == "default"
+            else role.model_profile,
+            bound_agent_id=role.bound_agent_id or template.bound_agent_id,
+            execution_surface=role.execution_surface,
+            mode=RoleMode.SUBAGENT,
+            memory_profile=role.memory_profile,
+            system_prompt=role.system_prompt,
+            template_role_id=role.template_role_id,
+        )
+
+    async def _merge_with_template_async(
+        self, *, run_id: str, role: TemporaryRoleSpec
+    ) -> TemporaryRoleSpec:
+        template_role_id = role.template_role_id
+        if template_role_id is None:
+            return role
+        template = await self.get_effective_role_async(
+            run_id=run_id,
+            role_id=template_role_id,
+        )
+        if self._role_registry.is_coordinator_role(
+            template.role_id
+        ) or is_coordinator_role_definition(template):
+            raise ValueError(
+                "Coordinator role cannot be used as a temporary role template"
+            )
+        return TemporaryRoleSpec(
+            role_id=role.role_id,
+            name=role.name,
+            description=role.description,
+            version=role.version,
+            tools=template.tools if len(role.tools) == 0 else role.tools,
+            mcp_servers=(
+                template.mcp_servers if len(role.mcp_servers) == 0 else role.mcp_servers
+            ),
+            skills=template.skills if len(role.skills) == 0 else role.skills,
+            model_profile=template.model_profile
+            if role.model_profile == "default"
+            else role.model_profile,
+            bound_agent_id=role.bound_agent_id or template.bound_agent_id,
+            execution_surface=role.execution_surface,
+            mode=RoleMode.SUBAGENT,
+            memory_profile=role.memory_profile,
+            system_prompt=role.system_prompt,
+            template_role_id=role.template_role_id,
+        )
+
+    @staticmethod
+    def _strip_coordinator_only_tools(role: TemporaryRoleSpec) -> TemporaryRoleSpec:
+        filtered_tools = tuple(
+            tool for tool in role.tools if tool not in COORDINATOR_ONLY_TOOLS
+        )
+        if filtered_tools == role.tools:
+            return role
+        removed_tools = tuple(
+            tool for tool in role.tools if tool in COORDINATOR_ONLY_TOOLS
+        )
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            event="roles.temporary.filtered_coordinator_only_tools",
+            message="Filtered coordinator-only tools from temporary role",
+            payload={
+                "role_id": role.role_id,
+                "removed_tools": list(removed_tools),
+            },
+        )
+        return role.model_copy(update={"tools": filtered_tools})

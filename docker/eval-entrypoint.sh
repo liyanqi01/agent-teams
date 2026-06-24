@@ -10,10 +10,10 @@
 # Usage (set by DockerWorkspaceSetup automatically):
 #   docker run ... -v /host/config:/tmp/agent-config-host:ro <image> \
 #       /opt/agent-runtime/eval-entrypoint.sh \
-#       /opt/agent-runtime/bin/agent-teams server start ...
+#       /opt/agent-runtime/bin/relay-teams server start ...
 
 CONFIG_STAGING="${AGENT_TEAMS_CONFIG_STAGING:-/tmp/agent-config-host}"
-CONFIG_TARGET="${AGENT_TEAMS_CONFIG_TARGET:-/root/.config/agent-teams}"
+CONFIG_TARGET="${AGENT_TEAMS_CONFIG_TARGET:-/root/.relay-teams}"
 
 if [ -d "$CONFIG_STAGING" ]; then
     mkdir -p "$CONFIG_TARGET"

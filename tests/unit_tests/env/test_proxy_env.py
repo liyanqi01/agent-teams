@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import os
 from pathlib import Path
 
-from agent_teams.env import (
+from relay_teams.env import (
     ProxyEnvInput,
     apply_proxy_env_to_process_env,
     build_subprocess_env,
@@ -16,6 +15,7 @@ from agent_teams.env import (
     proxy_applies_to_url,
     resolve_proxy_env_config,
 )
+from relay_teams.env.proxy_env import resolve_ssl_verify
 
 
 def test_extract_proxy_env_vars_normalizes_upper_and_lowercase_keys() -> None:
@@ -31,6 +31,13 @@ def test_extract_proxy_env_vars_normalizes_upper_and_lowercase_keys() -> None:
         "http_proxy": "http://proxy.example:8080",
         "NO_PROXY": "localhost,127.0.0.1",
         "no_proxy": "localhost,127.0.0.1",
+        "NODE_USE_ENV_PROXY": "1",
+        "NPM_CONFIG_PROXY": "http://proxy.example:8080",
+        "npm_config_proxy": "http://proxy.example:8080",
+        "NPM_CONFIG_HTTPS_PROXY": "http://proxy.example:8080",
+        "npm_config_https_proxy": "http://proxy.example:8080",
+        "NPM_CONFIG_NOPROXY": "localhost,127.0.0.1",
+        "npm_config_noproxy": "localhost,127.0.0.1",
     }
 
 
@@ -64,6 +71,10 @@ def test_apply_proxy_env_to_process_env_updates_os_environ(monkeypatch) -> None:
     assert os.environ["http_proxy"] == "http://proxy.example:8080"
     assert os.environ["NO_PROXY"] == "localhost,127.0.0.1"
     assert os.environ["no_proxy"] == "localhost,127.0.0.1"
+    assert os.environ["NODE_USE_ENV_PROXY"] == "1"
+    assert os.environ["npm_config_proxy"] == "http://proxy.example:8080"
+    assert os.environ["npm_config_https_proxy"] == "http://proxy.example:8080"
+    assert os.environ["npm_config_noproxy"] == "localhost,127.0.0.1"
 
 
 def test_apply_proxy_env_to_process_env_clears_stale_proxy_keys(monkeypatch) -> None:
@@ -71,6 +82,8 @@ def test_apply_proxy_env_to_process_env_clears_stale_proxy_keys(monkeypatch) -> 
     monkeypatch.setenv("http_proxy", "http://stale.example:8080")
     monkeypatch.setenv("NO_PROXY", "localhost")
     monkeypatch.setenv("no_proxy", "localhost")
+    monkeypatch.setenv("NODE_USE_ENV_PROXY", "1")
+    monkeypatch.setenv("npm_config_proxy", "http://stale.example:8080")
 
     applied = apply_proxy_env_to_process_env({})
 
@@ -79,6 +92,8 @@ def test_apply_proxy_env_to_process_env_clears_stale_proxy_keys(monkeypatch) -> 
     assert "http_proxy" not in os.environ
     assert "NO_PROXY" not in os.environ
     assert "no_proxy" not in os.environ
+    assert "NODE_USE_ENV_PROXY" not in os.environ
+    assert "npm_config_proxy" not in os.environ
 
 
 def test_build_subprocess_env_uses_current_proxy_values(monkeypatch) -> None:
@@ -94,6 +109,65 @@ def test_build_subprocess_env_uses_current_proxy_values(monkeypatch) -> None:
     assert subprocess_env["CUSTOM"] == "1"
     assert subprocess_env["HTTP_PROXY"] == "http://proxy.example:8080"
     assert subprocess_env["NO_PROXY"] == "localhost,127.0.0.1"
+    assert subprocess_env["NODE_USE_ENV_PROXY"] == "1"
+    assert subprocess_env["npm_config_proxy"] == "http://proxy.example:8080"
+    assert subprocess_env["npm_config_https_proxy"] == "http://proxy.example:8080"
+    assert subprocess_env["npm_config_noproxy"] == "localhost,127.0.0.1"
+
+
+def test_build_subprocess_env_clears_stale_node_proxy_keys(monkeypatch) -> None:
+    monkeypatch.delenv("HTTP_PROXY", raising=False)
+    monkeypatch.delenv("http_proxy", raising=False)
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    monkeypatch.delenv("https_proxy", raising=False)
+    monkeypatch.delenv("ALL_PROXY", raising=False)
+    monkeypatch.delenv("all_proxy", raising=False)
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+    monkeypatch.delenv("NODE_USE_ENV_PROXY", raising=False)
+    monkeypatch.delenv("npm_config_proxy", raising=False)
+
+    subprocess_env = build_subprocess_env(
+        base_env={
+            "PATH": "bin",
+            "NODE_USE_ENV_PROXY": "1",
+            "npm_config_proxy": "http://stale.example:8080",
+        }
+    )
+
+    assert subprocess_env["PATH"] == "bin"
+    assert "NODE_USE_ENV_PROXY" not in subprocess_env
+    assert "npm_config_proxy" not in subprocess_env
+
+
+def test_extract_proxy_env_vars_exports_node_ssl_proxy_controls() -> None:
+    proxy_env = extract_proxy_env_vars(
+        {
+            "HTTPS_PROXY": "http://proxy.example:8443",
+            "SSL_VERIFY": "false",
+        }
+    )
+
+    assert proxy_env["NODE_USE_ENV_PROXY"] == "1"
+    assert proxy_env["NPM_CONFIG_HTTPS_PROXY"] == "http://proxy.example:8443"
+    assert proxy_env["npm_config_https_proxy"] == "http://proxy.example:8443"
+    assert proxy_env["NPM_CONFIG_STRICT_SSL"] == "false"
+    assert proxy_env["npm_config_strict_ssl"] == "false"
+    assert proxy_env["NODE_TLS_REJECT_UNAUTHORIZED"] == "0"
+
+
+def test_resolve_ssl_verify_defaults_to_disabled() -> None:
+    assert resolve_ssl_verify() is False
+
+
+def test_resolve_ssl_verify_prefers_explicit_override() -> None:
+    assert (
+        resolve_ssl_verify(
+            proxy_config=resolve_proxy_env_config({"SSL_VERIFY": "false"}),
+            explicit_ssl_verify=True,
+        )
+        is True
+    )
 
 
 def test_proxy_applies_to_url_respects_no_proxy() -> None:
@@ -133,6 +207,127 @@ def test_parse_no_proxy_rules_normalizes_semicolon_separated_entries() -> None:
         ("wildcard", "192.168.*"),
         ("local", None),
     ]
+
+
+def test_extract_proxy_env_vars_converts_semicolons_to_commas_for_no_proxy() -> None:
+    proxy_env = extract_proxy_env_vars(
+        {
+            "HTTP_PROXY": "http://proxy.example:8080",
+            "NO_PROXY": "localhost;127.*;<local>",
+        }
+    )
+
+    assert proxy_env["NO_PROXY"] == "localhost,127.*,<local>"
+    assert proxy_env["no_proxy"] == "localhost,127.*,<local>"
+
+
+def test_extract_proxy_env_vars_strips_empty_no_proxy_tokens() -> None:
+    proxy_env = extract_proxy_env_vars(
+        {
+            "HTTP_PROXY": "http://proxy.example:8080",
+            "NO_PROXY": "a,,b; ;c",
+        }
+    )
+
+    assert proxy_env["NO_PROXY"] == "a,b,c"
+
+
+def test_extract_proxy_env_vars_omits_no_proxy_when_only_separators() -> None:
+    proxy_env = extract_proxy_env_vars(
+        {
+            "HTTP_PROXY": "http://proxy.example:8080",
+            "NO_PROXY": " ; , ",
+        }
+    )
+
+    assert "NO_PROXY" not in proxy_env
+    assert "no_proxy" not in proxy_env
+
+
+def test_build_subprocess_env_keeps_username_only_proxy_url_unchanged(
+    monkeypatch,
+) -> None:
+    for key in (
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://alice@proxy.example:8443")
+    monkeypatch.setenv("ALL_PROXY", "http://alice@proxy.example:1080")
+
+    subprocess_env = build_subprocess_env()
+
+    assert subprocess_env["HTTPS_PROXY"] == "http://alice@proxy.example:8443"
+    assert subprocess_env["https_proxy"] == "http://alice@proxy.example:8443"
+    assert subprocess_env["ALL_PROXY"] == "http://alice@proxy.example:1080"
+    assert subprocess_env["all_proxy"] == "http://alice@proxy.example:1080"
+
+
+def test_build_subprocess_env_leaves_url_without_username_unchanged(
+    monkeypatch,
+) -> None:
+    for key in (
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:8443")
+
+    subprocess_env = build_subprocess_env()
+
+    assert subprocess_env["HTTPS_PROXY"] == "http://proxy.example:8443"
+
+
+def test_build_subprocess_env_keeps_inline_password_when_already_present(
+    monkeypatch,
+) -> None:
+    for key in (
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://alice:inline-pw@proxy.example:8443")
+
+    subprocess_env = build_subprocess_env()
+
+    assert subprocess_env["HTTPS_PROXY"] == "http://alice:inline-pw@proxy.example:8443"
+
+
+def test_build_subprocess_env_exports_comma_separated_no_proxy(monkeypatch) -> None:
+    monkeypatch.delenv("HTTP_PROXY", raising=False)
+    monkeypatch.delenv("http_proxy", raising=False)
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    monkeypatch.delenv("https_proxy", raising=False)
+    monkeypatch.delenv("ALL_PROXY", raising=False)
+    monkeypatch.delenv("all_proxy", raising=False)
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.example:8080")
+    monkeypatch.setenv("NO_PROXY", "localhost;127.*;example.com")
+
+    subprocess_env = build_subprocess_env()
+
+    assert subprocess_env["NO_PROXY"] == "localhost,127.*,example.com"
+    assert subprocess_env["no_proxy"] == "localhost,127.*,example.com"
 
 
 def test_proxy_env_input_splits_and_rebuilds_shared_proxy_credentials() -> None:
@@ -194,7 +389,7 @@ def test_load_proxy_env_config_applies_password_from_secret_store(
             return "secret"
 
     monkeypatch.setattr(
-        "agent_teams.env.proxy_env.get_proxy_secret_store",
+        "relay_teams.env.proxy_env.get_proxy_secret_store",
         lambda: _FakeSecretStore(),
     )
 
@@ -222,7 +417,7 @@ def test_load_proxy_env_config_keeps_password_from_env_when_user_forces_it(
             return "from-keyring"
 
     monkeypatch.setattr(
-        "agent_teams.env.proxy_env.get_proxy_secret_store",
+        "relay_teams.env.proxy_env.get_proxy_secret_store",
         lambda: _FakeSecretStore(),
     )
 

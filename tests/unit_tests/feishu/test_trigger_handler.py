@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
-from typing import Literal
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Literal
 from typing import cast
 
-from lark_oapi.event.dispatcher_handler import P2ImMessageReceiveV1
+import pytest
 
-from agent_teams.gateway.feishu.models import (
+from relay_teams.gateway.feishu.models import (
     FeishuChatQueueClearResult,
     FeishuChatQueueItemPreview,
     FeishuChatQueueSummary,
@@ -20,14 +22,22 @@ from agent_teams.gateway.feishu.models import (
     FeishuTriggerTargetConfig,
     TriggerProcessingResult,
 )
-from agent_teams.gateway.feishu.trigger_handler import FeishuTriggerHandler
-from agent_teams.gateway.gateway_session_service import GatewaySessionService
-from agent_teams.gateway.im import ImSessionCommandService, ImToolService
-from agent_teams.providers.token_usage_repo import SessionTokenUsage
-from agent_teams.sessions import ExternalSessionBindingRepository, SessionService
-from agent_teams.sessions.runs.run_manager import RunManager
-from agent_teams.sessions.runs.run_models import IntentInput, RunThinkingConfig
-from agent_teams.sessions.session_models import SessionMode, SessionRecord
+from relay_teams.gateway.feishu.trigger_handler import FeishuTriggerHandler
+from relay_teams.gateway.gateway_session_service import GatewaySessionService
+from relay_teams.gateway.im.command_service import ImSessionCommandService
+from relay_teams.gateway.im.service import ImToolService
+from relay_teams.gateway.user_questions import UserQuestionAnswerStatus
+from relay_teams.providers.token_usage_repo import SessionTokenUsage
+from relay_teams.sessions.external_session_binding_repository import (
+    ExternalSessionBindingRepository,
+)
+from relay_teams.sessions.session_service import SessionService
+from relay_teams.sessions.runs.run_service import SessionRunService
+from relay_teams.sessions.runs.run_models import IntentInput, RunThinkingConfig
+from relay_teams.sessions.session_models import SessionMode, SessionRecord
+
+if TYPE_CHECKING:
+    from lark_oapi.event.dispatcher_handler import P2ImMessageReceiveV1
 
 
 class _FakeRuntimeConfigLookup:
@@ -76,7 +86,7 @@ class _FakeSessionService:
     def get_session(self, session_id: str) -> SessionRecord:
         return self.sessions[session_id]
 
-    def update_session(self, session_id: str, metadata: dict[str, str]) -> None:
+    def sync_session_metadata(self, session_id: str, metadata: dict[str, str]) -> None:
         self.sessions[session_id] = self.sessions[session_id].model_copy(
             update={"metadata": metadata}
         )
@@ -125,33 +135,90 @@ class _FakeRunService:
         _ = run_id
 
 
+def _build_sdk_event(raw_body: str) -> P2ImMessageReceiveV1:
+    payload = cast(dict[str, object], json.loads(raw_body))
+    header_payload = cast(dict[str, object], payload.get("header") or {})
+    event_payload = cast(dict[str, object], payload.get("event") or {})
+    message_payload = cast(dict[str, object], event_payload.get("message") or {})
+    sender_payload = cast(dict[str, object], event_payload.get("sender") or {})
+    sender_id_payload = cast(dict[str, object], sender_payload.get("sender_id") or {})
+    event = cast(
+        "P2ImMessageReceiveV1",
+        SimpleNamespace(
+            header=SimpleNamespace(
+                event_id=header_payload.get("event_id"),
+                tenant_key=header_payload.get("tenant_key"),
+            ),
+            event=SimpleNamespace(
+                message=SimpleNamespace(
+                    message_id=message_payload.get("message_id"),
+                    chat_id=message_payload.get("chat_id"),
+                    chat_type=message_payload.get("chat_type"),
+                    message_type=message_payload.get("message_type"),
+                    content=message_payload.get("content"),
+                ),
+                sender=SimpleNamespace(
+                    sender_type=sender_payload.get("sender_type"),
+                    tenant_key=sender_payload.get("tenant_key"),
+                    sender_id=SimpleNamespace(
+                        open_id=sender_id_payload.get("open_id"),
+                    ),
+                ),
+            ),
+        ),
+    )
+    return event
+
+
 class _FakeFeishuClient:
     def __init__(self) -> None:
         self.sent_messages: list[tuple[str, str]] = []
+        self.reply_messages: list[tuple[str, str]] = []
 
-    def send_text_message(
+    async def send_text_message(
         self,
         *,
         chat_id: str,
         text: str,
         environment: FeishuEnvironment | None = None,
-    ) -> None:
+    ) -> str:
         _ = environment
         self.sent_messages.append((chat_id, text))
+        return f"om_{len(self.sent_messages)}"
+
+    async def reply_text_message(
+        self,
+        *,
+        message_id: str,
+        text: str,
+        environment: FeishuEnvironment | None = None,
+    ) -> str:
+        _ = environment
+        self.reply_messages.append((message_id, text))
+        return f"om_reply_{len(self.reply_messages)}"
 
 
 class _FakeImToolService:
     def __init__(self, feishu_client: _FakeFeishuClient) -> None:
         self._feishu_client = feishu_client
 
-    def send_text_to_feishu_chat(
+    async def send_text_to_feishu_chat(
         self,
         *,
         chat_id: str,
         text: str,
         environment: FeishuEnvironment | None = None,
+        reply_to_message_id: str | None = None,
     ) -> None:
-        self._feishu_client.send_text_message(
+        normalized_reply_to_message_id = str(reply_to_message_id or "").strip()
+        if normalized_reply_to_message_id:
+            await self._feishu_client.reply_text_message(
+                message_id=normalized_reply_to_message_id,
+                text=text,
+                environment=environment,
+            )
+            return
+        await self._feishu_client.send_text_message(
             chat_id=chat_id,
             text=text,
             environment=environment,
@@ -161,6 +228,10 @@ class _FakeImToolService:
 class _FakeMessagePoolService:
     def __init__(self) -> None:
         self.enqueued: list[FeishuNormalizedMessage] = []
+        self.answered: list[FeishuNormalizedMessage] = []
+        self.consumed_answers: list[tuple[FeishuNormalizedMessage, str]] = []
+        self.known_messages: set[str] = set()
+        self.answer_result = UserQuestionAnswerStatus.NOT_PENDING
         self.chat_summary = FeishuChatQueueSummary(
             trigger_id="trg_feishu",
             tenant_key="tenant-1",
@@ -192,6 +263,36 @@ class _FakeMessagePoolService:
             trigger_name="feishu_main",
             event_id=normalized.event_id,
         )
+
+    def answer_pending_user_question(
+        self,
+        *,
+        runtime_config: FeishuTriggerRuntimeConfig,
+        normalized: FeishuNormalizedMessage,
+    ) -> UserQuestionAnswerStatus:
+        _ = runtime_config
+        self.answered.append(normalized)
+        return self.answer_result
+
+    def has_message_record(
+        self,
+        *,
+        runtime_config: FeishuTriggerRuntimeConfig,
+        normalized: FeishuNormalizedMessage,
+    ) -> bool:
+        _ = runtime_config
+        return normalized.message_id in self.known_messages
+
+    def record_consumed_user_question_answer(
+        self,
+        *,
+        runtime_config: FeishuTriggerRuntimeConfig,
+        normalized: FeishuNormalizedMessage,
+        reason: str,
+    ) -> None:
+        _ = runtime_config
+        self.known_messages.add(normalized.message_id)
+        self.consumed_answers.append((normalized, reason))
 
     def get_chat_summary(
         self,
@@ -265,7 +366,7 @@ def _build_handler(
     im_tool_service = _FakeImToolService(feishu_client)
     im_session_command_service = ImSessionCommandService(
         session_service=cast(SessionService, session_service),
-        run_service=cast(RunManager, _FakeRunService()),
+        run_service=cast(SessionRunService, _FakeRunService()),
         external_session_binding_repo=bindings,
         gateway_session_service=cast(
             GatewaySessionService,
@@ -274,7 +375,9 @@ def _build_handler(
         feishu_message_pool_service=message_pool_service,
     )
     handler = FeishuTriggerHandler(
-        runtime_config_lookup=_FakeRuntimeConfigLookup(runtime_config or _build_runtime()),
+        runtime_config_lookup=_FakeRuntimeConfigLookup(
+            runtime_config or _build_runtime()
+        ),
         message_pool_service=message_pool_service,
         im_tool_service=cast(ImToolService, im_tool_service),
         im_session_command_service=im_session_command_service,
@@ -282,7 +385,24 @@ def _build_handler(
     return handler, session_service, message_pool_service, bindings, feishu_client
 
 
-def _build_event(*, message_id: str, chat_id: str, event_id: str, text: str) -> str:
+def _build_event(
+    *,
+    message_id: str,
+    chat_id: str,
+    event_id: str,
+    text: str,
+    chat_type: str = "p2p",
+    mention_names: tuple[str, ...] = (),
+) -> str:
+    message: dict[str, object] = {
+        "message_id": message_id,
+        "chat_id": chat_id,
+        "chat_type": chat_type,
+        "message_type": "text",
+        "content": json.dumps({"text": text}),
+    }
+    if mention_names:
+        message["mentions"] = [{"name": name} for name in mention_names]
     return json.dumps(
         {
             "schema": "2.0",
@@ -293,13 +413,7 @@ def _build_event(*, message_id: str, chat_id: str, event_id: str, text: str) -> 
             },
             "event": {
                 "sender": {"sender_id": {"open_id": "ou_user"}, "sender_type": "user"},
-                "message": {
-                    "message_id": message_id,
-                    "chat_id": chat_id,
-                    "chat_type": "p2p",
-                    "message_type": "text",
-                    "content": json.dumps({"text": text}),
-                },
+                "message": message,
             },
         }
     )
@@ -318,7 +432,7 @@ def test_handle_sdk_event_enqueues_normal_message(tmp_path: Path) -> None:
 
     result = handler.handle_sdk_event(
         trigger_id="trg_feishu",
-        event=P2ImMessageReceiveV1(json.loads(raw_body)),
+        event=_build_sdk_event(raw_body),
         raw_body=raw_body,
         headers={"x-test": "1"},
         remote_addr="127.0.0.1",
@@ -343,7 +457,7 @@ def test_help_command_returns_help_and_skips_enqueue(tmp_path: Path) -> None:
 
     result = handler.handle_sdk_event(
         trigger_id="trg_feishu",
-        event=P2ImMessageReceiveV1(json.loads(raw_body)),
+        event=_build_sdk_event(raw_body),
         raw_body=raw_body,
         headers={},
         remote_addr=None,
@@ -356,6 +470,217 @@ def test_help_command_returns_help_and_skips_enqueue(tmp_path: Path) -> None:
     assert "help" in text
     assert "status" in text
     assert "clear" in text
+
+
+def test_group_command_requires_mention_under_mention_only(tmp_path: Path) -> None:
+    handler, _session_service, message_pool_service, _bindings, feishu_client = (
+        _build_handler(tmp_path=tmp_path)
+    )
+    raw_body = _build_event(
+        message_id="om_help_group",
+        chat_id="oc_group_help",
+        event_id="evt-help-group",
+        text="help",
+        chat_type="group",
+    )
+
+    result = handler.handle_sdk_event(
+        trigger_id="trg_feishu",
+        event=_build_sdk_event(raw_body),
+        raw_body=raw_body,
+        headers={},
+        remote_addr=None,
+    )
+
+    assert result.status == "ignored"
+    assert result.reason == "mention_required"
+    assert message_pool_service.enqueued == []
+    assert feishu_client.sent_messages == []
+    assert feishu_client.reply_messages == []
+
+
+def test_pending_question_answer_bypasses_group_mention_requirement(
+    tmp_path: Path,
+) -> None:
+    handler, _session_service, message_pool_service, _bindings, feishu_client = (
+        _build_handler(tmp_path=tmp_path)
+    )
+    message_pool_service.answer_result = UserQuestionAnswerStatus.ANSWERED
+    raw_body = _build_event(
+        message_id="om_answer_group",
+        chat_id="oc_group_answer",
+        event_id="evt-answer-group",
+        text="Ship",
+        chat_type="group",
+    )
+
+    result = handler.handle_sdk_event(
+        trigger_id="trg_feishu",
+        event=_build_sdk_event(raw_body),
+        raw_body=raw_body,
+        headers={},
+        remote_addr=None,
+    )
+
+    assert result.status == "answered"
+    assert result.reason == "user_question_answer"
+    assert message_pool_service.enqueued == []
+    assert len(message_pool_service.answered) == 1
+    assert message_pool_service.consumed_answers[0][1] == "user_question_answer"
+    assert message_pool_service.answered[0].trigger_text == "Ship"
+    assert feishu_client.sent_messages == []
+    assert len(feishu_client.reply_messages) == 1
+    assert feishu_client.reply_messages[0][0] == "om_answer_group"
+    assert "已收到回答" in feishu_client.reply_messages[0][1]
+
+
+def test_pending_question_answer_bypasses_command_handling(tmp_path: Path) -> None:
+    handler, _session_service, message_pool_service, _bindings, feishu_client = (
+        _build_handler(tmp_path=tmp_path)
+    )
+    message_pool_service.answer_result = UserQuestionAnswerStatus.ANSWERED
+    raw_body = _build_event(
+        message_id="om_answer_help",
+        chat_id="oc_cmd",
+        event_id="evt-answer-help",
+        text="help",
+    )
+
+    result = handler.handle_sdk_event(
+        trigger_id="trg_feishu",
+        event=_build_sdk_event(raw_body),
+        raw_body=raw_body,
+        headers={},
+        remote_addr=None,
+    )
+
+    assert result.status == "answered"
+    assert message_pool_service.enqueued == []
+    assert len(message_pool_service.answered) == 1
+    assert len(feishu_client.sent_messages) == 1
+    assert "help" not in feishu_client.sent_messages[0][1]
+    assert "已收到回答" in feishu_client.sent_messages[0][1]
+
+
+def test_duplicate_answer_event_is_consumed_before_command_handling(
+    tmp_path: Path,
+) -> None:
+    handler, _session_service, message_pool_service, _bindings, feishu_client = (
+        _build_handler(
+            tmp_path=tmp_path,
+            runtime_config=_build_runtime(trigger_rule="all_messages"),
+        )
+    )
+    message_pool_service.known_messages.add("om_answer_help")
+    message_pool_service.answer_result = UserQuestionAnswerStatus.ANSWERED
+    raw_body = _build_event(
+        message_id="om_answer_help",
+        chat_id="oc_cmd",
+        event_id="evt-answer-help-redelivery",
+        text="help",
+        chat_type="p2p",
+    )
+
+    result = handler.handle_sdk_event(
+        trigger_id="trg_feishu",
+        event=_build_sdk_event(raw_body),
+        raw_body=raw_body,
+        headers={},
+        remote_addr=None,
+    )
+
+    assert result.duplicate is True
+    assert message_pool_service.answered == []
+    assert message_pool_service.enqueued == []
+    assert feishu_client.sent_messages == []
+    assert feishu_client.reply_messages == []
+
+
+def test_group_help_command_replies_when_mentioned(tmp_path: Path) -> None:
+    handler, _session_service, message_pool_service, _bindings, feishu_client = (
+        _build_handler(tmp_path=tmp_path)
+    )
+    raw_body = _build_event(
+        message_id="om_help_group",
+        chat_id="oc_group_help",
+        event_id="evt-help-group",
+        text='<at user_id="ou_bot">Agent Teams Bot</at> help',
+        chat_type="group",
+        mention_names=("Agent Teams Bot",),
+    )
+
+    result = handler.handle_sdk_event(
+        trigger_id="trg_feishu",
+        event=_build_sdk_event(raw_body),
+        raw_body=raw_body,
+        headers={},
+        remote_addr=None,
+    )
+
+    assert result.status == "command"
+    assert message_pool_service.enqueued == []
+    assert feishu_client.sent_messages == []
+    assert len(feishu_client.reply_messages) == 1
+    assert feishu_client.reply_messages[0][0] == "om_help_group"
+    assert "help" in feishu_client.reply_messages[0][1]
+
+
+@pytest.mark.asyncio
+async def test_group_help_command_replies_when_event_loop_is_running(
+    tmp_path: Path,
+) -> None:
+    handler, _session_service, message_pool_service, _bindings, feishu_client = (
+        _build_handler(tmp_path=tmp_path)
+    )
+    raw_body = _build_event(
+        message_id="om_help_group",
+        chat_id="oc_group_help",
+        event_id="evt-help-group",
+        text='<at user_id="ou_bot">Agent Teams Bot</at> help',
+        chat_type="group",
+        mention_names=("Agent Teams Bot",),
+    )
+
+    result = handler.handle_sdk_event(
+        trigger_id="trg_feishu",
+        event=_build_sdk_event(raw_body),
+        raw_body=raw_body,
+        headers={},
+        remote_addr=None,
+    )
+    await asyncio.sleep(0)
+
+    assert result.status == "command"
+    assert message_pool_service.enqueued == []
+    assert feishu_client.reply_messages[0][0] == "om_help_group"
+
+
+def test_group_command_ignores_other_bot_mentions(tmp_path: Path) -> None:
+    handler, _session_service, message_pool_service, _bindings, feishu_client = (
+        _build_handler(tmp_path=tmp_path)
+    )
+    raw_body = _build_event(
+        message_id="om_help_other",
+        chat_id="oc_group_help",
+        event_id="evt-help-other",
+        text='<at user_id="ou_other">Other Bot</at> help',
+        chat_type="group",
+        mention_names=("Other Bot",),
+    )
+
+    result = handler.handle_sdk_event(
+        trigger_id="trg_feishu",
+        event=_build_sdk_event(raw_body),
+        raw_body=raw_body,
+        headers={},
+        remote_addr=None,
+    )
+
+    assert result.status == "ignored"
+    assert result.reason == "mention_not_for_app"
+    assert message_pool_service.enqueued == []
+    assert feishu_client.sent_messages == []
+    assert feishu_client.reply_messages == []
 
 
 def test_status_and_clear_commands_include_queue_state(tmp_path: Path) -> None:
@@ -438,14 +763,14 @@ def test_status_and_clear_commands_include_queue_state(tmp_path: Path) -> None:
 
     status_result = handler.handle_sdk_event(
         trigger_id="trg_feishu",
-        event=P2ImMessageReceiveV1(json.loads(status_body)),
+        event=_build_sdk_event(status_body),
         raw_body=status_body,
         headers={},
         remote_addr=None,
     )
     clear_result = handler.handle_sdk_event(
         trigger_id="trg_feishu",
-        event=P2ImMessageReceiveV1(json.loads(clear_body)),
+        event=_build_sdk_event(clear_body),
         raw_body=clear_body,
         headers={},
         remote_addr=None,
@@ -478,7 +803,7 @@ def test_missing_runtime_config_ignores_event(tmp_path: Path) -> None:
 
     result = handler.handle_sdk_event(
         trigger_id="missing",
-        event=P2ImMessageReceiveV1(json.loads(raw_body)),
+        event=_build_sdk_event(raw_body),
         raw_body=raw_body,
         headers={},
         remote_addr=None,

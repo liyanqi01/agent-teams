@@ -1,0 +1,2123 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Awaitable, Callable, Mapping
+import logging
+from pathlib import Path
+import sqlite3
+from typing import Protocol
+
+from relay_teams.agents.execution.prompt_instructions import PromptInstructionResolver
+from relay_teams.audit import AuditEventRepository, AuditService
+from relay_teams.automation.automation_bound_session_queue_repository import (
+    AutomationBoundSessionQueueRepository,
+)
+from relay_teams.automation.automation_bound_session_queue_service import (
+    AutomationBoundSessionQueueService,
+    AutomationBoundSessionQueueWorker,
+)
+from relay_teams.automation.automation_delivery_repository import (
+    AutomationDeliveryRepository,
+)
+from relay_teams.automation.automation_delivery_service import (
+    AutomationDeliveryService,
+    AutomationDeliveryWorker,
+)
+from relay_teams.automation.automation_event_repository import (
+    AutomationEventRepository,
+)
+from relay_teams.automation.automation_repository import AutomationProjectRepository
+from relay_teams.automation.automation_service import AutomationService
+from relay_teams.automation.feishu_binding_service import (
+    AutomationFeishuBindingService,
+)
+from relay_teams.automation.scheduler_service import AutomationSchedulerService
+from relay_teams.automation.xiaoluban_binding_service import (
+    AutomationXiaolubanBindingService,
+)
+from relay_teams.binary_tools import BinaryToolService
+from relay_teams.builtin import (
+    ensure_app_config_bootstrap,
+    get_builtin_roles_dir,
+    get_builtin_skills_dir,
+)
+from relay_teams.boards import BoardTodoRepository, BoardTodoService
+from relay_teams.commands import CommandRegistry
+from relay_teams.connector import ConnectorService, W3ConnectorService
+from relay_teams.computer import build_default_computer_runtime
+from relay_teams.agents.orchestration.meta_agent import MetaAgent
+from relay_teams.agents.orchestration.settings_config_manager import (
+    OrchestrationSettingsConfigManager,
+)
+from relay_teams.agents.orchestration.settings_service import (
+    OrchestrationSettingsService,
+)
+from relay_teams.agents.orchestration.coordinator import CoordinatorGraph
+from relay_teams.agents.orchestration.delegation_planning import (
+    DelegationPlanningService,
+)
+from relay_teams.agents.orchestration.human_gate import GateManager
+from relay_teams.agents.orchestration.llm_semantic_evaluator import (
+    LlmSemanticEvaluator,
+)
+from relay_teams.agents.orchestration.task_orchestration_service import (
+    TaskOrchestrationService,
+)
+from relay_teams.agents.orchestration.task_execution_service import TaskExecutionService
+from relay_teams.env.app_env_watcher import AppEnvFileWatcher
+from relay_teams.env.clawhub_config_service import ClawHubConfigService
+from relay_teams.env.environment_variable_service import EnvironmentVariableService
+from relay_teams.env.github_config_service import GitHubConfigService
+from relay_teams.env.localhost_run_tunnel_service import LocalhostRunTunnelService
+from relay_teams.env.proxy_config_service import ProxyConfigService
+from relay_teams.env.proxy_env import ProxyEnvConfig, sync_proxy_env_to_process_env
+from relay_teams.env.runtime_env import sync_app_env_to_process_env
+from relay_teams.env.web_config_service import WebConfigService
+from relay_teams.general import GeneralConfigService
+from relay_teams.agent_runtimes import (
+    AcpRegistryService,
+    ExternalAgentConfigService,
+    ExternalAgentSessionRepository,
+)
+from relay_teams.agent_runtimes.provider import AgentRuntimeSessionManager
+from relay_teams.agent_runtimes.test_job_service import AgentRuntimeTestJobService
+from relay_teams.gateway.feishu.account_repository import FeishuAccountRepository
+from relay_teams.gateway.feishu.client import FeishuClient
+from relay_teams.gateway.feishu.gateway_service import FeishuGatewayService
+from relay_teams.gateway.feishu.inbound_runtime import FeishuInboundRuntime
+from relay_teams.gateway.feishu.message_pool_repository import (
+    FeishuMessagePoolRepository,
+)
+from relay_teams.gateway.feishu.message_pool_service import FeishuMessagePoolService
+from relay_teams.gateway.feishu.notification_delivery import (
+    FeishuNotificationDispatcher,
+)
+from relay_teams.gateway.feishu.subscription_service import FeishuSubscriptionService
+from relay_teams.gateway.feishu.trigger_handler import FeishuTriggerHandler
+from relay_teams.gateway.feishu.notification_delivery import (
+    CompositeTerminalNotificationSuppressor,
+)
+from relay_teams.gateway.im.command_service import ImSessionCommandService
+from relay_teams.gateway.im.context import ImToolContextResolver
+from relay_teams.gateway.im.service import ImToolService
+from relay_teams.gateway.gateway_session_repository import GatewaySessionRepository
+from relay_teams.gateway.gateway_session_service import GatewaySessionService
+from relay_teams.gateway.session_ingress_service import GatewaySessionIngressService
+from relay_teams.gateway.discord import (
+    DiscordAccountRepository,
+    DiscordClient,
+    DiscordGatewayService,
+    DiscordInboundQueueRepository,
+    get_discord_secret_store,
+)
+from relay_teams.memory.repository import MemoryBankRepository
+from relay_teams.memory.service import MemoryBankService
+from relay_teams.memory.evolution_service import MemoryEvolutionService
+from relay_teams.memory.skill_draft_repository import MemorySkillDraftRepository
+from relay_teams.memory.skill_synthesis_service import MemorySkillSynthesisService
+from relay_teams.memory.event_handler import MemoryEventHandler
+from relay_teams.logger import get_logger, log_event
+from relay_teams.interfaces.server.config_status_service import ConfigStatusService
+from relay_teams.interfaces.server.async_call import (
+    call_maybe_async_in_session_projection_refresh_thread,
+)
+from relay_teams.interfaces.server.ui_language_service import UiLanguageSettingsService
+from relay_teams.mcp.mcp_config_manager import McpConfigManager
+from relay_teams.mcp.config_reload_service import McpConfigReloadService
+from relay_teams.mcp.mcp_config_watcher import McpConfigFileWatcher
+from relay_teams.mcp.mcp_discovery_service import McpDiscoveryService
+from relay_teams.mcp.mcp_registry import McpRegistry
+from relay_teams.mcp.mcp_service import McpService
+from relay_teams.mcp.runtime_schema_loader import RuntimeMcpSchemaLoader
+from relay_teams.metrics import (
+    AggregateStoreSink,
+    DEFAULT_DEFINITIONS,
+    GrafanaExporterSink,
+    MetricRecorder,
+    MetricRegistry,
+    MetricsQueryService,
+    MetricsService,
+    PrettyLogSink,
+    SqliteMetricAggregateStore,
+)
+from relay_teams.media import MediaAssetRepository, MediaAssetService
+from relay_teams.monitors import MonitorRepository, MonitorService
+from relay_teams.notifications import NotificationConfigManager, NotificationService
+from relay_teams.notifications.notification_settings_service import (
+    NotificationSettingsService,
+)
+from relay_teams.plugins import PluginRegistry
+from relay_teams.plugins.config_manager import PluginConfigManager
+from relay_teams.plugins.mcp_sources import load_plugin_mcp_specs
+from relay_teams.agents.execution.system_prompts import RuntimePromptBuilder
+from relay_teams.retrieval import RetrievalService, SqliteFts5RetrievalStore
+from relay_teams.providers.provider_contracts import LLMProvider, LLMRequest
+from relay_teams.providers.model_config_manager import ModelConfigManager
+from relay_teams.providers.model_config_service import ModelConfigService
+from relay_teams.providers.model_config import ModelEndpointConfig
+from relay_teams.providers.model_catalog import ModelCatalogService
+from relay_teams.providers.model_fallback_config_manager import (
+    ModelFallbackConfigManager,
+)
+from relay_teams.net import (
+    clear_llm_http_client_cache,
+    clear_llm_http_client_cache_async,
+)
+from relay_teams.net.clawhub_connectivity import ClawHubConnectivityProbeService
+from relay_teams.net.github_connectivity import (
+    GitHubConnectivityProbeService,
+    GitHubWebhookConnectivityProbeService,
+)
+from relay_teams.net.web_connectivity import WebConnectivityProbeService
+from relay_teams.providers.provider_factory import (
+    apply_default_model_profile_override,
+    create_provider_factory,
+    resolve_model_profile_config,
+    resolve_model_profile_name,
+)
+from relay_teams.agents.orchestration.task_execution_service_factory import (
+    create_task_execution_service,
+)
+from relay_teams.roles.role_models import RoleDefinition
+from relay_teams.roles import (
+    RoleLoader,
+    RoleRegistry,
+    RuntimeRoleResolver,
+    TemporaryRoleRepository,
+)
+from relay_teams.roles.settings_service import RoleSettingsService
+from relay_teams.sessions.runs.active_run_registry import ActiveSessionRunRegistry
+from relay_teams.sessions.runs.run_control_manager import RunControlManager
+from relay_teams.sessions.runs.event_stream import RunEventHub
+from relay_teams.sessions.runs.injection_queue import RunInjectionManager
+from relay_teams.sessions.runs.run_service import SessionRunService
+from relay_teams.sessions.runs.runtime_config import RuntimeConfig, load_runtime_config
+from relay_teams.speech import RealtimeSttProxyService, SpeechConfigService
+from relay_teams.sessions.external_session_binding_repository import (
+    ExternalSessionBindingRepository,
+)
+from relay_teams.sessions.session_history_marker_repository import (
+    SessionHistoryMarkerRepository,
+)
+from relay_teams.sessions.session_service import SessionService
+from relay_teams.skills.config_reload_service import SkillsConfigReloadService
+from relay_teams.skills.clawhub_skill_service import ClawHubSkillService
+from relay_teams.skills.skill_market_service import ClawHubSkillMarketService
+from relay_teams.skills.skill_registry import SkillRegistry
+from relay_teams.skills.skill_routing_service import SkillRuntimeService
+from relay_teams.agent_runtimes.instances.instance_repository import (
+    AgentInstanceRepository,
+)
+from relay_teams.tools.runtime.approval_ticket_repo import ApprovalTicketRepository
+from relay_teams.sessions.runs.event_log import EventLog
+from relay_teams.agents.execution.message_repository import MessageRepository
+from relay_teams.sessions.runs.background_tasks.manager import (
+    BackgroundTaskManager,
+)
+from relay_teams.sessions.runs.background_tasks.command_runtime import (
+    kill_process_tree_by_pid,
+)
+from relay_teams.sessions.runs.background_tasks.models import BackgroundTaskKind
+from relay_teams.sessions.runs.background_tasks.repository import (
+    BackgroundTaskRepository,
+)
+from relay_teams.sessions.runs.background_tasks.service import BackgroundTaskService
+from relay_teams.sessions.runs.run_intent_repo import RunIntentRepository
+from relay_teams.sessions.runs.run_runtime_repo import RunRuntimeRepository
+from relay_teams.sessions.runs.run_state_repo import RunStateRepository
+from relay_teams.sessions.runs.user_question_manager import UserQuestionManager
+from relay_teams.sessions.runs.user_question_repository import UserQuestionRepository
+from relay_teams.sessions.runs.todo_repository import TodoRepository
+from relay_teams.sessions.runs.todo_service import TodoService
+from relay_teams.sessions.runs.system_injection import SystemInjectionSink
+from relay_teams.sessions.session_repository import SessionRepository
+from relay_teams.persistence.shared_state_repo import SharedStateRepository
+from relay_teams.reminders import ReminderStateRepository
+from relay_teams.reminders.service import SystemReminderService
+from relay_teams.agents.tasks.artifact_repository import TaskArtifactRepository
+from relay_teams.agents.tasks.task_repository import TaskRepository
+from relay_teams.providers.token_usage_repo import TokenUsageRepository
+from relay_teams.tools.registry import ToolRegistry, ToolResolutionContext
+from relay_teams.tools.registry.defaults import build_default_registry
+from relay_teams.tools.generated_tools import AutoHarnessService
+from relay_teams.tools.runtime.approval_state import ToolApprovalManager
+from relay_teams.tools.runtime.policy import ToolApprovalPolicy
+from relay_teams.tools.workspace_tools.shell_approval_repo import (
+    ShellApprovalRepository,
+)
+from relay_teams.triggers import (
+    GitHubApiClient,
+    GitHubTriggerActionWorker,
+    GitHubTriggerService,
+    TriggerRepository,
+    get_github_trigger_secret_store,
+)
+from relay_teams.gateway.wechat.account_repository import WeChatAccountRepository
+from relay_teams.gateway.wechat.client import WeChatClient
+from relay_teams.gateway.wechat.inbound_queue_repository import (
+    WeChatInboundQueueRepository,
+)
+from relay_teams.gateway.wechat.secret_store import get_wechat_secret_store
+from relay_teams.gateway.wechat.service import WeChatGatewayService
+from relay_teams.gateway.xiaoluban import (
+    CompositeXiaolubanTerminalNotificationSuppressor,
+    XiaolubanAccountRepository,
+    XiaolubanClient,
+    XiaolubanGatewayService,
+    XiaolubanImListenerService,
+    XiaolubanNotificationDispatcher,
+    get_xiaoluban_secret_store,
+)
+from relay_teams.hooks import HookLoader, HookRuntimeState, HookService
+from relay_teams.hooks.executors.agent_executor import AgentHookExecutor
+from relay_teams.hooks.executors.command_executor import CommandHookExecutor
+from relay_teams.hooks.executors.http_executor import HttpHookExecutor
+from relay_teams.hooks.executors.prompt_executor import PromptHookExecutor
+from relay_teams.workspace import (
+    SshProfileRepository,
+    SshProfileService,
+    WorkspaceManager,
+    WorkspaceRepository,
+    WorkspaceService,
+)
+
+
+LOGGER = get_logger(__name__)
+SYNC_SERVICE_START_TIMEOUT_SECONDS = 5.0
+
+
+class AsyncCloseableRepository(Protocol):
+    @staticmethod
+    async def close_async() -> None:
+        pass
+
+
+class ServerContainer:
+    def __init__(
+        self,
+        *,
+        config_dir: Path,
+        roles_dir: Path | None = None,
+        db_path: Path | None = None,
+        manage_runtime_state: bool = True,
+        session_model_profile_lookup: (Callable[[str], ModelEndpointConfig | None])
+        | None = None,
+    ) -> None:
+        runtime = load_runtime_config(
+            config_dir=config_dir,
+            roles_dir=roles_dir,
+            db_path=db_path,
+        )
+        app_config_dir = runtime.paths.config_dir
+        ensure_app_config_bootstrap(app_config_dir)
+        sync_app_env_to_process_env(runtime.paths.env_file)
+        self.config_dir: Path = app_config_dir
+        self.runtime: RuntimeConfig = runtime
+        self._project_start_dir = Path.cwd().resolve()
+        self._session_model_profile_lookup = session_model_profile_lookup
+        self.model_config_manager: ModelConfigManager = ModelConfigManager(
+            config_dir=app_config_dir
+        )
+        self.model_fallback_config_manager = ModelFallbackConfigManager(
+            config_dir=app_config_dir
+        )
+        self.notification_config_manager: NotificationConfigManager = (
+            NotificationConfigManager(config_dir=app_config_dir)
+        )
+        self.orchestration_settings_config_manager = OrchestrationSettingsConfigManager(
+            config_dir=app_config_dir
+        )
+        self.plugin_config_manager: PluginConfigManager = (
+            PluginConfigManager.from_environment(
+                app_config_dir=app_config_dir,
+                project_start_dir=self._project_start_dir,
+            )
+        )
+        self.plugin_registry: PluginRegistry = (
+            self.plugin_config_manager.load_registry()
+        )
+        self._plugin_mcp_specs = load_plugin_mcp_specs(
+            self.plugin_registry.mcp_sources()
+        )
+        self.proxy_config_service: ProxyConfigService = ProxyConfigService(
+            config_dir=app_config_dir,
+            on_proxy_reloaded=self._on_proxy_reloaded,
+        )
+        self.model_catalog_service = ModelCatalogService(
+            config_dir=app_config_dir,
+            get_proxy_config=self.proxy_config_service.get_proxy_config,
+        )
+        self.speech_config_service = SpeechConfigService(
+            config_dir=app_config_dir,
+            get_profiles=lambda: self.runtime.llm_profiles,
+        )
+        self.general_config_service = GeneralConfigService(config_dir=app_config_dir)
+        self.realtime_stt_proxy_service = RealtimeSttProxyService(
+            speech_config_service=self.speech_config_service,
+        )
+        self.hook_service = HookService(
+            loader=self._build_hook_loader(),
+            runtime_state=HookRuntimeState(),
+            command_executor=CommandHookExecutor(),
+            http_executor=HttpHookExecutor(
+                get_proxy_config=self.proxy_config_service.get_proxy_config
+            ),
+            prompt_executor=PromptHookExecutor(
+                resolve_model_config=self._resolve_hook_model_config,
+                retry_config=runtime.llm_retry,
+            ),
+        )
+        self.web_config_service: WebConfigService = WebConfigService(
+            config_dir=app_config_dir
+        )
+        self.github_config_service: GitHubConfigService = GitHubConfigService(
+            config_dir=app_config_dir,
+        )
+        self.acp_registry_service = AcpRegistryService(
+            config_dir=app_config_dir,
+            get_proxy_config=self.proxy_config_service.get_proxy_config,
+            get_github_token=lambda: (
+                self.github_config_service.get_github_config().token
+            ),
+        )
+        self.binary_tool_service: BinaryToolService = BinaryToolService(
+            config_dir=app_config_dir,
+            get_github_token=lambda: (
+                self.github_config_service.get_github_config().token
+            ),
+            resolve_latest_releases=True,
+        )
+        self.localhost_run_tunnel_service = LocalhostRunTunnelService()
+        self.clawhub_config_service: ClawHubConfigService = ClawHubConfigService(
+            config_dir=app_config_dir
+        )
+        self.web_connectivity_probe_service = WebConnectivityProbeService(
+            get_proxy_config=self.proxy_config_service.get_proxy_config,
+        )
+        self.github_connectivity_probe_service = GitHubConnectivityProbeService(
+            get_github_config=self.github_config_service.get_github_config,
+            get_proxy_config=self.proxy_config_service.get_proxy_config,
+        )
+        self.github_webhook_connectivity_probe_service = (
+            GitHubWebhookConnectivityProbeService(
+                get_github_config=self.github_config_service.get_github_config,
+                get_proxy_config=self.proxy_config_service.get_proxy_config,
+            )
+        )
+        self.clawhub_connectivity_probe_service = ClawHubConnectivityProbeService(
+            config_dir=app_config_dir,
+            get_clawhub_config=self.clawhub_config_service.get_clawhub_config,
+            binary_tool_service=self.binary_tool_service,
+        )
+        self.ui_language_settings_service = UiLanguageSettingsService(
+            config_dir=app_config_dir
+        )
+        self.external_agent_config_service = ExternalAgentConfigService(
+            config_dir=app_config_dir,
+            registry_service=self.acp_registry_service,
+        )
+        self.environment_variable_service: EnvironmentVariableService = (
+            EnvironmentVariableService(
+                app_env_file_path=runtime.paths.env_file,
+                on_app_env_changed=self._on_app_environment_saved,
+            )
+        )
+        self.app_env_file_watcher: AppEnvFileWatcher = AppEnvFileWatcher(
+            env_file_path=runtime.paths.env_file,
+            on_changed=self._on_app_environment_changed,
+        )
+        self.mcp_config_manager: McpConfigManager = McpConfigManager(
+            app_config_dir=app_config_dir
+        )
+        self.mcp_config_file_watcher: McpConfigFileWatcher = McpConfigFileWatcher(
+            config_path=self.mcp_config_manager.config_file_path(),
+            on_changed=self._reload_mcp_config_after_file_change,
+        )
+        self.tool_registry: ToolRegistry = build_default_registry()
+        self.auto_harness_service = AutoHarnessService(
+            config_dir=app_config_dir,
+            roles_dir=runtime.paths.roles_dir,
+            builtin_roles_dir=get_builtin_roles_dir(),
+            tool_registry=self.tool_registry,
+            get_role_registry=lambda: self.role_registry,
+            resolve_model_config=self._resolve_autoharness_model_config,
+            on_roles_reloaded=self._on_roles_reloaded,
+            resolve_role_instance_id=lambda session_id, role_id: (
+                self.agent_repo.get_session_role_instance_id(session_id, role_id)
+            ),
+            retry_config=runtime.llm_retry,
+        )
+        self.auto_harness_service.register_enabled_tools()
+        self.mcp_registry: McpRegistry = self.mcp_config_manager.load_registry(
+            extra_specs=self._plugin_mcp_specs
+        )
+        self.mcp_discovery_service: McpDiscoveryService = McpDiscoveryService(
+            self.mcp_registry
+        )
+        self.runtime_mcp_schema_loader = RuntimeMcpSchemaLoader(self.mcp_registry)
+        self.mcp_service: McpService = McpService(
+            registry=self.mcp_registry,
+            config_manager=self.mcp_config_manager,
+            on_registry_changed=self.replace_mcp_registry,
+            extra_specs=self._plugin_mcp_specs,
+            discovery_service=self.mcp_discovery_service,
+            runtime_schema_loader=self.runtime_mcp_schema_loader,
+        )
+        self.command_registry: CommandRegistry = CommandRegistry(
+            app_config_dir=app_config_dir,
+            plugin_sources=self.plugin_registry.command_sources(),
+        )
+        self.skill_registry: SkillRegistry = SkillRegistry.from_config_dirs(
+            app_config_dir=app_config_dir,
+            project_start_dir=self._project_start_dir,
+            plugin_sources=self.plugin_registry.skill_sources(),
+        )
+        self.role_registry = self._sanitize_role_registry(
+            RoleLoader().load_builtin_app_and_plugins(
+                builtin_roles_dir=get_builtin_roles_dir(),
+                app_roles_dir=runtime.paths.roles_dir,
+                plugin_sources=self.plugin_registry.role_sources(),
+                allow_empty=True,
+            )
+        )
+
+        self.task_repo: TaskRepository = TaskRepository(runtime.paths.db_path)
+        self.artifact_repo: TaskArtifactRepository = TaskArtifactRepository(
+            runtime.paths.db_path
+        )
+        self.audit_repository: AuditEventRepository = AuditEventRepository(
+            runtime.paths.db_path
+        )
+        self.audit_service: AuditService = AuditService(self.audit_repository)
+        self.shared_store: SharedStateRepository = SharedStateRepository(
+            runtime.paths.db_path
+        )
+        self.workspace_repo: WorkspaceRepository = WorkspaceRepository(
+            runtime.paths.db_path
+        )
+        self.ssh_profile_repo: SshProfileRepository = SshProfileRepository(
+            runtime.paths.db_path
+        )
+        self.ssh_profile_service: SshProfileService = SshProfileService(
+            repository=self.ssh_profile_repo,
+            config_dir=app_config_dir,
+        )
+        self.workspace_service: WorkspaceService = WorkspaceService(
+            repository=self.workspace_repo,
+            ssh_profile_service=self.ssh_profile_service,
+        )
+        self.workspace_manager: WorkspaceManager = WorkspaceManager(
+            project_root=Path.cwd(),
+            app_config_dir=app_config_dir,
+            workspace_repo=self.workspace_repo,
+            ssh_profile_service=self.ssh_profile_service,
+            builtin_skills_dir=get_builtin_skills_dir(),
+            app_skills_dir=app_config_dir / "skills",
+        )
+        self.agent_runtime_test_job_service = AgentRuntimeTestJobService(
+            config_service=self.external_agent_config_service,
+            workspace_manager=self.workspace_manager,
+        )
+        self.media_asset_repo: MediaAssetRepository = MediaAssetRepository(
+            runtime.paths.db_path
+        )
+        self.media_asset_service: MediaAssetService = MediaAssetService(
+            repository=self.media_asset_repo,
+            workspace_manager=self.workspace_manager,
+        )
+        self.computer_runtime = build_default_computer_runtime(project_root=Path.cwd())
+        self.event_log: EventLog = EventLog(runtime.paths.db_path)
+        self.agent_repo: AgentInstanceRepository = AgentInstanceRepository(
+            runtime.paths.db_path
+        )
+        self.session_history_marker_repo: SessionHistoryMarkerRepository = (
+            SessionHistoryMarkerRepository(runtime.paths.db_path)
+        )
+        self.message_repo: MessageRepository = MessageRepository(
+            runtime.paths.db_path,
+            session_history_marker_repo=self.session_history_marker_repo,
+        )
+        self.approval_ticket_repo: ApprovalTicketRepository = ApprovalTicketRepository(
+            runtime.paths.db_path
+        )
+        self.user_question_repo: UserQuestionRepository = UserQuestionRepository(
+            runtime.paths.db_path
+        )
+        self.shell_approval_repo: ShellApprovalRepository = ShellApprovalRepository(
+            runtime.paths.db_path
+        )
+        self.run_runtime_repo: RunRuntimeRepository = RunRuntimeRepository(
+            runtime.paths.db_path
+        )
+        self.run_intent_repo: RunIntentRepository = RunIntentRepository(
+            runtime.paths.db_path
+        )
+        self.background_task_repository: BackgroundTaskRepository = (
+            BackgroundTaskRepository(runtime.paths.db_path)
+        )
+        self.todo_repository: TodoRepository = TodoRepository(runtime.paths.db_path)
+        self.board_todo_repository: BoardTodoRepository = BoardTodoRepository(
+            runtime.paths.db_path
+        )
+        self.run_state_repo: RunStateRepository = RunStateRepository(
+            runtime.paths.db_path
+        )
+        self.trigger_repository = TriggerRepository(runtime.paths.db_path)
+        self.session_repo: SessionRepository = SessionRepository(runtime.paths.db_path)
+        self.external_session_binding_repo: ExternalSessionBindingRepository = (
+            ExternalSessionBindingRepository(runtime.paths.db_path)
+        )
+        self.external_agent_session_repo = ExternalAgentSessionRepository(
+            runtime.paths.db_path
+        )
+        self.gateway_session_repository = GatewaySessionRepository(
+            runtime.paths.db_path
+        )
+        self.orchestration_settings_service: OrchestrationSettingsService = (
+            OrchestrationSettingsService(
+                config_manager=self.orchestration_settings_config_manager,
+                session_repo=self.session_repo,
+                get_role_registry=lambda: self.role_registry,
+                get_plugin_registry=lambda: self.plugin_registry,
+            )
+        )
+        self.token_usage_repo: TokenUsageRepository = TokenUsageRepository(
+            runtime.paths.db_path,
+            session_history_marker_repo=self.session_history_marker_repo,
+        )
+        self.metric_registry: MetricRegistry = MetricRegistry(DEFAULT_DEFINITIONS)
+        self.metrics_store: SqliteMetricAggregateStore = SqliteMetricAggregateStore(
+            runtime.paths.db_path
+        )
+        self.metric_recorder: MetricRecorder = MetricRecorder(
+            registry=self.metric_registry,
+            sinks=(
+                AggregateStoreSink(self.metrics_store),
+                PrettyLogSink(),
+                GrafanaExporterSink(),
+            ),
+        )
+        self.retrieval_store = SqliteFts5RetrievalStore(runtime.paths.db_path)
+        self.retrieval_service = RetrievalService(
+            store=self.retrieval_store,
+            metric_recorder=self.metric_recorder,
+        )
+        self.skill_runtime_service = self._build_skill_runtime_service(
+            skill_registry=self.skill_registry
+        )
+        self.metrics_query_service: MetricsQueryService = MetricsQueryService(
+            store=self.metrics_store
+        )
+        self.metrics_service: MetricsService = MetricsService(
+            query_service=self.metrics_query_service
+        )
+        self.feishu_message_pool_repo: FeishuMessagePoolRepository = (
+            FeishuMessagePoolRepository(runtime.paths.db_path)
+        )
+        self.feishu_account_repository = FeishuAccountRepository(runtime.paths.db_path)
+        self.automation_repo: AutomationProjectRepository = AutomationProjectRepository(
+            runtime.paths.db_path
+        )
+        self.automation_event_repo = AutomationEventRepository(runtime.paths.db_path)
+        self.automation_delivery_repo: AutomationDeliveryRepository = (
+            AutomationDeliveryRepository(runtime.paths.db_path)
+        )
+        self.automation_bound_session_queue_repo: AutomationBoundSessionQueueRepository = AutomationBoundSessionQueueRepository(
+            runtime.paths.db_path
+        )
+        self.memory_bank_repo: MemoryBankRepository = MemoryBankRepository(
+            runtime.paths.db_path
+        )
+        self.memory_skill_draft_repo: MemorySkillDraftRepository = (
+            MemorySkillDraftRepository(runtime.paths.db_path)
+        )
+        self.memory_bank_service: MemoryBankService = MemoryBankService(
+            repository=self.memory_bank_repo,
+            retrieval_service=self.retrieval_service,
+            llm_provider_resolver=self._resolve_memory_consolidation_provider,
+            message_repo=self.message_repo,
+            event_log=self.event_log,
+        )
+        self.memory_event_handler = MemoryEventHandler(
+            memory_bank_service=self.memory_bank_service,
+        )
+        self.temporary_role_repo: TemporaryRoleRepository = TemporaryRoleRepository(
+            runtime.paths.db_path
+        )
+        self.runtime_role_resolver: RuntimeRoleResolver = RuntimeRoleResolver(
+            role_registry=self.role_registry,
+            temporary_role_repository=self.temporary_role_repo,
+        )
+        self._ensure_default_workspace()
+
+        if manage_runtime_state:
+            self.agent_repo.mark_running_instances_failed()
+            _ = self.run_runtime_repo.mark_transient_runs_interrupted()
+            self._interrupt_transient_background_tasks()
+        self.injection_manager: RunInjectionManager = RunInjectionManager()
+        self.hook_service.set_injection_manager(self.injection_manager)
+        self.run_control_manager: RunControlManager = RunControlManager()
+        self.active_run_registry: ActiveSessionRunRegistry = ActiveSessionRunRegistry(
+            run_runtime_repo=self.run_runtime_repo
+        )
+        self.run_event_hub: RunEventHub = RunEventHub(
+            event_log=self.event_log,
+            run_state_repo=self.run_state_repo,
+        )
+        self.monitor_repository = MonitorRepository(runtime.paths.db_path)
+        self.monitor_service = MonitorService(
+            repository=self.monitor_repository,
+            run_event_hub=self.run_event_hub,
+        )
+        self.background_task_manager = BackgroundTaskManager(
+            repository=self.background_task_repository,
+            run_event_hub=self.run_event_hub,
+            monitor_service=self.monitor_service,
+            ssh_profile_service=self.ssh_profile_service,
+        )
+        self.background_task_service = BackgroundTaskService(
+            background_task_manager=self.background_task_manager,
+            repository=self.background_task_repository,
+            run_event_hub=self.run_event_hub,
+            hook_service=self.hook_service,
+        )
+        self.hook_service.set_agent_executor(
+            AgentHookExecutor(
+                background_task_service=self.background_task_service,
+                session_repo=self.session_repo,
+            )
+        )
+        self.todo_service = TodoService(
+            repository=self.todo_repository,
+            run_event_hub=self.run_event_hub,
+        )
+        self.system_injection_sink = SystemInjectionSink(
+            injection_manager=self.injection_manager,
+            run_event_hub=self.run_event_hub,
+            message_repo=self.message_repo,
+        )
+        self.reminder_state_repository = ReminderStateRepository(self.shared_store)
+        self.reminder_service = SystemReminderService(
+            state_repository=self.reminder_state_repository,
+            injection_sink=self.system_injection_sink,
+        )
+        self.feishu_client = FeishuClient()
+        self.xiaoluban_account_repository = XiaolubanAccountRepository(
+            runtime.paths.db_path
+        )
+        self.discord_account_repository = DiscordAccountRepository(
+            runtime.paths.db_path
+        )
+        self.discord_inbound_queue_repo = DiscordInboundQueueRepository(
+            runtime.paths.db_path
+        )
+        self.wechat_account_repository = WeChatAccountRepository(runtime.paths.db_path)
+        self.wechat_inbound_queue_repo = WeChatInboundQueueRepository(
+            runtime.paths.db_path
+        )
+        self.xiaoluban_client = XiaolubanClient()
+        self.discord_client = DiscordClient()
+        self.wechat_client = WeChatClient()
+        self.github_trigger_secret_store = get_github_trigger_secret_store()
+        self.github_api_client = GitHubApiClient(
+            get_proxy_config=self.proxy_config_service.get_proxy_config
+        )
+        self.feishu_gateway_service = FeishuGatewayService(
+            config_dir=app_config_dir,
+            repository=self.feishu_account_repository,
+            secret_store=None,
+            role_registry=self.role_registry,
+            orchestration_settings_service=self.orchestration_settings_service,
+            workspace_service=self.workspace_service,
+            external_session_binding_repo=self.external_session_binding_repo,
+        )
+        self.im_tool_service: ImToolService = ImToolService(
+            config_dir=app_config_dir,
+            session_repo=self.session_repo,
+            runtime_config_lookup=self.feishu_gateway_service,
+            automation_project_repo=self.automation_repo,
+            automation_delivery_lookup=self.automation_delivery_repo,
+            gateway_session_lookup=self.gateway_session_repository,
+            feishu_client=self.feishu_client,
+            wechat_account_repo=self.wechat_account_repository,
+            wechat_secret_store=get_wechat_secret_store(),
+            wechat_client=self.wechat_client,
+            discord_account_repo=self.discord_account_repository,
+            discord_secret_store=get_discord_secret_store(),
+            discord_client=self.discord_client,
+        )
+        self.tool_registry.register_implicit_resolver(
+            ImToolContextResolver(
+                session_repo=self.session_repo,
+                runtime_config_lookup=self.feishu_gateway_service,
+                automation_project_repo=self.automation_repo,
+                gateway_session_lookup=self.gateway_session_repository,
+            )
+        )
+        self.notification_service: NotificationService = NotificationService(
+            run_event_hub=self.run_event_hub,
+            get_config=self.notification_config_manager.get_notification_config,
+            hook_service=self.hook_service,
+            injection_manager=self.injection_manager,
+            dispatchers=(
+                FeishuNotificationDispatcher(
+                    session_repo=self.session_repo,
+                    runtime_config_lookup=self.feishu_gateway_service,
+                    feishu_client=self.feishu_client,
+                    terminal_notification_suppressor=None,
+                ),
+            ),
+        )
+        self.gate_manager: GateManager = GateManager()
+        self.tool_approval_manager: ToolApprovalManager = ToolApprovalManager()
+        self.user_question_manager: UserQuestionManager = UserQuestionManager()
+        self.tool_approval_policy: ToolApprovalPolicy = ToolApprovalPolicy()
+        self.external_acp_session_manager = AgentRuntimeSessionManager(
+            config_dir=self.config_dir,
+            config_service=self.external_agent_config_service,
+            session_repo=self.external_agent_session_repo,
+            message_repo=self.message_repo,
+            run_event_hub=self.run_event_hub,
+            workspace_manager=self.workspace_manager,
+            media_asset_service=self.media_asset_service,
+            task_repo=self.task_repo,
+            shared_store=self.shared_store,
+            event_bus=self.event_log,
+            injection_manager=self.injection_manager,
+            agent_repo=self.agent_repo,
+            approval_ticket_repo=self.approval_ticket_repo,
+            user_question_repo=self.user_question_repo,
+            run_runtime_repo=self.run_runtime_repo,
+            run_intent_repo=self.run_intent_repo,
+            background_task_service=self.background_task_service,
+            todo_service=self.todo_service,
+            reminder_service=self.reminder_service,
+            monitor_service=self.monitor_service,
+            tool_registry=self.tool_registry,
+            get_mcp_registry=lambda: self.mcp_registry,
+            get_skill_registry=lambda: self.skill_registry,
+            get_role_registry=lambda: self.role_registry,
+            get_task_execution_service=lambda: self.task_execution_service,
+            get_task_service=lambda: self.task_service,
+            run_control_manager=self.run_control_manager,
+            tool_approval_manager=self.tool_approval_manager,
+            user_question_manager=self.user_question_manager,
+            tool_approval_policy=self.tool_approval_policy,
+            runtime_role_resolver=self.runtime_role_resolver,
+            shell_approval_repo=self.shell_approval_repo,
+            get_notification_service=lambda: self.notification_service,
+            resolve_model_config=self.resolve_external_agent_model_config,
+            metric_recorder=self.metric_recorder,
+            im_tool_service=self.im_tool_service,
+            get_xiaoluban_notify_service=lambda: getattr(
+                self,
+                "xiaoluban_gateway_service",
+                None,
+            ),
+            get_gateway_session_lookup=lambda: getattr(
+                self,
+                "gateway_session_service",
+                None,
+            ),
+            computer_runtime=self.computer_runtime,
+            audit_service=self.audit_service,
+        )
+        self.run_control_manager.bind_runtime(
+            run_event_hub=self.run_event_hub,
+            injection_manager=self.injection_manager,
+            agent_repo=self.agent_repo,
+            task_repo=self.task_repo,
+            message_repo=self.message_repo,
+            event_bus=self.event_log,
+            run_runtime_repo=self.run_runtime_repo,
+        )
+
+        self._provider_factory: Callable[[RoleDefinition, str | None], LLMProvider]
+        self.task_execution_service: TaskExecutionService
+        self.task_service: TaskOrchestrationService
+        self.delegation_planning_service: DelegationPlanningService
+        self._build_runtime_services()
+        self.background_task_service.replace_subagent_runtime_dependencies(
+            task_execution_service=self.task_execution_service,
+            agent_repo=self.agent_repo,
+            task_repo=self.task_repo,
+            run_intent_repo=self.run_intent_repo,
+            run_control_manager=self.run_control_manager,
+            run_runtime_repo=self.run_runtime_repo,
+        )
+
+        semantic_evaluator = LlmSemanticEvaluator(
+            resolve_model_config=lambda: (
+                self._resolve_auxiliary_model_config(),
+                self._resolve_auxiliary_model_profile_name(),
+            ),
+        )
+        coordinator = CoordinatorGraph(
+            role_registry=self.role_registry,
+            task_repo=self.task_repo,
+            shared_store=self.shared_store,
+            event_bus=self.event_log,
+            agent_repo=self.agent_repo,
+            prompt_builder=RuntimePromptBuilder(
+                role_registry=self.role_registry,
+                mcp_registry=self.mcp_registry,
+                mcp_discovery_service=self.mcp_discovery_service,
+                runtime_mcp_schema_loader=self.runtime_mcp_schema_loader,
+                instruction_resolver=PromptInstructionResolver(
+                    app_config_dir=runtime.paths.config_dir,
+                    instructions=runtime.prompt_instructions.instructions,
+                ),
+                hook_service=self.hook_service,
+                run_event_hub=self.run_event_hub,
+            ),
+            provider_factory=self._provider_factory,
+            task_execution_service=self.task_execution_service,
+            run_runtime_repo=self.run_runtime_repo,
+            run_control_manager=self.run_control_manager,
+            hook_service=self.hook_service,
+            session_repo=self.session_repo,
+            gate_manager=self.gate_manager,
+            run_event_hub=self.run_event_hub,
+            semantic_evaluator=semantic_evaluator,
+            planning_service=self.delegation_planning_service,
+        )
+        self.meta_agent: MetaAgent = MetaAgent(coordinator=coordinator)
+        self.run_service: SessionRunService = SessionRunService(
+            meta_agent=self.meta_agent,
+            provider_factory=self._provider_factory,
+            role_registry=self.role_registry,
+            injection_manager=self.injection_manager,
+            run_event_hub=self.run_event_hub,
+            run_control_manager=self.run_control_manager,
+            tool_approval_manager=self.tool_approval_manager,
+            session_repo=self.session_repo,
+            active_run_registry=self.active_run_registry,
+            event_log=self.event_log,
+            task_repo=self.task_repo,
+            agent_repo=self.agent_repo,
+            message_repo=self.message_repo,
+            approval_ticket_repo=self.approval_ticket_repo,
+            user_question_repo=self.user_question_repo,
+            run_runtime_repo=self.run_runtime_repo,
+            run_intent_repo=self.run_intent_repo,
+            run_state_repo=self.run_state_repo,
+            background_task_manager=self.background_task_manager,
+            background_task_service=self.background_task_service,
+            todo_service=self.todo_service,
+            monitor_service=self.monitor_service,
+            notification_service=self.notification_service,
+            orchestration_settings_service=self.orchestration_settings_service,
+            media_asset_service=self.media_asset_service,
+            runtime_role_resolver=self.runtime_role_resolver,
+            shell_approval_repo=self.shell_approval_repo,
+            user_question_manager=self.user_question_manager,
+            hook_service=self.hook_service,
+            memory_event_handler=self.memory_event_handler,
+        )
+        self.monitor_service.bind_action_sink(self.run_service)
+        self.session_service: SessionService = SessionService(
+            session_repo=self.session_repo,
+            task_repo=self.task_repo,
+            agent_repo=self.agent_repo,
+            message_repo=self.message_repo,
+            approval_ticket_repo=self.approval_ticket_repo,
+            user_question_repo=self.user_question_repo,
+            run_runtime_repo=self.run_runtime_repo,
+            token_usage_repo=self.token_usage_repo,
+            monitor_repository=self.monitor_repository,
+            background_task_repository=self.background_task_repository,
+            todo_service=self.todo_service,
+            run_state_repo=self.run_state_repo,
+            run_event_hub=self.run_event_hub,
+            active_run_registry=self.active_run_registry,
+            event_log=self.event_log,
+            session_history_marker_repo=self.session_history_marker_repo,
+            shared_store=self.shared_store,
+            metrics_store=self.metrics_store,
+            workspace_manager=self.workspace_manager,
+            workspace_service=self.workspace_service,
+            external_session_binding_repo=self.external_session_binding_repo,
+            role_registry=self.role_registry,
+            skill_registry=self.skill_registry,
+            mcp_registry=self.mcp_registry,
+            orchestration_settings_service=self.orchestration_settings_service,
+            media_asset_service=self.media_asset_service,
+            run_intent_repo=self.run_intent_repo,
+            memory_event_handler=self.memory_event_handler,
+            get_runtime=lambda: self.runtime,
+            projection_refresh_runner=(
+                call_maybe_async_in_session_projection_refresh_thread
+            ),
+        )
+        self.run_event_hub.add_publish_listener(
+            self.session_service.mark_run_event_dirty
+        )
+        self.session_ingress_service = GatewaySessionIngressService(
+            run_service=self.run_service,
+            run_runtime_repo=self.run_runtime_repo,
+        )
+        self.gateway_session_service = GatewaySessionService(
+            repository=self.gateway_session_repository,
+            session_service=self.session_service,
+            workspace_service=self.workspace_service,
+        )
+        self.feishu_inbound_runtime = FeishuInboundRuntime(
+            session_service=self.session_service,
+            run_service=self.run_service,
+            external_session_binding_repo=self.external_session_binding_repo,
+            feishu_client=self.feishu_client,
+            session_ingress_service=self.session_ingress_service,
+        )
+        self.feishu_message_pool_service = FeishuMessagePoolService(
+            runtime_config_lookup=self.feishu_gateway_service,
+            inbound_runtime=self.feishu_inbound_runtime,
+            feishu_client=self.feishu_client,
+            message_pool_repo=self.feishu_message_pool_repo,
+            run_runtime_repo=self.run_runtime_repo,
+            event_log=self.event_log,
+            external_session_binding_repo=self.external_session_binding_repo,
+            automation_queue_repo=self.automation_bound_session_queue_repo,
+        )
+        self.im_session_command_service = ImSessionCommandService(
+            session_service=self.session_service,
+            run_service=self.run_service,
+            external_session_binding_repo=self.external_session_binding_repo,
+            gateway_session_service=self.gateway_session_service,
+            feishu_message_pool_service=self.feishu_message_pool_service,
+        )
+        self.discord_gateway_service = DiscordGatewayService(
+            config_dir=app_config_dir,
+            repository=self.discord_account_repository,
+            secret_store=get_discord_secret_store(),
+            client=self.discord_client,
+            gateway_session_service=self.gateway_session_service,
+            run_service=self.run_service,
+            workspace_service=self.workspace_service,
+            orchestration_settings_service=self.orchestration_settings_service,
+            im_tool_service=self.im_tool_service,
+            im_session_command_service=self.im_session_command_service,
+            inbound_queue_repo=self.discord_inbound_queue_repo,
+            session_ingress_service=self.session_ingress_service,
+            session_recovery_service=self.session_service,
+        )
+        self.wechat_gateway_service = WeChatGatewayService(
+            config_dir=app_config_dir,
+            repository=self.wechat_account_repository,
+            secret_store=None,
+            client=self.wechat_client,
+            gateway_session_service=self.gateway_session_service,
+            run_service=self.run_service,
+            run_event_hub=self.run_event_hub,
+            workspace_service=self.workspace_service,
+            role_registry=self.role_registry,
+            orchestration_settings_service=self.orchestration_settings_service,
+            session_service=self.session_service,
+            im_tool_service=self.im_tool_service,
+            im_session_command_service=self.im_session_command_service,
+            inbound_queue_repo=self.wechat_inbound_queue_repo,
+            session_ingress_service=self.session_ingress_service,
+            get_shell_safety_policy_enabled=lambda: (
+                self.general_config_service.get_config().shell_safety_policy_enabled
+            ),
+        )
+        self.xiaoluban_gateway_service = XiaolubanGatewayService(
+            config_dir=app_config_dir,
+            repository=self.xiaoluban_account_repository,
+            secret_store=get_xiaoluban_secret_store(),
+            client=self.xiaoluban_client,
+            workspace_lookup=self.workspace_service,
+            gateway_session_service=self.gateway_session_service,
+            run_service=self.run_service,
+            event_log=self.event_log,
+            session_ingress_service=self.session_ingress_service,
+            get_shell_safety_policy_enabled=lambda: (
+                self.general_config_service.get_config().shell_safety_policy_enabled
+            ),
+        )
+        self.xiaoluban_im_listener_service = XiaolubanImListenerService(
+            service=self.xiaoluban_gateway_service
+        )
+        self.automation_feishu_binding_service = AutomationFeishuBindingService(
+            external_session_binding_repo=self.external_session_binding_repo,
+            session_repo=self.session_repo,
+            account_lookup=self.feishu_gateway_service,
+            runtime_config_lookup=self.feishu_gateway_service,
+        )
+        self.automation_xiaoluban_binding_service = AutomationXiaolubanBindingService(
+            account_lookup=self.xiaoluban_gateway_service
+        )
+        self.automation_delivery_service = AutomationDeliveryService(
+            repository=self.automation_delivery_repo,
+            runtime_config_lookup=self.feishu_gateway_service,
+            feishu_client=self.feishu_client,
+            xiaoluban_gateway_service=self.xiaoluban_gateway_service,
+            run_runtime_repo=self.run_runtime_repo,
+            event_log=self.event_log,
+            notification_service=self.notification_service,
+            session_lookup=self.session_repo,
+        )
+        self.automation_delivery_worker = AutomationDeliveryWorker(
+            delivery_service=self.automation_delivery_service
+        )
+        self.notification_service = NotificationService(
+            run_event_hub=self.run_event_hub,
+            get_config=self.notification_config_manager.get_notification_config,
+            hook_service=self.hook_service,
+            injection_manager=self.injection_manager,
+            dispatchers=(
+                FeishuNotificationDispatcher(
+                    session_repo=self.session_repo,
+                    runtime_config_lookup=self.feishu_gateway_service,
+                    feishu_client=self.feishu_client,
+                    terminal_notification_suppressor=CompositeTerminalNotificationSuppressor(
+                        self.feishu_message_pool_service,
+                        self.automation_delivery_service,
+                    ),
+                ),
+                XiaolubanNotificationDispatcher(
+                    session_repo=self.session_repo,
+                    account_lookup=self.xiaoluban_gateway_service,
+                    terminal_notification_suppressor=CompositeXiaolubanTerminalNotificationSuppressor(
+                        self.automation_delivery_service,
+                        self.xiaoluban_gateway_service,
+                    ),
+                ),
+            ),
+        )
+        self.run_service._notification_service = self.notification_service
+        self.monitor_service.bind_notification_service(self.notification_service)
+        self.automation_delivery_service.bind_notification_service(
+            self.notification_service
+        )
+        self.automation_bound_session_queue_service = (
+            AutomationBoundSessionQueueService(
+                repository=self.automation_bound_session_queue_repo,
+                session_lookup=self.session_service,
+                run_service=self.run_service,
+                run_runtime_repo=self.run_runtime_repo,
+                delivery_service=self.automation_delivery_service,
+                runtime_config_lookup=self.feishu_gateway_service,
+                feishu_client=self.feishu_client,
+                project_repository=self.automation_repo,
+                session_ingress_service=self.session_ingress_service,
+                get_shell_safety_policy_enabled=lambda: (
+                    self.general_config_service.get_config().shell_safety_policy_enabled
+                ),
+            )
+        )
+        self.automation_bound_session_queue_worker = AutomationBoundSessionQueueWorker(
+            queue_service=self.automation_bound_session_queue_service
+        )
+        self.feishu_trigger_handler = FeishuTriggerHandler(
+            runtime_config_lookup=self.feishu_gateway_service,
+            message_pool_service=self.feishu_message_pool_service,
+            im_tool_service=self.im_tool_service,
+            im_session_command_service=self.im_session_command_service,
+        )
+        self.feishu_subscription_service = FeishuSubscriptionService(
+            runtime_config_lookup=self.feishu_gateway_service,
+            event_handler=self.feishu_trigger_handler,
+        )
+        self.automation_service: AutomationService = AutomationService(
+            repository=self.automation_repo,
+            event_repository=self.automation_event_repo,
+            session_service=self.session_service,
+            run_service=self.run_service,
+            feishu_binding_service=self.automation_feishu_binding_service,
+            xiaoluban_binding_service=self.automation_xiaoluban_binding_service,
+            delivery_service=self.automation_delivery_service,
+            bound_session_queue_service=self.automation_bound_session_queue_service,
+            workspace_service=self.workspace_service,
+            session_ingress_service=self.session_ingress_service,
+            get_role_registry=lambda: self.role_registry,
+            orchestration_settings_service=self.orchestration_settings_service,
+            get_shell_safety_policy_enabled=lambda: (
+                self.general_config_service.get_config().shell_safety_policy_enabled
+            ),
+        )
+        self.github_trigger_service = GitHubTriggerService(
+            config_dir=app_config_dir,
+            repository=self.trigger_repository,
+            secret_store=self.github_trigger_secret_store,
+            github_client=self.github_api_client,
+            automation_service=self.automation_service,
+            session_service=self.session_service,
+            run_service=self.run_service,
+            run_runtime_repo=self.run_runtime_repo,
+            event_log=self.event_log,
+            monitor_service=self.monitor_service,
+            session_ingress_service=self.session_ingress_service,
+            get_github_config=self.github_config_service.get_github_config,
+            get_shell_safety_policy_enabled=lambda: (
+                self.general_config_service.get_config().shell_safety_policy_enabled
+            ),
+        )
+        self.board_todo_service = BoardTodoService(
+            repository=self.board_todo_repository,
+            workspace_service=self.workspace_service,
+            github_trigger_service=self.github_trigger_service,
+            github_client=self.github_api_client,
+            session_service=self.session_service,
+            run_service=self.run_service,
+            run_runtime_repo=self.run_runtime_repo,
+            get_shared_github_token=lambda: (
+                self.github_config_service.get_github_config().token
+            ),
+            get_shell_safety_policy_enabled=lambda: (
+                self.general_config_service.get_config().shell_safety_policy_enabled
+            ),
+        )
+        self.github_trigger_service.replace_board_todo_service(self.board_todo_service)
+        self.run_service.replace_board_todo_service(self.board_todo_service)
+        self.session_service.replace_board_todo_service(self.board_todo_service)
+        self.github_trigger_action_worker = GitHubTriggerActionWorker(
+            trigger_service=self.github_trigger_service
+        )
+        self.automation_scheduler_service: AutomationSchedulerService = (
+            AutomationSchedulerService(automation_service=self.automation_service)
+        )
+        self.config_status_service: ConfigStatusService = ConfigStatusService(
+            get_runtime=lambda: self.runtime,
+            get_mcp_registry=lambda: self.mcp_registry,
+            get_skill_registry=lambda: self.skill_registry,
+            get_proxy_status=self.proxy_config_service.get_proxy_status,
+            get_plugin_registry=lambda: self.plugin_registry,
+        )
+        self.model_config_service: ModelConfigService = ModelConfigService(
+            config_dir=app_config_dir,
+            roles_dir=self.runtime.paths.roles_dir,
+            db_path=self.runtime.paths.db_path,
+            model_config_manager=self.model_config_manager,
+            model_fallback_config_manager=self.model_fallback_config_manager,
+            model_catalog_service=self.model_catalog_service,
+            get_runtime=lambda: self.runtime,
+            on_runtime_reloaded=self._on_runtime_reloaded,
+        )
+        self.w3_connector_service = W3ConnectorService(
+            config_dir=app_config_dir,
+            model_config_service=self.model_config_service,
+        )
+        self.connector_service = ConnectorService(
+            github_trigger_service=self.github_trigger_service,
+            github_connectivity_probe_service=self.github_connectivity_probe_service,
+            feishu_gateway_service=self.feishu_gateway_service,
+            feishu_subscription_service=self.feishu_subscription_service,
+            discord_gateway_service=self.discord_gateway_service,
+            wechat_gateway_service=self.wechat_gateway_service,
+            xiaoluban_gateway_service=self.xiaoluban_gateway_service,
+            xiaoluban_im_listener_service=self.xiaoluban_im_listener_service,
+            w3_connector_service=self.w3_connector_service,
+            runtime_tool_service=self.binary_tool_service,
+            get_shared_github_token=lambda: (
+                self.github_config_service.get_github_config().token
+            ),
+        )
+        self.notification_settings_service: NotificationSettingsService = (
+            NotificationSettingsService(
+                notification_config_manager=self.notification_config_manager
+            )
+        )
+        self.role_settings_service: RoleSettingsService = RoleSettingsService(
+            roles_dir=self.runtime.paths.roles_dir,
+            builtin_roles_dir=get_builtin_roles_dir(),
+            get_tool_registry=lambda: self.tool_registry,
+            get_mcp_registry=lambda: self.mcp_registry,
+            get_skill_registry=lambda: self.skill_registry,
+            get_external_agent_service=lambda: self.external_agent_config_service,
+            on_roles_reloaded=self._on_roles_reloaded,
+            reload_skill_registry=lambda: (
+                self.skills_config_reload_service.reload_skills_config()
+            ),
+            plugin_sources=self.plugin_registry.role_sources(),
+        )
+        self.mcp_config_reload_service: McpConfigReloadService = McpConfigReloadService(
+            mcp_config_manager=self.mcp_config_manager,
+            role_registry=self.role_registry,
+            on_mcp_reloaded=self._on_mcp_reloaded,
+            extra_specs=self._plugin_mcp_specs,
+        )
+        self.skills_config_reload_service: SkillsConfigReloadService = (
+            SkillsConfigReloadService(
+                config_dir=app_config_dir,
+                project_start_dir=self._project_start_dir,
+                plugin_sources=self.plugin_registry.skill_sources(),
+                role_registry=self.role_registry,
+                on_skill_reloaded=self._on_skill_reloaded,
+            )
+        )
+        self.clawhub_skill_service: ClawHubSkillService = ClawHubSkillService(
+            config_dir=app_config_dir,
+            on_skill_mutated=self._reload_skills_config,
+        )
+        self.clawhub_skill_market_service: ClawHubSkillMarketService = (
+            ClawHubSkillMarketService(
+                config_dir=app_config_dir,
+                get_clawhub_config=self.clawhub_config_service.get_clawhub_config,
+                list_clawhub_skills=lambda: self.clawhub_skill_service.list_skills(),
+                delete_clawhub_skill=lambda skill_id: (
+                    self.clawhub_skill_service.delete_skill(skill_id)
+                ),
+                reload_skills_config=self._reload_skills_config,
+            )
+        )
+        self.memory_evolution_service: MemoryEvolutionService = MemoryEvolutionService(
+            repository=self.memory_bank_repo,
+            skill_service=self.clawhub_skill_service,
+        )
+        self.memory_skill_synthesis_service: MemorySkillSynthesisService = (
+            self._build_memory_skill_synthesis_service()
+        )
+        self._async_closeables: tuple[AsyncCloseableRepository, ...] = (
+            self.task_repo,
+            self.artifact_repo,
+            self.audit_repository,
+            self.shared_store,
+            self.workspace_repo,
+            self.ssh_profile_repo,
+            self.media_asset_repo,
+            self.event_log,
+            self.agent_repo,
+            self.session_history_marker_repo,
+            self.message_repo,
+            self.approval_ticket_repo,
+            self.user_question_repo,
+            self.shell_approval_repo,
+            self.run_runtime_repo,
+            self.run_intent_repo,
+            self.background_task_repository,
+            self.todo_repository,
+            self.board_todo_repository,
+            self.run_state_repo,
+            self.trigger_repository,
+            self.session_repo,
+            self.external_session_binding_repo,
+            self.external_agent_session_repo,
+            self.gateway_session_repository,
+            self.token_usage_repo,
+            self.metrics_store,
+            self.retrieval_store,
+            self.feishu_message_pool_repo,
+            self.feishu_account_repository,
+            self.automation_repo,
+            self.automation_event_repo,
+            self.automation_delivery_repo,
+            self.automation_bound_session_queue_repo,
+            self.memory_bank_repo,
+            self.memory_skill_draft_repo,
+            self.temporary_role_repo,
+            self.monitor_repository,
+            self.xiaoluban_account_repository,
+            self.discord_account_repository,
+            self.discord_inbound_queue_repo,
+            self.wechat_account_repository,
+            self.wechat_inbound_queue_repo,
+        )
+        self._startup_background_tasks: set[asyncio.Task[None]] = set()
+        self._noncancelable_startup_background_tasks: set[asyncio.Task[None]] = set()
+        self._runtime_background_startup_failures: dict[str, str] = {}
+        self._runtime_background_startup_pending = False
+
+    @property
+    def runtime_background_startup_failures(self) -> Mapping[str, str]:
+        return self._runtime_background_startup_failures.copy()
+
+    @property
+    def runtime_background_startup_pending(self) -> bool:
+        return self._runtime_background_startup_pending
+
+    def _build_runtime_services(self) -> None:
+        def get_task_execution_service() -> TaskExecutionService:
+            return self.task_execution_service
+
+        def get_task_service() -> TaskOrchestrationService:
+            return self.task_service
+
+        self._provider_factory = create_provider_factory(
+            runtime=self.runtime,
+            task_repo=self.task_repo,
+            shared_store=self.shared_store,
+            event_log=self.event_log,
+            injection_manager=self.injection_manager,
+            run_event_hub=self.run_event_hub,
+            agent_repo=self.agent_repo,
+            approval_ticket_repo=self.approval_ticket_repo,
+            user_question_repo=self.user_question_repo,
+            run_runtime_repo=self.run_runtime_repo,
+            run_intent_repo=self.run_intent_repo,
+            background_task_service=self.background_task_service,
+            todo_service=self.todo_service,
+            monitor_service=self.monitor_service,
+            workspace_manager=self.workspace_manager,
+            media_asset_service=self.media_asset_service,
+            computer_runtime=self.computer_runtime,
+            tool_registry=self.tool_registry,
+            mcp_registry=self.mcp_registry,
+            mcp_discovery_service=self.mcp_discovery_service,
+            skill_registry=self.skill_registry,
+            message_repo=self.message_repo,
+            session_history_marker_repo=self.session_history_marker_repo,
+            role_registry=self.role_registry,
+            get_task_service=get_task_service,
+            run_control_manager=self.run_control_manager,
+            tool_approval_manager=self.tool_approval_manager,
+            user_question_manager=self.user_question_manager,
+            tool_approval_policy=self.tool_approval_policy,
+            shell_approval_repo=self.shell_approval_repo,
+            notification_service=self.notification_service,
+            get_task_execution_service=get_task_execution_service,
+            token_usage_repo=self.token_usage_repo,
+            metric_recorder=self.metric_recorder,
+            im_tool_service=self.im_tool_service,
+            get_xiaoluban_notify_service=lambda: getattr(
+                self,
+                "xiaoluban_gateway_service",
+                None,
+            ),
+            get_gateway_session_lookup=lambda: getattr(
+                self,
+                "gateway_session_service",
+                None,
+            ),
+            external_agent_session_manager=self.external_acp_session_manager,
+            session_model_profile_lookup=self._session_model_profile_lookup,
+            hook_service=self.hook_service,
+            reminder_service=self.reminder_service,
+            auto_harness_service=self.auto_harness_service,
+            audit_service=self.audit_service,
+        )
+        self.task_execution_service = create_task_execution_service(
+            role_registry=self.role_registry,
+            task_repo=self.task_repo,
+            shared_store=self.shared_store,
+            event_log=self.event_log,
+            agent_repo=self.agent_repo,
+            message_repo=self.message_repo,
+            approval_ticket_repo=self.approval_ticket_repo,
+            run_runtime_repo=self.run_runtime_repo,
+            run_event_hub=self.run_event_hub,
+            run_intent_repo=self.run_intent_repo,
+            workspace_manager=self.workspace_manager,
+            media_asset_service=self.media_asset_service,
+            app_config_dir=self.runtime.paths.config_dir,
+            prompt_instructions=self.runtime.prompt_instructions.instructions,
+            provider_factory=self._provider_factory,
+            tool_registry=self.tool_registry,
+            skill_registry=self.skill_registry,
+            skill_runtime_service=self.skill_runtime_service,
+            mcp_registry=self.mcp_registry,
+            mcp_discovery_service=self.mcp_discovery_service,
+            runtime_mcp_schema_loader=self.runtime_mcp_schema_loader,
+            injection_manager=self.injection_manager,
+            run_control_manager=self.run_control_manager,
+            memory_bank_service=self.memory_bank_service,
+            memory_event_handler=self.memory_event_handler,
+            runtime_role_resolver=self.runtime_role_resolver,
+            hook_service=self.hook_service,
+            todo_service=self.todo_service,
+            reminder_service=self.reminder_service,
+            artifact_repo=self.artifact_repo,
+        )
+        self.task_service = TaskOrchestrationService(
+            task_repo=self.task_repo,
+            role_registry=self.role_registry,
+            agent_repo=self.agent_repo,
+            task_execution_service=self.task_execution_service,
+            message_repo=self.message_repo,
+            session_repo=self.session_repo,
+            runtime_role_resolver=self.runtime_role_resolver,
+            hook_service=self.hook_service,
+            run_event_hub=self.run_event_hub,
+            run_intent_repo=self.run_intent_repo,
+        )
+        self.delegation_planning_service = DelegationPlanningService(
+            task_repo=self.task_repo,
+            task_service=self.task_service,
+            role_registry=self.role_registry,
+            runtime_role_resolver=self.runtime_role_resolver,
+        )
+
+    def _build_hook_loader(self) -> HookLoader:
+        return HookLoader(
+            app_config_dir=self.runtime.paths.config_dir,
+            project_root=Path.cwd(),
+            get_role_registry=lambda: self.role_registry,
+            get_skill_registry=lambda: self.skill_registry,
+            plugin_hook_sources=self.plugin_registry.hook_sources(),
+        )
+
+    def _resolve_auxiliary_model_config(self) -> ModelEndpointConfig | None:
+        if self.runtime.default_model_profile is not None:
+            return self.runtime.llm_profiles.get(self.runtime.default_model_profile)
+        for profile in self.runtime.llm_profiles.values():
+            return profile
+        return None
+
+    def _resolve_auxiliary_model_profile_name(self) -> str | None:
+        if self.runtime.default_model_profile is not None:
+            return self.runtime.default_model_profile
+        for profile_name in self.runtime.llm_profiles.keys():
+            return profile_name
+        return None
+
+    def resolve_auxiliary_model_config(self) -> ModelEndpointConfig | None:
+        return self._resolve_auxiliary_model_config()
+
+    def resolve_auxiliary_model_profile_name(self) -> str | None:
+        return self._resolve_auxiliary_model_profile_name()
+
+    def create_provider(
+        self,
+        role_definition: RoleDefinition,
+        session_id: str | None,
+    ) -> LLMProvider:
+        return self._provider_factory(role_definition, session_id)
+
+    def _build_memory_skill_synthesis_service(self) -> MemorySkillSynthesisService:
+        return MemorySkillSynthesisService(
+            draft_repository=self.memory_skill_draft_repo,
+            memory_bank_service=self.memory_bank_service,
+            clawhub_skill_service=self.clawhub_skill_service,
+            llm_provider_resolver=self._resolve_memory_skill_provider,
+        )
+
+    def _resolve_memory_skill_provider(self) -> LLMProvider | None:
+        profile_name = self._resolve_auxiliary_model_profile_name()
+        if profile_name is None:
+            return None
+        return self.create_provider(
+            RoleDefinition(
+                role_id="memory-skill-synthesis",
+                name="Memory Skill Synthesis",
+                description="Synthesize Memory Bank entries into reusable skills.",
+                version="1",
+                system_prompt="internal",
+                model_profile=profile_name,
+            ),
+            None,
+        )
+
+    def _resolve_memory_consolidation_provider(self) -> LLMProvider | None:
+        profile_name = self._resolve_auxiliary_model_profile_name()
+        if profile_name is None:
+            return None
+        return self.create_provider(
+            RoleDefinition(
+                role_id="memory-consolidation",
+                name="Memory Consolidation",
+                description="Extract structured Memory Bank entries from run history.",
+                version="1",
+                system_prompt="internal",
+                model_profile=profile_name,
+            ),
+            None,
+        )
+
+    def _resolve_hook_model_config(
+        self,
+        model_profile: str | None,
+    ) -> tuple[ModelEndpointConfig | None, str | None]:
+        profile_name = (
+            model_profile.strip()
+            if model_profile is not None and model_profile.strip()
+            else "default"
+        )
+        return (
+            resolve_model_profile_config(
+                runtime=self.runtime,
+                profile_name=profile_name,
+            ),
+            resolve_model_profile_name(
+                runtime=self.runtime,
+                profile_name=profile_name,
+            ),
+        )
+
+    def _resolve_autoharness_model_config(
+        self,
+        role: RoleDefinition,
+        session_id: str | None,
+    ) -> tuple[ModelEndpointConfig | None, str | None]:
+        runtime_to_use = self.runtime
+        if (
+            session_id
+            and self._session_model_profile_lookup is not None
+            and (override := self._session_model_profile_lookup(session_id)) is not None
+        ):
+            runtime_to_use = apply_default_model_profile_override(
+                runtime=runtime_to_use,
+                override=override,
+            )
+        return (
+            resolve_model_profile_config(
+                runtime=runtime_to_use,
+                profile_name=role.model_profile,
+            ),
+            resolve_model_profile_name(
+                runtime=runtime_to_use,
+                profile_name=role.model_profile,
+            ),
+        )
+
+    def resolve_external_agent_model_config(
+        self,
+        role: RoleDefinition,
+        request: LLMRequest,
+    ) -> ModelEndpointConfig | None:
+        runtime_to_use = self.runtime
+        if (
+            self._session_model_profile_lookup is not None
+            and (override := self._session_model_profile_lookup(request.session_id))
+            is not None
+        ):
+            runtime_to_use = apply_default_model_profile_override(
+                runtime=runtime_to_use,
+                override=override,
+            )
+        return resolve_model_profile_config(
+            runtime=runtime_to_use,
+            profile_name=role.model_profile,
+        )
+
+    async def start(self) -> None:
+        self._start_memory_reindex_background()
+        self.mcp_discovery_service.start_warmup(self.mcp_registry)
+        self.app_env_file_watcher.start()
+        self.mcp_config_file_watcher.start()
+        self.run_service.bind_event_loop(asyncio.get_running_loop())
+        self.background_task_service.bind_completion_sink(self.run_service)
+        self._runtime_background_startup_pending = True
+        task = asyncio.create_task(
+            self._start_runtime_background_services(),
+            name="server-runtime-background-services-startup",
+        )
+        self._startup_background_tasks.add(task)
+        self._noncancelable_startup_background_tasks.add(task)
+        return None
+
+    async def _start_runtime_background_services(self) -> None:
+        try:
+            await self._run_runtime_service_startup_step(
+                "discord_gateway_service",
+                self.discord_gateway_service.start_async,
+            )
+            await self._run_runtime_service_startup_step(
+                "wechat_gateway_service",
+                self._start_wechat_gateway_service,
+            )
+            await self._run_runtime_service_startup_step(
+                "xiaoluban_im_listener_service",
+                self._start_xiaoluban_im_listener_service,
+            )
+            await self._run_runtime_service_startup_step(
+                "feishu_subscription_service",
+                self._start_feishu_subscription_service,
+            )
+            await self._run_runtime_service_startup_step(
+                "feishu_message_pool_service",
+                self.feishu_message_pool_service.start,
+            )
+            await self._run_runtime_service_startup_step(
+                "automation_delivery_worker",
+                self.automation_delivery_worker.start,
+            )
+            await self._run_runtime_service_startup_step(
+                "automation_bound_session_queue_worker",
+                self.automation_bound_session_queue_worker.start,
+            )
+            await self._run_runtime_service_startup_step(
+                "github_trigger_action_worker",
+                self.github_trigger_action_worker.start,
+            )
+            await self._run_runtime_service_startup_step(
+                "board_todo_service",
+                self.board_todo_service.start,
+            )
+            await self._run_runtime_service_startup_step(
+                "automation_scheduler_service",
+                self.automation_scheduler_service.start,
+            )
+        finally:
+            self._runtime_background_startup_pending = False
+
+    async def _run_runtime_service_startup_step(
+        self,
+        service_name: str,
+        start_step: Callable[[], Awaitable[None]],
+    ) -> None:
+        try:
+            await start_step()
+        except asyncio.CancelledError:
+            raise
+        except (OSError, RuntimeError, ValueError, sqlite3.Error):
+            self._runtime_background_startup_failures[service_name] = "start_failed"
+            LOGGER.warning(
+                "Runtime background service failed to start: %s",
+                service_name,
+                exc_info=True,
+            )
+        except (ImportError, AttributeError):
+            self._runtime_background_startup_failures[service_name] = "start_failed"
+            LOGGER.exception(
+                "Runtime background service failed unexpectedly during startup: %s",
+                service_name,
+            )
+
+    async def _start_wechat_gateway_service(self) -> None:
+        await asyncio.to_thread(self.wechat_gateway_service.start)
+
+    async def _start_xiaoluban_im_listener_service(self) -> None:
+        await asyncio.to_thread(self.xiaoluban_im_listener_service.start)
+
+    async def _start_feishu_subscription_service(self) -> None:
+        await asyncio.to_thread(self.feishu_subscription_service.start)
+
+    async def _start_sync_service(
+        self,
+        *,
+        service_name: str,
+        start: Callable[[], None],
+    ) -> None:
+        start_task = asyncio.create_task(
+            asyncio.to_thread(start),
+            name=f"{service_name}-sync-start",
+        )
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(start_task),
+                timeout=SYNC_SERVICE_START_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                event="app.startup.sync_service_timeout",
+                message="Timed out while starting optional sync service",
+                payload={
+                    "service": service_name,
+                    "timeout_seconds": SYNC_SERVICE_START_TIMEOUT_SECONDS,
+                },
+            )
+            self._startup_background_tasks.add(start_task)
+            start_task.add_done_callback(
+                lambda completed: self._handle_startup_background_task_done(
+                    completed,
+                    service_name=service_name,
+                )
+            )
+            return
+
+    def _start_sync_service_background(
+        self,
+        *,
+        service_name: str,
+        start: Callable[[], None],
+    ) -> None:
+        task = asyncio.create_task(
+            self._start_sync_service(service_name=service_name, start=start),
+            name=f"{service_name}-startup",
+        )
+        self._startup_background_tasks.add(task)
+        task.add_done_callback(
+            lambda completed: self._handle_startup_background_task_done(
+                completed,
+                service_name=service_name,
+            )
+        )
+
+    def _handle_startup_background_task_done(
+        self,
+        task: asyncio.Task[None],
+        *,
+        service_name: str,
+    ) -> None:
+        if task.cancelled():
+            return
+        exception = task.exception()
+        if exception is None:
+            self._startup_background_tasks.discard(task)
+            return
+        self._startup_background_tasks.discard(task)
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            event="app.startup.background_task_failed",
+            message="Startup background task failed",
+            payload={"service": service_name},
+            exc_info=exception,
+        )
+
+    async def stop(self) -> None:
+        self._cancel_startup_background_tasks()
+        await self._drain_startup_background_tasks()
+        await self.app_env_file_watcher.stop()
+        await self.automation_scheduler_service.stop()
+        await self.board_todo_service.stop()
+        await self.github_trigger_action_worker.stop()
+        await self.automation_bound_session_queue_worker.stop()
+        await self.automation_delivery_worker.stop()
+        await self.feishu_message_pool_service.stop()
+        self.feishu_subscription_service.stop()
+        self.xiaoluban_im_listener_service.stop()
+        self.wechat_gateway_service.stop()
+        self.discord_gateway_service.stop()
+        self.localhost_run_tunnel_service.stop()
+        stopped_runs = await self.run_service.stop_active_runs_for_shutdown_async()
+        if stopped_runs:
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                event="app.shutdown.active_runs_stopped",
+                message="Requested active runs to stop during server shutdown",
+                payload={"stopped_run_count": stopped_runs},
+            )
+        await self.run_service.drain_detached_notifications_async()
+        await self.external_acp_session_manager.close()
+        await self.background_task_manager.close()
+        await self.mcp_config_file_watcher.stop()
+        await self.mcp_discovery_service.close()
+        await self._close_async_repositories()
+        await clear_llm_http_client_cache_async()
+        return None
+
+    def _start_memory_reindex_background(self) -> None:
+        task = asyncio.create_task(self._reindex_memory_bank_on_startup())
+        self._startup_background_tasks.add(task)
+
+    async def _reindex_memory_bank_on_startup(self) -> None:
+        try:
+            await self.memory_bank_service.forget_expired_async()
+        except asyncio.CancelledError:
+            raise
+        except (ValueError, OSError, RuntimeError, sqlite3.Error):
+            LOGGER.warning(
+                "Failed to expire Memory Bank entries during startup",
+                exc_info=True,
+            )
+        try:
+            await self.memory_bank_service.reindex_active_entries_async()
+        except asyncio.CancelledError:
+            raise
+        except (ValueError, OSError, RuntimeError, sqlite3.Error):
+            LOGGER.warning(
+                "Failed to rebuild Memory Bank retrieval entries during startup",
+                exc_info=True,
+            )
+
+    def _cancel_startup_background_tasks(self) -> None:
+        for task in tuple(self._startup_background_tasks):
+            if task in self._noncancelable_startup_background_tasks:
+                continue
+            task.cancel()
+
+    async def _drain_startup_background_tasks(self) -> None:
+        tasks = tuple(self._startup_background_tasks)
+        if not tasks:
+            return
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, asyncio.CancelledError):
+                continue
+            if isinstance(result, BaseException):
+                LOGGER.warning(
+                    "Startup background task failed",
+                    exc_info=(type(result), result, result.__traceback__),
+                )
+        self._startup_background_tasks.difference_update(tasks)
+        self._noncancelable_startup_background_tasks.difference_update(tasks)
+
+    async def _close_async_repositories(self) -> None:
+        for repository in reversed(self._async_closeables):
+            # noinspection PyBroadException
+            try:
+                await repository.close_async()
+            except Exception:
+                LOGGER.warning(
+                    "Failed to close async SQLite repository connection",
+                    exc_info=True,
+                )
+
+    def _sanitize_role_registry(self, role_registry: RoleRegistry) -> RoleRegistry:
+        sanitized_registry = RoleRegistry()
+        for role in role_registry.list_roles():
+            consumer = f"interfaces.server.container.role:{role.role_id}"
+            sanitized_registry.register(
+                role.model_copy(
+                    update={
+                        "tools": self.tool_registry.resolve_known(
+                            role.tools,
+                            context=ToolResolutionContext(session_id=""),
+                            strict=False,
+                            consumer=consumer,
+                        ),
+                        "mcp_servers": self.mcp_registry.resolve_server_names(
+                            role.mcp_servers,
+                            strict=False,
+                            consumer=consumer,
+                            expand_wildcards=False,
+                        ),
+                        "skills": self.skill_registry.resolve_known(
+                            role.skills,
+                            strict=False,
+                            consumer=consumer,
+                            expand_wildcards=False,
+                        ),
+                    }
+                )
+            )
+        return sanitized_registry
+
+    def replace_mcp_registry(self, mcp_registry: McpRegistry) -> None:
+        self.mcp_registry = mcp_registry
+        self.runtime_mcp_schema_loader.replace_registry(mcp_registry)
+        self.mcp_service.replace_registry(mcp_registry)
+        self._refresh_coordinator_runtime()
+
+    def _refresh_coordinator_runtime(self) -> None:
+        self._build_runtime_services()
+        self.meta_agent.coordinator.role_registry = self.role_registry
+        self.meta_agent.coordinator.prompt_builder = RuntimePromptBuilder(
+            role_registry=self.role_registry,
+            mcp_registry=self.mcp_registry,
+            mcp_discovery_service=self.mcp_discovery_service,
+            runtime_mcp_schema_loader=self.runtime_mcp_schema_loader,
+            instruction_resolver=PromptInstructionResolver(
+                app_config_dir=self.runtime.paths.config_dir,
+                instructions=self.runtime.prompt_instructions.instructions,
+            ),
+            hook_service=self.hook_service,
+            run_event_hub=self.run_event_hub,
+        )
+        self.meta_agent.coordinator.provider_factory = self._provider_factory
+        self.meta_agent.coordinator.task_execution_service = self.task_execution_service
+        self.meta_agent.coordinator.planning_service = self.delegation_planning_service
+
+    def _refresh_runtime_dependents(self) -> None:
+        self.runtime_role_resolver.replace_role_registry(self.role_registry)
+        self.delegation_planning_service.replace_role_registry(self.role_registry)
+        self.session_service.replace_role_registry(self.role_registry)
+        self.run_service.replace_runtime_dependencies(
+            role_registry=self.role_registry,
+            provider_factory=self._provider_factory,
+            runtime_role_resolver=self.runtime_role_resolver,
+        )
+        self.feishu_gateway_service.replace_role_registry(self.role_registry)
+        self.wechat_gateway_service.replace_role_registry(self.role_registry)
+
+    def _on_runtime_reloaded(self, runtime: RuntimeConfig) -> None:
+        self.runtime = runtime
+        self._refresh_coordinator_runtime()
+        self._refresh_runtime_dependents()
+
+    def _on_roles_reloaded(self, role_registry: RoleRegistry) -> None:
+        self.role_registry = self._sanitize_role_registry(role_registry)
+        self.mcp_config_reload_service = McpConfigReloadService(
+            mcp_config_manager=self.mcp_config_manager,
+            role_registry=self.role_registry,
+            on_mcp_reloaded=self._on_mcp_reloaded,
+            extra_specs=self._plugin_mcp_specs,
+        )
+        self.skills_config_reload_service = SkillsConfigReloadService(
+            config_dir=self.runtime.paths.config_dir,
+            project_start_dir=self._project_start_dir,
+            plugin_sources=self.plugin_registry.skill_sources(),
+            role_registry=self.role_registry,
+            on_skill_reloaded=self._on_skill_reloaded,
+        )
+        self.clawhub_skill_service = ClawHubSkillService(
+            config_dir=self.runtime.paths.config_dir,
+            on_skill_mutated=self._reload_skills_config,
+        )
+        self.memory_evolution_service = MemoryEvolutionService(
+            repository=self.memory_bank_repo,
+            skill_service=self.clawhub_skill_service,
+        )
+        self.memory_skill_synthesis_service = (
+            self._build_memory_skill_synthesis_service()
+        )
+        self._refresh_coordinator_runtime()
+        self._refresh_runtime_dependents()
+
+    def _on_mcp_reloaded(self, mcp_registry: McpRegistry) -> None:
+        self.replace_mcp_registry(mcp_registry)
+
+    def _reload_mcp_config_after_file_change(self) -> None:
+        self.mcp_config_reload_service.reload_mcp_config()
+
+    def _reload_skills_config(self) -> None:
+        self.skills_config_reload_service.reload_skills_config()
+
+    def _on_skill_reloaded(self, skill_registry: SkillRegistry) -> None:
+        skill_runtime_service = self._build_skill_runtime_service(
+            skill_registry=skill_registry
+        )
+        self.skill_registry = skill_registry
+        self.skill_runtime_service = skill_runtime_service
+        self._refresh_coordinator_runtime()
+
+    def _on_proxy_reloaded(self, proxy_config: ProxyEnvConfig) -> None:
+        sync_proxy_env_to_process_env(proxy_config)
+        clear_llm_http_client_cache()
+        self._on_mcp_reloaded(
+            self.mcp_config_manager.load_registry(extra_specs=self._plugin_mcp_specs)
+        )
+        self.feishu_subscription_service.reload()
+        self.wechat_gateway_service.reload()
+
+    def _reload_mcp_runtime_after_app_env_change(self) -> None:
+        try:
+            self._on_mcp_reloaded(
+                self.mcp_config_manager.load_registry(
+                    extra_specs=self._plugin_mcp_specs
+                )
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "Failed to reload MCP runtime after app environment change: %s",
+                exc,
+            )
+
+    def _reload_skills_runtime_after_app_env_change(self) -> None:
+        try:
+            self.skills_config_reload_service.reload_skills_config()
+        except Exception as exc:
+            LOGGER.warning(
+                "Failed to reload skills runtime after app environment change: %s",
+                exc,
+            )
+
+    def _reload_plugin_runtime_after_app_env_change(self) -> None:
+        sync_app_env_to_process_env(self.runtime.paths.env_file)
+        self.plugin_config_manager = PluginConfigManager.from_environment(
+            app_config_dir=self.runtime.paths.config_dir,
+            project_start_dir=self._project_start_dir,
+        )
+        self.plugin_registry = self.plugin_config_manager.load_registry()
+        self._plugin_mcp_specs = load_plugin_mcp_specs(
+            self.plugin_registry.mcp_sources()
+        )
+        self.mcp_service.replace_extra_specs(self._plugin_mcp_specs)
+        self.command_registry = CommandRegistry(
+            app_config_dir=self.runtime.paths.config_dir,
+            plugin_sources=self.plugin_registry.command_sources(),
+        )
+        self.hook_service.replace_loader(self._build_hook_loader())
+        self.role_settings_service.replace_plugin_sources(
+            self.plugin_registry.role_sources()
+        )
+        self.skills_config_reload_service.replace_plugin_sources(
+            self.plugin_registry.skill_sources()
+        )
+        self._on_mcp_reloaded(
+            self.mcp_config_manager.load_registry(extra_specs=self._plugin_mcp_specs)
+        )
+        self.skill_registry = SkillRegistry.from_config_dirs(
+            app_config_dir=self.runtime.paths.config_dir,
+            project_start_dir=self._project_start_dir,
+            plugin_sources=self.plugin_registry.skill_sources(),
+        )
+        self.skill_runtime_service = self._build_skill_runtime_service(
+            skill_registry=self.skill_registry
+        )
+        self.role_registry = self._sanitize_role_registry(
+            RoleLoader().load_builtin_app_and_plugins(
+                builtin_roles_dir=get_builtin_roles_dir(),
+                app_roles_dir=self.runtime.paths.roles_dir,
+                plugin_sources=self.plugin_registry.role_sources(),
+                allow_empty=True,
+            )
+        )
+        self.mcp_config_reload_service = McpConfigReloadService(
+            mcp_config_manager=self.mcp_config_manager,
+            role_registry=self.role_registry,
+            on_mcp_reloaded=self._on_mcp_reloaded,
+            extra_specs=self._plugin_mcp_specs,
+        )
+        self.skills_config_reload_service = SkillsConfigReloadService(
+            config_dir=self.runtime.paths.config_dir,
+            project_start_dir=self._project_start_dir,
+            plugin_sources=self.plugin_registry.skill_sources(),
+            role_registry=self.role_registry,
+            on_skill_reloaded=self._on_skill_reloaded,
+        )
+        self._refresh_coordinator_runtime()
+        self._refresh_runtime_dependents()
+
+    def reload_plugin_runtime(self) -> None:
+        self._reload_plugin_runtime_after_app_env_change()
+
+    def _on_app_environment_changed(self, changed_keys: frozenset[str]) -> None:
+        self.model_config_service.reload_model_config()
+        proxy_related_keys = {
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "SSL_VERIFY",
+        }
+        normalized_keys = {key.upper() for key in changed_keys}
+        self._reload_plugin_runtime_after_app_env_change()
+        if normalized_keys.isdisjoint(proxy_related_keys):
+            self._reload_mcp_runtime_after_app_env_change()
+        else:
+            self.proxy_config_service.reload_proxy_config()
+        self._reload_skills_runtime_after_app_env_change()
+
+    def _on_app_environment_saved(self, changed_keys: frozenset[str]) -> None:
+        synced_changed_keys = (
+            self.app_env_file_watcher.sync_current_env_for_handled_change()
+        )
+        self._on_app_environment_changed(changed_keys | synced_changed_keys)
+
+    def _ensure_default_workspace(self) -> None:
+        if self.workspace_repo.exists("default"):
+            return
+        _ = self.workspace_service.create_workspace(
+            workspace_id="default",
+            root_path=Path.cwd(),
+        )
+
+    def _interrupt_transient_background_tasks(self) -> int:
+        interrupted = self.background_task_repository.list_interruptible()
+        interrupted_ids: list[str] = []
+        for record in interrupted:
+            if (
+                record.kind == BackgroundTaskKind.SUBAGENT
+                and record.execution_mode == "foreground"
+            ):
+                continue
+            if record.pid is None:
+                LOGGER.warning(
+                    "Persisted background task lost pid before interruption cleanup",
+                    extra={"background_task_id": record.background_task_id},
+                )
+                interrupted_ids.append(record.background_task_id)
+                continue
+            killed = kill_process_tree_by_pid(record.pid)
+            if not killed:
+                LOGGER.warning(
+                    "Failed to terminate interrupted background task process",
+                    extra={
+                        "background_task_id": record.background_task_id,
+                        "pid": record.pid,
+                    },
+                )
+                continue
+            interrupted_ids.append(record.background_task_id)
+        return (
+            self.background_task_repository.mark_transient_background_tasks_interrupted(
+                background_task_ids=tuple(interrupted_ids)
+            )
+        )
+
+    def _build_skill_runtime_service(
+        self,
+        *,
+        skill_registry: SkillRegistry,
+    ) -> SkillRuntimeService:
+        skill_runtime_service = SkillRuntimeService(
+            skill_registry=skill_registry,
+            retrieval_service=self.retrieval_service,
+        )
+        skill_runtime_service.rebuild_index()
+        return skill_runtime_service

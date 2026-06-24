@@ -1,0 +1,141 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import json
+from uuid import uuid4
+
+import httpx
+
+from relay_teams.gateway.xiaoluban.models import (
+    DEFAULT_XIAOLUBAN_BASE_URL,
+    XiaolubanKeepAliveRequest,
+    XiaolubanSendTextRequest,
+    XiaolubanSendTextResponse,
+)
+from relay_teams.net import create_async_http_client
+
+
+class XiaolubanClient:
+    def __init__(self) -> None:
+        self._timeout_seconds = 30.0
+
+    async def send_text_message(
+        self,
+        *,
+        text: str,
+        receiver_uid: str,
+        auth_token: str,
+        base_url: str = DEFAULT_XIAOLUBAN_BASE_URL,
+        sender: str | None = None,
+    ) -> XiaolubanSendTextResponse:
+        request = XiaolubanSendTextRequest(
+            content=text,
+            receiver=receiver_uid,
+            auth=auth_token,
+            sender=sender,
+        )
+        try:
+            async with create_async_http_client(
+                timeout_seconds=self._timeout_seconds
+            ) as client:
+                response = await client.post(
+                    _normalize_base_url(base_url),
+                    content=request.model_dump_json().encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                )
+        except httpx.RequestError as exc:
+            raise RuntimeError(f"Xiaoluban API request failed: {exc}") from exc
+        return _parse_send_response(response)
+
+    async def keep_alive(
+        self,
+        *,
+        uid: str,
+        session_id: str,
+        auth_token: str,
+        base_url: str = DEFAULT_XIAOLUBAN_BASE_URL,
+        save_info: str = "",
+        timeout_minutes: int = 1440,
+    ) -> None:
+        request = XiaolubanKeepAliveRequest(
+            uid=uid,
+            session_id=session_id,
+            save_info=save_info,
+            minute=timeout_minutes,
+            auth=auth_token,
+        )
+        _ = await self._post_util_route(
+            base_url=base_url,
+            route="keep_alive",
+            payload_json=request.model_dump_json(),
+        )
+
+    async def _post_util_route(
+        self,
+        *,
+        base_url: str,
+        route: str,
+        payload_json: str,
+    ) -> httpx.Response:
+        try:
+            async with create_async_http_client(
+                timeout_seconds=self._timeout_seconds
+            ) as client:
+                response = await client.post(
+                    _build_util_url(base_url, route),
+                    content=payload_json.encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                )
+        except httpx.RequestError as exc:
+            raise RuntimeError(f"Xiaoluban API request failed: {exc}") from exc
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            detail = exc.response.text.strip() or str(exc)
+            raise RuntimeError(f"Xiaoluban util API request failed: {detail}") from exc
+        return response
+
+
+def _normalize_base_url(base_url: str) -> str:
+    normalized = base_url.strip()
+    if not normalized:
+        return DEFAULT_XIAOLUBAN_BASE_URL
+    return normalized
+
+
+def _build_util_url(base_url: str, route: str) -> str:
+    normalized = _normalize_base_url(base_url).rstrip("/")
+    return f"{normalized}/y/msg/util/{route.strip('/')}"
+
+
+def _parse_send_response(response: httpx.Response) -> XiaolubanSendTextResponse:
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text.strip() or str(exc)
+        raise RuntimeError(f"Xiaoluban API failed to send message: {detail}") from exc
+    raw_text = response.text.strip()
+    if not raw_text:
+        return XiaolubanSendTextResponse(message_id=f"xlbmsg_{uuid4().hex[:12]}")
+    try:
+        payload = json.loads(raw_text)
+    except json.JSONDecodeError:
+        return XiaolubanSendTextResponse(
+            message_id=f"xlbmsg_{uuid4().hex[:12]}",
+            raw_response=raw_text,
+        )
+    if isinstance(payload, dict):
+        for key in ("message_id", "msg_id", "id", "request_id"):
+            candidate = str(payload.get(key) or "").strip()
+            if candidate:
+                return XiaolubanSendTextResponse(
+                    message_id=candidate,
+                    raw_response=raw_text,
+                )
+    return XiaolubanSendTextResponse(
+        message_id=f"xlbmsg_{uuid4().hex[:12]}",
+        raw_response=raw_text,
+    )
+
+
+__all__ = ["XiaolubanClient"]

@@ -1,0 +1,372 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+from typing import Annotated, NoReturn
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import JsonValue
+
+from relay_teams.env.github_config_service import GitHubConfigService
+from relay_teams.env.public_webhook_url import (
+    build_public_base_url_path,
+    is_public_http_url,
+)
+from relay_teams.interfaces.server.deps import (
+    get_github_config_service,
+    get_github_trigger_service,
+)
+from relay_teams.triggers import (
+    GitHubRepoSubscriptionConflictError,
+    GitHubAvailableRepositoryRecord,
+    GitHubRepoSubscriptionCreateInput,
+    GitHubRepoSubscriptionRecord,
+    GitHubRepoSubscriptionUpdateInput,
+    GitHubApiError,
+    GitHubTriggerAccountCreateInput,
+    GitHubTriggerAccountNameConflictError,
+    GitHubTriggerAccountRecord,
+    GitHubTriggerAccountUpdateInput,
+    GitHubTriggerService,
+    TriggerRuleCreateInput,
+    TriggerRuleNameConflictError,
+    TriggerRuleRecord,
+    TriggerRuleUpdateInput,
+)
+from relay_teams.validation import RequiredIdentifierStr
+
+router = APIRouter(prefix="/triggers", tags=["Triggers"])
+
+
+def _raise_for_github_api_error(exc: GitHubApiError) -> NoReturn:
+    if exc.status_code == 404:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _github_delivery_callback_url(
+    request: Request,
+    github_config_service: GitHubConfigService,
+) -> str | None:
+    configured_base_url = github_config_service.get_github_config().webhook_base_url
+    if configured_base_url is not None:
+        return build_public_base_url_path(
+            configured_base_url,
+            "/api/triggers/github/deliveries",
+        )
+    request_callback_url = str(request.url_for("handle_github_delivery"))
+    if is_public_http_url(request_callback_url):
+        return request_callback_url
+    return None
+
+
+@router.get("/github/accounts", response_model=list[GitHubTriggerAccountRecord])
+async def list_github_accounts(
+    service: Annotated[GitHubTriggerService, Depends(get_github_trigger_service)],
+) -> list[GitHubTriggerAccountRecord]:
+    accounts = await service.list_accounts_async()
+    return list(accounts)
+
+
+@router.post("/github/accounts", response_model=GitHubTriggerAccountRecord)
+async def create_github_account(
+    req: GitHubTriggerAccountCreateInput,
+    service: Annotated[GitHubTriggerService, Depends(get_github_trigger_service)],
+) -> GitHubTriggerAccountRecord:
+    try:
+        return await service.create_account_async(req)
+    except GitHubTriggerAccountNameConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except GitHubApiError as exc:
+        _raise_for_github_api_error(exc)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.patch(
+    "/github/accounts/{account_id}", response_model=GitHubTriggerAccountRecord
+)
+async def update_github_account(
+    account_id: RequiredIdentifierStr,
+    req: GitHubTriggerAccountUpdateInput,
+    service: Annotated[GitHubTriggerService, Depends(get_github_trigger_service)],
+) -> GitHubTriggerAccountRecord:
+    try:
+        return await service.update_account_async(account_id, req)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except GitHubTriggerAccountNameConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except GitHubApiError as exc:
+        _raise_for_github_api_error(exc)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.delete("/github/accounts/{account_id}")
+async def delete_github_account(
+    account_id: RequiredIdentifierStr,
+    service: Annotated[GitHubTriggerService, Depends(get_github_trigger_service)],
+) -> dict[str, JsonValue]:
+    try:
+        await service.delete_account_async(account_id)
+        return {"status": "ok"}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post(
+    "/github/accounts/{account_id}:enable", response_model=GitHubTriggerAccountRecord
+)
+async def enable_github_account(
+    account_id: RequiredIdentifierStr,
+    service: Annotated[GitHubTriggerService, Depends(get_github_trigger_service)],
+) -> GitHubTriggerAccountRecord:
+    try:
+        return await service.enable_account_async(account_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except GitHubApiError as exc:
+        _raise_for_github_api_error(exc)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post(
+    "/github/accounts/{account_id}:disable", response_model=GitHubTriggerAccountRecord
+)
+async def disable_github_account(
+    account_id: RequiredIdentifierStr,
+    service: Annotated[GitHubTriggerService, Depends(get_github_trigger_service)],
+) -> GitHubTriggerAccountRecord:
+    try:
+        return await service.disable_account_async(account_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except GitHubApiError as exc:
+        _raise_for_github_api_error(exc)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/github/repos", response_model=list[GitHubRepoSubscriptionRecord])
+async def list_github_repo_subscriptions(
+    service: Annotated[GitHubTriggerService, Depends(get_github_trigger_service)],
+) -> list[GitHubRepoSubscriptionRecord]:
+    subscriptions = await service.list_repo_subscriptions_async()
+    return list(subscriptions)
+
+
+@router.get(
+    "/github/accounts/{account_id}/repositories",
+    response_model=list[GitHubAvailableRepositoryRecord],
+)
+async def list_github_available_repositories(
+    account_id: RequiredIdentifierStr,
+    service: Annotated[GitHubTriggerService, Depends(get_github_trigger_service)],
+    query: str | None = None,
+) -> list[GitHubAvailableRepositoryRecord]:
+    try:
+        repositories = await service.list_available_repositories_async(
+            account_id, query=query
+        )
+        return list(repositories)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except GitHubApiError as exc:
+        _raise_for_github_api_error(exc)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/github/repos", response_model=GitHubRepoSubscriptionRecord)
+async def create_github_repo_subscription(
+    request: Request,
+    req: GitHubRepoSubscriptionCreateInput,
+    service: Annotated[GitHubTriggerService, Depends(get_github_trigger_service)],
+    github_config_service: Annotated[
+        GitHubConfigService, Depends(get_github_config_service)
+    ],
+) -> GitHubRepoSubscriptionRecord:
+    try:
+        resolved_req = req
+        if req.callback_url is None or not req.callback_url.strip():
+            callback_url = _github_delivery_callback_url(request, github_config_service)
+            if callback_url is not None:
+                resolved_req = req.model_copy(update={"callback_url": callback_url})
+        return await service.create_repo_subscription_async(resolved_req)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except GitHubRepoSubscriptionConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except GitHubApiError as exc:
+        _raise_for_github_api_error(exc)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.patch(
+    "/github/repos/{repo_subscription_id}",
+    response_model=GitHubRepoSubscriptionRecord,
+)
+async def update_github_repo_subscription(
+    repo_subscription_id: RequiredIdentifierStr,
+    req: GitHubRepoSubscriptionUpdateInput,
+    service: Annotated[GitHubTriggerService, Depends(get_github_trigger_service)],
+) -> GitHubRepoSubscriptionRecord:
+    try:
+        return await service.update_repo_subscription_async(repo_subscription_id, req)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except GitHubRepoSubscriptionConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except GitHubApiError as exc:
+        _raise_for_github_api_error(exc)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.delete("/github/repos/{repo_subscription_id}")
+async def delete_github_repo_subscription(
+    repo_subscription_id: RequiredIdentifierStr,
+    service: Annotated[GitHubTriggerService, Depends(get_github_trigger_service)],
+) -> dict[str, JsonValue]:
+    try:
+        await service.delete_repo_subscription_async(repo_subscription_id)
+        return {"status": "ok"}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post(
+    "/github/repos/{repo_subscription_id}:enable",
+    response_model=GitHubRepoSubscriptionRecord,
+)
+async def enable_github_repo_subscription(
+    repo_subscription_id: RequiredIdentifierStr,
+    service: Annotated[GitHubTriggerService, Depends(get_github_trigger_service)],
+) -> GitHubRepoSubscriptionRecord:
+    try:
+        return await service.enable_repo_subscription_async(repo_subscription_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except GitHubApiError as exc:
+        _raise_for_github_api_error(exc)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post(
+    "/github/repos/{repo_subscription_id}:disable",
+    response_model=GitHubRepoSubscriptionRecord,
+)
+async def disable_github_repo_subscription(
+    repo_subscription_id: RequiredIdentifierStr,
+    service: Annotated[GitHubTriggerService, Depends(get_github_trigger_service)],
+) -> GitHubRepoSubscriptionRecord:
+    try:
+        return await service.disable_repo_subscription_async(repo_subscription_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except GitHubApiError as exc:
+        _raise_for_github_api_error(exc)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/github/rules", response_model=list[TriggerRuleRecord])
+async def list_github_rules(
+    service: Annotated[GitHubTriggerService, Depends(get_github_trigger_service)],
+) -> list[TriggerRuleRecord]:
+    rules = await service.list_rules_async()
+    return list(rules)
+
+
+@router.post("/github/rules", response_model=TriggerRuleRecord)
+async def create_github_rule(
+    req: TriggerRuleCreateInput,
+    service: Annotated[GitHubTriggerService, Depends(get_github_trigger_service)],
+) -> TriggerRuleRecord:
+    try:
+        return await service.create_rule_async(req)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except TriggerRuleNameConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except GitHubApiError as exc:
+        _raise_for_github_api_error(exc)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.patch("/github/rules/{trigger_rule_id}", response_model=TriggerRuleRecord)
+async def update_github_rule(
+    trigger_rule_id: RequiredIdentifierStr,
+    req: TriggerRuleUpdateInput,
+    service: Annotated[GitHubTriggerService, Depends(get_github_trigger_service)],
+) -> TriggerRuleRecord:
+    try:
+        return await service.update_rule_async(trigger_rule_id, req)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except TriggerRuleNameConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except GitHubApiError as exc:
+        _raise_for_github_api_error(exc)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.delete("/github/rules/{trigger_rule_id}")
+async def delete_github_rule(
+    trigger_rule_id: RequiredIdentifierStr,
+    service: Annotated[GitHubTriggerService, Depends(get_github_trigger_service)],
+) -> dict[str, JsonValue]:
+    try:
+        await service.delete_rule_async(trigger_rule_id)
+        return {"status": "ok"}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/github/rules/{trigger_rule_id}:enable", response_model=TriggerRuleRecord)
+async def enable_github_rule(
+    trigger_rule_id: RequiredIdentifierStr,
+    service: Annotated[GitHubTriggerService, Depends(get_github_trigger_service)],
+) -> TriggerRuleRecord:
+    try:
+        return await service.enable_rule_async(trigger_rule_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except GitHubApiError as exc:
+        _raise_for_github_api_error(exc)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post(
+    "/github/rules/{trigger_rule_id}:disable", response_model=TriggerRuleRecord
+)
+async def disable_github_rule(
+    trigger_rule_id: RequiredIdentifierStr,
+    service: Annotated[GitHubTriggerService, Depends(get_github_trigger_service)],
+) -> TriggerRuleRecord:
+    try:
+        return await service.disable_rule_async(trigger_rule_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except GitHubApiError as exc:
+        _raise_for_github_api_error(exc)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/github/deliveries")
+async def handle_github_delivery(
+    request: Request,
+    service: Annotated[GitHubTriggerService, Depends(get_github_trigger_service)],
+) -> dict[str, JsonValue]:
+    body = await request.body()
+    headers = {str(key): str(value) for key, value in request.headers.items()}
+    return await service.handle_inbound_github_delivery_async(
+        headers=headers, body=body
+    )

@@ -1,13 +1,13 @@
 /**
  * core/api/triggers.js
- * Backward-compatible Feishu gateway API wrappers.
+ * Trigger and gateway-related API wrappers.
  */
 import { requestJson } from './request.js';
 
-export async function fetchTriggers() {
+export async function fetchTriggers(options = {}) {
     const accounts = await requestJson(
         '/api/gateway/feishu/accounts',
-        undefined,
+        { signal: options.signal },
         'Failed to fetch Feishu gateway accounts',
     );
     const rows = Array.isArray(accounts) ? accounts : [];
@@ -20,7 +20,7 @@ export async function createTrigger(payload) {
         {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(toGatewayPayload(payload)),
+            body: JSON.stringify(toGatewayPayload(payload, { includeEnabled: true })),
         },
         'Failed to create Feishu gateway account',
     );
@@ -32,7 +32,9 @@ export async function updateTrigger(triggerId, payload) {
         {
             method: 'PATCH',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(toGatewayPayload(payload)),
+            body: JSON.stringify(
+                toGatewayPayload(payload, { includeEnabled: false }),
+            ),
         },
         'Failed to update Feishu gateway account',
     );
@@ -41,7 +43,11 @@ export async function updateTrigger(triggerId, payload) {
 export async function deleteTrigger(triggerId) {
     return requestJson(
         `/api/gateway/feishu/accounts/${encodeURIComponent(triggerId)}`,
-        { method: 'DELETE' },
+        {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ force: true }),
+        },
         'Failed to delete Feishu gateway account',
     );
 }
@@ -68,8 +74,190 @@ export async function rotateTriggerToken(triggerId) {
     );
 }
 
-function toGatewayPayload(payload) {
-    return {
+export async function fetchGitHubTriggerAccounts(options = {}) {
+    return requestJson(
+        '/api/triggers/github/accounts',
+        { signal: options.signal },
+        'Failed to fetch GitHub trigger accounts',
+    );
+}
+
+export async function createGitHubTriggerAccount(payload) {
+    return requestJson(
+        '/api/triggers/github/accounts',
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        'Failed to create GitHub trigger account',
+    );
+}
+
+export async function updateGitHubTriggerAccount(accountId, payload) {
+    return requestJson(
+        `/api/triggers/github/accounts/${encodeURIComponent(accountId)}`,
+        {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        'Failed to update GitHub trigger account',
+    );
+}
+
+export async function deleteGitHubTriggerAccount(accountId) {
+    return requestJson(
+        `/api/triggers/github/accounts/${encodeURIComponent(accountId)}`,
+        { method: 'DELETE' },
+        'Failed to delete GitHub trigger account',
+    );
+}
+
+export async function enableGitHubTriggerAccount(accountId) {
+    return requestJson(
+        `/api/triggers/github/accounts/${encodeURIComponent(accountId)}:enable`,
+        { method: 'POST' },
+        'Failed to enable GitHub trigger account',
+    );
+}
+
+export async function disableGitHubTriggerAccount(accountId) {
+    return requestJson(
+        `/api/triggers/github/accounts/${encodeURIComponent(accountId)}:disable`,
+        { method: 'POST' },
+        'Failed to disable GitHub trigger account',
+    );
+}
+
+export async function fetchGitHubRepoSubscriptions(options = {}) {
+    return requestJson(
+        '/api/triggers/github/repos',
+        { signal: options.signal },
+        'Failed to fetch GitHub repo subscriptions',
+    );
+}
+
+export async function fetchGitHubAccountRepositories(accountId, query = '', options = {}) {
+    const params = new URLSearchParams();
+    const normalizedQuery = String(query || '').trim();
+    if (normalizedQuery) {
+        params.set('query', normalizedQuery);
+    }
+    const suffix = params.size > 0 ? `?${params.toString()}` : '';
+    return requestJson(
+        `/api/triggers/github/accounts/${encodeURIComponent(accountId)}/repositories${suffix}`,
+        { signal: options.signal },
+        'Failed to fetch GitHub repositories',
+    );
+}
+
+export async function createGitHubRepoSubscription(payload) {
+    return requestJson(
+        '/api/triggers/github/repos',
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        'Failed to create GitHub repo subscription',
+    );
+}
+
+export async function updateGitHubRepoSubscription(repoSubscriptionId, payload) {
+    return requestJson(
+        `/api/triggers/github/repos/${encodeURIComponent(repoSubscriptionId)}`,
+        {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        'Failed to update GitHub repo subscription',
+    );
+}
+
+export async function deleteGitHubRepoSubscription(repoSubscriptionId) {
+    return requestJson(
+        `/api/triggers/github/repos/${encodeURIComponent(repoSubscriptionId)}`,
+        { method: 'DELETE' },
+        'Failed to delete GitHub repo subscription',
+    );
+}
+
+export async function enableGitHubRepoSubscription(repoSubscriptionId) {
+    return requestJson(
+        `/api/triggers/github/repos/${encodeURIComponent(repoSubscriptionId)}:enable`,
+        { method: 'POST' },
+        'Failed to enable GitHub repo subscription',
+    );
+}
+
+export async function disableGitHubRepoSubscription(repoSubscriptionId) {
+    return requestJson(
+        `/api/triggers/github/repos/${encodeURIComponent(repoSubscriptionId)}:disable`,
+        { method: 'POST' },
+        'Failed to disable GitHub repo subscription',
+    );
+}
+
+export async function fetchGitHubTriggerRules(options = {}) {
+    return requestJson(
+        '/api/triggers/github/rules',
+        { signal: options.signal },
+        'Failed to fetch GitHub trigger rules',
+    );
+}
+
+export async function createGitHubTriggerRule(payload) {
+    return requestJson(
+        '/api/triggers/github/rules',
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        'Failed to create GitHub trigger rule',
+    );
+}
+
+export async function updateGitHubTriggerRule(triggerRuleId, payload) {
+    return requestJson(
+        `/api/triggers/github/rules/${encodeURIComponent(triggerRuleId)}`,
+        {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        'Failed to update GitHub trigger rule',
+    );
+}
+
+export async function deleteGitHubTriggerRule(triggerRuleId) {
+    return requestJson(
+        `/api/triggers/github/rules/${encodeURIComponent(triggerRuleId)}`,
+        { method: 'DELETE' },
+        'Failed to delete GitHub trigger rule',
+    );
+}
+
+export async function enableGitHubTriggerRule(triggerRuleId) {
+    return requestJson(
+        `/api/triggers/github/rules/${encodeURIComponent(triggerRuleId)}:enable`,
+        { method: 'POST' },
+        'Failed to enable GitHub trigger rule',
+    );
+}
+
+export async function disableGitHubTriggerRule(triggerRuleId) {
+    return requestJson(
+        `/api/triggers/github/rules/${encodeURIComponent(triggerRuleId)}:disable`,
+        { method: 'POST' },
+        'Failed to disable GitHub trigger rule',
+    );
+}
+
+function toGatewayPayload(payload, { includeEnabled = true } = {}) {
+    const gatewayPayload = {
         name: String(payload?.name || '').trim(),
         display_name: payload?.display_name ?? null,
         source_config:
@@ -84,8 +272,11 @@ function toGatewayPayload(payload) {
             payload?.secret_config && typeof payload.secret_config === 'object'
                 ? { ...payload.secret_config }
                 : undefined,
-        enabled: payload?.enabled !== false,
     };
+    if (includeEnabled) {
+        gatewayPayload.enabled = payload?.enabled !== false;
+    }
+    return gatewayPayload;
 }
 
 function normalizeFeishuGatewayAccount(account) {

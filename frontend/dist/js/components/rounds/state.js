@@ -4,13 +4,17 @@
  */
 export const roundsState = {
     currentRounds: [],
+    timelineRounds: [],
     currentRound: null,
     scrollBound: false,
     activeRunId: null,
     activeVisibility: 0,
+    activeLockUntil: 0,
     pendingScrollTargetRunId: null,
     pendingScrollUnlockAt: 0,
-    pageSize: 8,
+    programmaticScrollUnlockAt: 0,
+    suppressNavigatorFollow: false,
+    pageSize: 3,
     paging: {
         hasMore: false,
         nextCursor: null,

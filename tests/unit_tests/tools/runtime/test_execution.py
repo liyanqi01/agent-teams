@@ -1,38 +1,88 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from pydantic import JsonValue
+import json
+from pydantic import BaseModel, JsonValue
 
 import asyncio
 import sqlite3
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import mkdtemp
+from types import SimpleNamespace
 from typing import cast
 
-from agent_teams.persistence.shared_state_repo import SharedStateRepository
-from agent_teams.notifications import NotificationService, default_notification_config
-from agent_teams.roles.role_models import RoleDefinition
-from agent_teams.roles.role_registry import RoleRegistry
-from agent_teams.sessions.runs.enums import RunEventType
-from agent_teams.sessions.runs.event_stream import RunEventHub
+import pytest
+from pydantic_ai.messages import BinaryContent, ImageUrl, ToolReturn
 
-from agent_teams.tools.runtime.approval_ticket_repo import (
+import relay_teams.tools.runtime.execution as execution_module
+from relay_teams.persistence.shared_state_repo import SharedStateRepository
+from relay_teams.persistence.scope_models import ScopeRef, ScopeType, StateMutation
+from relay_teams.notifications import NotificationService, default_notification_config
+from relay_teams.reminders import ToolResultObservation
+from relay_teams.roles.role_models import RoleDefinition
+from relay_teams.roles.role_registry import RoleRegistry
+from relay_teams.sessions.runs.enums import InjectionSource, RunEventType
+from relay_teams.hooks import (
+    HookDecision,
+    HookDecisionBundle,
+    HookDecisionType,
+    HookEventName,
+    HookExecutionResult,
+    HookExecutionStatus,
+    HookHandlerType,
+)
+from relay_teams.hooks.hook_models import HookSourceInfo, HookSourceScope
+from relay_teams.agents.execution.message_repository import MessageRepository
+from relay_teams.sessions.runs.event_stream import RunEventHub
+from relay_teams.media import (
+    MediaModality,
+    MediaRefContentPart,
+    TextContentPart,
+    UserPromptContent,
+)
+
+from relay_teams.tools.runtime.approval_ticket_repo import (
     ApprovalTicketRepository,
     ApprovalTicketStatus,
+    ApprovalTicketStatusConflictError,
 )
-from agent_teams.sessions.runs.run_runtime_repo import (
+from relay_teams.sessions.runs.run_runtime_repo import (
     RunRuntimePhase,
     RunRuntimeRepository,
     RunRuntimeStatus,
 )
-from agent_teams.tools.runtime import (
-    ToolApprovalPolicy,
-    ToolContext,
-    ToolResultProjection,
+from relay_teams.tools.runtime.context import ToolContext
+from relay_teams.tools.runtime.execution import (
+    _apply_permission_denied_hooks,
     execute_tool,
+    execute_tool_call,
 )
-from agent_teams.tools.runtime.persisted_state import load_tool_call_state
+from relay_teams.tools.runtime.models import (
+    ToolExecutionError,
+    ToolResultProjection,
+)
+from relay_teams.tools.runtime.guardrails import (
+    RuntimeGuardrailAction,
+    RuntimeGuardrailLayer,
+    RuntimeGuardrailPolicy,
+    RuntimeGuardrailRule,
+    RuntimeGuardrailRuleType,
+    RuntimeGuardrailStatus,
+)
+from relay_teams.tools.runtime.policy import ToolApprovalPolicy
+from relay_teams.tools.runtime.persisted_state import (
+    ToolApprovalMode,
+    ToolExecutionStatus,
+    load_tool_call_state,
+)
+
+
+class _TaskDraftPayload(BaseModel):
+    objective: str
+    title: str | None = None
 
 
 class _FakeRunEventHub:
@@ -41,6 +91,60 @@ class _FakeRunEventHub:
 
     def publish(self, event) -> None:
         self.events.append(event)
+
+
+class _FakeInjectionRecord:
+    def __init__(self, *, source: InjectionSource, content: UserPromptContent) -> None:
+        self.source = source
+        self.content = content
+
+    def model_dump_json(self) -> str:
+        return json.dumps(
+            {"source": self.source.value, "content": self.content},
+            ensure_ascii=False,
+        )
+
+
+class _FakeInjectionManager:
+    def __init__(self) -> None:
+        self.records: list[_FakeInjectionRecord] = []
+
+    def is_active(self, run_id: str) -> bool:
+        _ = run_id
+        return True
+
+    def enqueue(
+        self,
+        run_id: str,
+        recipient_instance_id: str,
+        *,
+        source: InjectionSource,
+        content: UserPromptContent,
+        visibility: str = "public",
+        internal_kind: str = "",
+        internal_delivery_mode: str = "",
+        internal_issue_key: str = "",
+    ) -> _FakeInjectionRecord:
+        _ = (
+            run_id,
+            recipient_instance_id,
+            visibility,
+            internal_kind,
+            internal_delivery_mode,
+            internal_issue_key,
+        )
+        record = _FakeInjectionRecord(source=source, content=content)
+        self.records.append(record)
+        return record
+
+
+class _FakeReminderService:
+    def __init__(self) -> None:
+        self.observations: list[ToolResultObservation] = []
+
+    def observe_tool_result(self, observation: ToolResultObservation) -> object:
+        self.observations.append(observation)
+        return None
 
 
 class _FakeApprovalManager:
@@ -79,6 +183,157 @@ class _FakePolicy:
         return self.needs_approval
 
 
+def test_execute_tool_persists_terminal_state_before_publishing_result_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[tuple[str, bool, int]] = []
+
+    async def fake_persist_tool_record_async(**kwargs: object) -> None:
+        runtime_meta = cast(dict[str, JsonValue], kwargs["runtime_meta"])
+        result_event_id = cast(int, kwargs.get("result_event_id", 0))
+        order.append(
+            (
+                "persist",
+                runtime_meta.get("tool_result_event_published") is True,
+                result_event_id,
+            )
+        )
+
+    async def fake_publish_tool_result_event_async(**kwargs: object) -> int:
+        visible_envelope = cast(dict[str, JsonValue], kwargs["visible_envelope"])
+        meta = cast(dict[str, JsonValue], visible_envelope["meta"])
+        order.append(
+            (
+                "publish",
+                meta.get("tool_result_event_published") is True,
+                42,
+            )
+        )
+        return 42
+
+    monkeypatch.setattr(
+        execution_module,
+        "_persist_tool_record_async",
+        fake_persist_tool_record_async,
+    )
+    monkeypatch.setattr(
+        execution_module,
+        "_publish_tool_result_event_async",
+        fake_publish_tool_result_event_async,
+    )
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("approve", "")),
+        policy=_FakePolicy(needs_approval=False),
+    )
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-order-1"
+
+    result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="search",
+            args_summary={"query": "relay"},
+            action=lambda: {"matches": 1},
+        )
+    )
+
+    assert cast(dict[str, JsonValue], result)["ok"] is True
+    assert order == [
+        ("persist", False, 0),
+        ("publish", True, 42),
+        ("persist", True, 42),
+    ]
+
+
+def test_execute_tool_ignores_post_publish_result_linkage_write_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[tuple[str, int]] = []
+
+    async def fake_persist_tool_record_async(**kwargs: object) -> None:
+        result_event_id = cast(int, kwargs.get("result_event_id", 0))
+        order.append(("persist", result_event_id))
+        if result_event_id == 42:
+            raise sqlite3.OperationalError("database is locked")
+
+    async def fake_publish_tool_result_event_async(**kwargs: object) -> int:
+        _ = kwargs
+        order.append(("publish", 42))
+        return 42
+
+    monkeypatch.setattr(
+        execution_module,
+        "_persist_tool_record_async",
+        fake_persist_tool_record_async,
+    )
+    monkeypatch.setattr(
+        execution_module,
+        "_publish_tool_result_event_async",
+        fake_publish_tool_result_event_async,
+    )
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("approve", "")),
+        policy=_FakePolicy(needs_approval=False),
+    )
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-linkage-failure"
+
+    result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="search",
+            args_summary={"query": "relay"},
+            action=lambda: {"matches": 1},
+        )
+    )
+
+    assert cast(dict[str, JsonValue], result)["ok"] is True
+    assert order == [
+        ("persist", 0),
+        ("publish", 42),
+        ("persist", 42),
+    ]
+
+
+def test_execute_tool_runs_when_pre_run_state_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    action_calls: list[str] = []
+
+    async def fake_mark_tool_running_async(**kwargs: object) -> None:
+        _ = kwargs
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(
+        execution_module,
+        "_mark_tool_running_async",
+        fake_mark_tool_running_async,
+    )
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("approve", "")),
+        policy=_FakePolicy(needs_approval=False),
+    )
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-running-state-failure"
+
+    def action() -> dict[str, int]:
+        action_calls.append("ran")
+        return {"matches": 1}
+
+    result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="search",
+            args_summary={"query": "relay"},
+            action=action,
+        )
+    )
+
+    assert action_calls == ["ran"]
+    assert cast(dict[str, JsonValue], result)["ok"] is True
+    assert len(_tool_result_payloads(deps)) == 1
+
+
 class _FakeDeps:
     def __init__(
         self,
@@ -91,6 +346,9 @@ class _FakeDeps:
         self.trace_id = "trace-1"
         self.task_id = "task-1"
         self.session_id = "session-1"
+        self.session_mode = "orchestration"
+        self.run_kind = "generate_image"
+        self.workspace_id = "workspace-1"
         self.instance_id = "inst-1"
         self.role_id = "spec_coder"
         self.role_registry = RoleRegistry()
@@ -100,7 +358,7 @@ class _FakeDeps:
                 name="Spec Coder",
                 description="Implements requested changes.",
                 version="1",
-                tools=(),
+                tools=("webfetch",),
                 system_prompt="Implement tasks.",
             )
         )
@@ -109,6 +367,14 @@ class _FakeDeps:
         self.tool_approval_manager = manager
         self.tool_approval_policy = policy
         self.notification_service = _build_notification_service(self.run_event_hub)
+        self.hook_service: object | None = None
+        self.reminder_service: object | None = None
+        self.audit_service: object | None = None
+        self.hook_runtime_env: dict[str, str] = {}
+        self.injection_manager = _FakeInjectionManager()
+        self.media_asset_service: object | None = None
+        self.workspace: object | None = None
+        self.message_repo = MessageRepository(db_path)
         self.approval_ticket_repo = ApprovalTicketRepository(db_path)
         self.run_runtime_repo = RunRuntimeRepository(db_path)
         self.shared_store = SharedStateRepository(Path(mkdtemp()) / "state.db")
@@ -155,6 +421,15 @@ def _build_notification_service(
     )
 
 
+def _tool_result_payloads(deps: _FakeDeps) -> list[dict[str, object]]:
+    return [
+        cast(dict[str, object], json.loads(event.payload_json))
+        for event in deps.run_event_hub.events
+        if event.event_type == RunEventType.TOOL_RESULT
+    ]
+
+
+@pytest.mark.timeout(5)
 def test_execute_tool_returns_standard_envelope() -> None:
     deps = _FakeDeps(
         manager=_FakeApprovalManager(wait_result=("approve", "")),
@@ -185,10 +460,220 @@ def test_execute_tool_returns_standard_envelope() -> None:
     assert record["tool"] == "read"
     assert cast(dict[str, JsonValue], record["visible_result"]) == result
     runtime_meta = cast(dict[str, JsonValue], record["runtime_meta"])
+    assert state.run_id == deps.run_id
+    assert state.session_id == deps.session_id
+    assert state.run_yolo is False
+    assert state.approval_mode == ToolApprovalMode.POLICY_EXEMPT
     assert runtime_meta["approval_required"] is False
+    assert runtime_meta["run_yolo"] is False
+    assert runtime_meta["approval_mode"] == "policy_exempt"
     assert runtime is not None
     assert runtime.status == RunRuntimeStatus.RUNNING
     assert runtime.phase == RunRuntimePhase.SUBAGENT_RUNNING
+    tool_result_payloads = _tool_result_payloads(deps)
+    assert len(tool_result_payloads) == 1
+    assert tool_result_payloads[0]["tool_name"] == "read"
+    assert tool_result_payloads[0]["tool_call_id"] == "call-read-1"
+    assert tool_result_payloads[0]["error"] is False
+    assert tool_result_payloads[0]["result"] == result
+
+
+def test_execute_tool_marks_reported_failed_result_event_as_error() -> None:
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("approve", "")),
+        policy=_FakePolicy(needs_approval=False),
+    )
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-shell-failed"
+
+    result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="shell",
+            args_summary={"command": "ls missing"},
+            action=lambda: ToolResultProjection(
+                visible_data={
+                    "status": "failed",
+                    "exit_code": 2,
+                    "output_excerpt": "missing",
+                },
+            ),
+        )
+    )
+
+    tool_result_payloads = _tool_result_payloads(deps)
+    assert result["ok"] is True
+    assert len(tool_result_payloads) == 1
+    assert tool_result_payloads[0]["tool_name"] == "shell"
+    assert tool_result_payloads[0]["tool_call_id"] == "call-shell-failed"
+    assert tool_result_payloads[0]["error"] is True
+    assert tool_result_payloads[0]["result"] == result
+
+
+def test_tool_action_limits_live_unpersisted_batch_per_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _run() -> None:
+        monkeypatch.setattr(execution_module, "PER_RUN_TOOL_ACTION_CONCURRENCY", 2)
+        monkeypatch.setattr(
+            execution_module,
+            "_GLOBAL_TOOL_ACTION_SEMAPHORE",
+            asyncio.Semaphore(8),
+        )
+        execution_module._RUN_TOOL_ACTION_GATES.clear()
+
+        ctx = SimpleNamespace(
+            deps=SimpleNamespace(run_id="run-burst", session_id="session-burst"),
+            tool_call_id="tool-burst",
+        )
+        active = 0
+        max_active = 0
+        lock = threading.Lock()
+
+        def action() -> str:
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.04)
+            with lock:
+                active -= 1
+            return "ok"
+
+        tasks = [
+            asyncio.create_task(
+                execution_module._invoke_tool_action_with_limits(
+                    ctx=cast(ToolContext, cast(object, ctx)),
+                    action=action,
+                    tool_input={},
+                )
+            )
+            for _ in range(10)
+        ]
+        results = await asyncio.gather(*tasks)
+
+        assert results == ["ok"] * 10
+        assert max_active <= 2
+        assert "run-burst" not in execution_module._RUN_TOOL_ACTION_GATES
+
+    asyncio.run(_run())
+
+
+def test_tool_action_run_gate_waiters_do_not_hold_global_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _run() -> None:
+        monkeypatch.setattr(execution_module, "PER_RUN_TOOL_ACTION_CONCURRENCY", 1)
+        monkeypatch.setattr(
+            execution_module,
+            "_GLOBAL_TOOL_ACTION_SEMAPHORE",
+            asyncio.Semaphore(2),
+        )
+        execution_module._RUN_TOOL_ACTION_GATES.clear()
+
+        ctx_a = SimpleNamespace(
+            deps=SimpleNamespace(run_id="run-a", session_id="session-a"),
+            tool_call_id="tool-a",
+        )
+        ctx_b = SimpleNamespace(
+            deps=SimpleNamespace(run_id="run-b", session_id="session-b"),
+            tool_call_id="tool-b",
+        )
+        first_a_started = asyncio.Event()
+        release_first_a = asyncio.Event()
+        run_b_started = asyncio.Event()
+
+        async def slow_run_a_action() -> str:
+            first_a_started.set()
+            await release_first_a.wait()
+            return "a1"
+
+        async def queued_run_a_action() -> str:
+            return "a2"
+
+        async def run_b_action() -> str:
+            run_b_started.set()
+            return "b1"
+
+        first_a_task = asyncio.create_task(
+            execution_module._invoke_tool_action_with_limits(
+                ctx=cast(ToolContext, cast(object, ctx_a)),
+                action=slow_run_a_action,
+                tool_input={},
+            )
+        )
+        await first_a_started.wait()
+        second_a_task = asyncio.create_task(
+            execution_module._invoke_tool_action_with_limits(
+                ctx=cast(ToolContext, cast(object, ctx_a)),
+                action=queued_run_a_action,
+                tool_input={},
+            )
+        )
+        await asyncio.sleep(0.02)
+        run_b_task = asyncio.create_task(
+            execution_module._invoke_tool_action_with_limits(
+                ctx=cast(ToolContext, cast(object, ctx_b)),
+                action=run_b_action,
+                tool_input={},
+            )
+        )
+
+        try:
+            await asyncio.wait_for(run_b_started.wait(), timeout=0.1)
+            run_b_started_before_first_a_released = True
+        except TimeoutError:
+            run_b_started_before_first_a_released = False
+        finally:
+            release_first_a.set()
+
+        results = await asyncio.gather(first_a_task, second_a_task, run_b_task)
+
+        assert run_b_started_before_first_a_released is True
+        assert results == ["a1", "a2", "b1"]
+        assert execution_module._RUN_TOOL_ACTION_GATES == {}
+
+    asyncio.run(_run())
+
+
+def test_execute_tool_call_reuses_persisted_result_for_duplicate_tool_call_id() -> None:
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("approve", "")),
+        policy=_FakePolicy(needs_approval=False),
+    )
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-read-duplicate"
+    call_count = 0
+
+    def action(path: str) -> dict[str, JsonValue]:
+        nonlocal call_count
+        assert path == "README.md"
+        call_count += 1
+        return {"value": call_count}
+
+    first = asyncio.run(
+        execute_tool_call(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="read",
+            args_summary={"path_len": len("README.md")},
+            action=action,
+            raw_args={"ctx": ctx, "path": "README.md"},
+        )
+    )
+    second = asyncio.run(
+        execute_tool_call(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="read",
+            args_summary={"path_len": len("README.md")},
+            action=lambda path: {"path": path, "value": 999},
+            raw_args={"ctx": ctx, "path": "README.md"},
+        )
+    )
+
+    assert call_count == 1
+    assert second == first
+    assert cast(dict[str, JsonValue], second)["data"] == {"value": 1}
+    assert len(_tool_result_payloads(deps)) == 1
 
 
 def test_execute_tool_skips_approval_flow_when_yolo_enabled() -> None:
@@ -205,8 +690,10 @@ def test_execute_tool_skips_approval_flow_when_yolo_enabled() -> None:
     result = asyncio.run(
         execute_tool(
             cast(ToolContext, cast(object, ctx)),
-            tool_name="shell",
-            args_summary={"command": "pwd"},
+            tool_name="webfetch",
+            args_summary={"url": "https://example.com/docs"},
+            approval_args_summary={"host": "example.com"},
+            keep_approval_ticket_reusable=True,
             action=lambda: {"stdout": "/tmp"},
         )
     )
@@ -224,11 +711,54 @@ def test_execute_tool_skips_approval_flow_when_yolo_enabled() -> None:
         dict[str, JsonValue],
         cast(dict[str, JsonValue], state.result_envelope)["runtime_meta"],
     )
+    assert state.run_yolo is True
+    assert state.approval_mode == ToolApprovalMode.YOLO
     assert runtime_meta["approval_required"] is False
     assert runtime_meta["approval_status"] == "not_required"
+    assert runtime_meta["run_yolo"] is True
+    assert runtime_meta["approval_mode"] == "yolo"
     assert deps.approval_ticket_repo.get("call-model-yolo") is None
     assert manager.last_open is None
     assert not any(
+        event.event_type == RunEventType.TOOL_APPROVAL_REQUESTED
+        for event in deps.run_event_hub.events
+    )
+
+
+def test_execute_tool_force_approval_uses_approval_flow_even_when_yolo_enabled() -> (
+    None
+):
+    manager = _FakeApprovalManager(wait_result=("approve", ""))
+    deps = _FakeDeps(
+        manager=manager,
+        policy=ToolApprovalPolicy(
+            yolo=True,
+            timeout_seconds=0.01,
+        ),
+    )
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-force-approval"
+    result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="webfetch",
+            args_summary={"url": "https://example.com"},
+            action=lambda: {"enabled": True},
+            force_approval=True,
+        )
+    )
+
+    state = load_tool_call_state(
+        shared_store=deps.shared_store,
+        task_id=deps.task_id,
+        tool_call_id="call-force-approval",
+    )
+    assert result["ok"] is True
+    assert manager.last_open is not None
+    assert state is not None
+    assert state.run_yolo is True
+    assert state.approval_mode == ToolApprovalMode.APPROVAL_FLOW
+    assert any(
         event.event_type == RunEventType.TOOL_APPROVAL_REQUESTED
         for event in deps.run_event_hub.events
     )
@@ -265,8 +795,12 @@ def test_execute_tool_returns_denied_error_when_approval_rejected() -> None:
         dict[str, JsonValue],
         cast(dict[str, JsonValue], state.result_envelope)["runtime_meta"],
     )
+    assert state.run_yolo is False
+    assert state.approval_mode == ToolApprovalMode.APPROVAL_FLOW
     assert runtime_meta["approval_required"] is True
     assert runtime_meta["approval_status"] == "deny"
+    assert runtime_meta["run_yolo"] is False
+    assert runtime_meta["approval_mode"] == "approval_flow"
     assert any(
         event.event_type == RunEventType.TOOL_APPROVAL_REQUESTED
         for event in deps.run_event_hub.events
@@ -281,6 +815,12 @@ def test_execute_tool_returns_denied_error_when_approval_rejected() -> None:
     )
     assert ticket is not None
     assert ticket.status == ApprovalTicketStatus.DENIED
+    tool_result_payloads = _tool_result_payloads(deps)
+    assert len(tool_result_payloads) == 1
+    assert tool_result_payloads[0]["tool_name"] == "write"
+    assert tool_result_payloads[0]["tool_call_id"] == "call-model-deny"
+    assert tool_result_payloads[0]["error"] is True
+    assert tool_result_payloads[0]["result"] == result
 
 
 def test_execute_tool_returns_timeout_error_when_approval_times_out() -> None:
@@ -314,9 +854,263 @@ def test_execute_tool_returns_timeout_error_when_approval_times_out() -> None:
         dict[str, JsonValue],
         cast(dict[str, JsonValue], state.result_envelope)["runtime_meta"],
     )
+    assert state.approval_mode == ToolApprovalMode.APPROVAL_FLOW
     assert runtime_meta["approval_status"] == "timeout"
+    assert runtime_meta["approval_mode"] == "approval_flow"
     assert ticket is not None
     assert ticket.status == ApprovalTicketStatus.TIMED_OUT
+
+
+def test_execute_tool_honors_persisted_approval_when_timeout_loses_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(timeout=True),
+        policy=_FakePolicy(needs_approval=True, timeout_seconds=0.01),
+    )
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-model-race"
+    original_resolve_async = deps.approval_ticket_repo.resolve_async
+
+    async def resolve_with_approved_race(
+        *,
+        tool_call_id: str,
+        status: ApprovalTicketStatus,
+        feedback: str = "",
+        expected_status: ApprovalTicketStatus | None = None,
+    ):
+        if (
+            tool_call_id == "call-model-race"
+            and status == ApprovalTicketStatus.TIMED_OUT
+            and expected_status == ApprovalTicketStatus.REQUESTED
+        ):
+            _ = await original_resolve_async(
+                tool_call_id=tool_call_id,
+                status=ApprovalTicketStatus.APPROVED,
+                feedback="approved elsewhere",
+            )
+            raise ApprovalTicketStatusConflictError(
+                tool_call_id=tool_call_id,
+                expected_status=ApprovalTicketStatus.REQUESTED,
+                actual_status=ApprovalTicketStatus.APPROVED,
+            )
+        return await original_resolve_async(
+            tool_call_id=tool_call_id,
+            status=status,
+            feedback=feedback,
+            expected_status=expected_status,
+        )
+
+    monkeypatch.setattr(
+        deps.approval_ticket_repo, "resolve_async", resolve_with_approved_race
+    )
+
+    result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="shell",
+            args_summary={"command": "echo hi"},
+            action=lambda: "executed",
+        )
+    )
+
+    ticket = deps.approval_ticket_repo.get("call-model-race")
+    assert result["ok"] is True
+    assert result["data"] == "executed"
+    assert ticket is not None
+    assert ticket.status == ApprovalTicketStatus.COMPLETED
+
+
+def test_execute_tool_preserves_custom_tool_error_details() -> None:
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("approve", "")),
+        policy=_FakePolicy(needs_approval=False),
+    )
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-webfetch-error"
+
+    result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="webfetch",
+            args_summary={"url": "https://example.com"},
+            action=lambda: _raise_tool_execution_error(),
+        )
+    )
+
+    error = cast(dict[str, JsonValue], result["error"])
+    meta = cast(dict[str, JsonValue], result["meta"])
+    assert result["ok"] is False
+    assert error["type"] == "source_access_denied"
+    assert error["retryable"] is False
+    assert cast(dict[str, JsonValue], error["details"]) == {
+        "url_host": "example.com",
+        "status_code": 403,
+    }
+    assert cast(dict[str, JsonValue], meta["error_details"]) == {
+        "url_host": "example.com",
+        "status_code": 403,
+    }
+    tool_result_payloads = _tool_result_payloads(deps)
+    assert len(tool_result_payloads) == 1
+    assert tool_result_payloads[0]["tool_name"] == "webfetch"
+    assert tool_result_payloads[0]["tool_call_id"] == "call-webfetch-error"
+    assert tool_result_payloads[0]["error"] is True
+    assert tool_result_payloads[0]["result"] == result
+
+
+def test_execute_tool_publishes_sanitized_dispatch_task_result_immediately() -> None:
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("approve", "")),
+        policy=_FakePolicy(needs_approval=False),
+    )
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "dispatch-call-1"
+
+    result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="orch_dispatch_task",
+            args_summary={"task_name": "ask_time"},
+            action=lambda: {
+                "task_status": {
+                    "ask_time": {
+                        "task_name": "ask_time",
+                        "task_id": "task-1",
+                        "role_id": "time",
+                        "instance_id": "inst-1",
+                        "status": "completed",
+                        "result": "Current time is 2026-03-07 00:41:29.",
+                        "error": "Task stopped by user",
+                    }
+                }
+            },
+        )
+    )
+
+    tool_result_payloads = _tool_result_payloads(deps)
+    assert len(tool_result_payloads) == 1
+    payload_result = cast(dict[str, object], tool_result_payloads[0]["result"])
+    task_status = cast(
+        dict[str, object],
+        cast(dict[str, object], payload_result["data"])["task_status"],
+    )["ask_time"]
+    task_status_payload = cast(dict[str, object], task_status)
+    assert tool_result_payloads[0]["tool_name"] == "orch_dispatch_task"
+    assert tool_result_payloads[0]["tool_call_id"] == "dispatch-call-1"
+    assert tool_result_payloads[0]["error"] is False
+    assert task_status_payload["status"] == "completed"
+    assert task_status_payload["result"] == "Current time is 2026-03-07 00:41:29."
+    assert "error" not in task_status_payload
+    assert result["ok"] is True
+
+
+def test_execute_tool_marks_value_error_as_non_retryable() -> None:
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("approve", "")),
+        policy=_FakePolicy(needs_approval=False),
+    )
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-validation-error-1"
+
+    result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="write",
+            args_summary={"path": "notes.txt"},
+            action=lambda: (_ for _ in ()).throw(ValueError("missing path")),
+        )
+    )
+
+    error = cast(dict[str, JsonValue], result["error"])
+    assert result["ok"] is False
+    assert error["type"] == "validation_error"
+    assert error["retryable"] is False
+
+
+def test_execute_tool_call_rehydrates_pydantic_model_lists_from_future_annotations() -> (
+    None
+):
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("approve", "")),
+        policy=_FakePolicy(needs_approval=False),
+    )
+    ctx = _FakeCtx(deps)
+    captured_types: list[type[object]] = []
+
+    async def _action(tasks: list[_TaskDraftPayload]) -> dict[str, JsonValue]:
+        captured_types.extend(type(task) for task in tasks)
+        return {
+            "titles": [task.title for task in tasks],
+        }
+
+    result = asyncio.run(
+        execute_tool_call(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="orch_create_tasks",
+            args_summary={"task_count": 1},
+            action=_action,
+            raw_args={
+                "ctx": ctx,
+                "tasks": [
+                    _TaskDraftPayload(
+                        objective="Implement the endpoint",
+                        title="Endpoint implementation",
+                    )
+                ],
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["data"] == {"titles": ["Endpoint implementation"]}
+    assert captured_types == [_TaskDraftPayload]
+
+
+def test_execute_tool_call_rehydrates_optional_pydantic_models_from_future_annotations() -> (
+    None
+):
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("approve", "")),
+        policy=_FakePolicy(needs_approval=False),
+    )
+    ctx = _FakeCtx(deps)
+    captured_type: list[type[object]] = []
+
+    async def _action(task: _TaskDraftPayload | None = None) -> dict[str, JsonValue]:
+        if task is None:
+            return {"title": None}
+        captured_type.append(type(task))
+        return {"title": task.title}
+
+    result = asyncio.run(
+        execute_tool_call(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="create_task",
+            args_summary={"has_task": True},
+            action=_action,
+            raw_args={
+                "ctx": ctx,
+                "task": _TaskDraftPayload(
+                    objective="Implement the endpoint",
+                    title="Endpoint implementation",
+                ),
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["data"] == {"title": "Endpoint implementation"}
+    assert captured_type == [_TaskDraftPayload]
+
+
+def _raise_tool_execution_error() -> object:
+    raise ToolExecutionError(
+        error_type="source_access_denied",
+        message="Web fetch failed for example.com with HTTP 403",
+        retryable=False,
+        details={"url_host": "example.com", "status_code": 403},
+    )
 
 
 def test_execute_tool_approval_uses_model_tool_call_id_when_present() -> None:
@@ -387,6 +1181,73 @@ def test_execute_tool_reuses_approved_ticket_without_reopening_request() -> None
     assert ticket.status == ApprovalTicketStatus.COMPLETED
 
 
+def test_execute_tool_reuses_host_scoped_approval_identity_after_success() -> None:
+    manager = _FakeApprovalManager(wait_result=("approve", ""))
+    deps = _FakeDeps(
+        manager=manager,
+        policy=_FakePolicy(needs_approval=True),
+    )
+    first_ctx = _FakeCtx(deps)
+    first_ctx.tool_call_id = "call-webfetch-1"
+    first_result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, first_ctx)),
+            tool_name="webfetch",
+            args_summary={"url": "https://example.com/docs/start"},
+            approval_args_summary={"host": "example.com"},
+            keep_approval_ticket_reusable=True,
+            action=lambda: "first",
+        )
+    )
+
+    first_state = load_tool_call_state(
+        shared_store=deps.shared_store,
+        task_id=deps.task_id,
+        tool_call_id="call-webfetch-1",
+    )
+    first_ticket = deps.approval_ticket_repo.get("call-webfetch-1")
+    assert first_result["ok"] is True
+    assert first_state is not None
+    assert first_state.args_preview == '{"url": "https://example.com/docs/start"}'
+    assert first_ticket is not None
+    assert first_ticket.status == ApprovalTicketStatus.APPROVED
+
+    manager.last_open = None
+    second_ctx = _FakeCtx(deps)
+    second_ctx.tool_call_id = "call-webfetch-2"
+    second_result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, second_ctx)),
+            tool_name="webfetch",
+            args_summary={"url": "https://example.com/docs/next"},
+            approval_args_summary={"host": "example.com"},
+            keep_approval_ticket_reusable=True,
+            action=lambda: "second",
+        )
+    )
+
+    second_state = load_tool_call_state(
+        shared_store=deps.shared_store,
+        task_id=deps.task_id,
+        tool_call_id="call-webfetch-2",
+    )
+    assert second_result["ok"] is True
+    assert second_result["data"] == "second"
+    assert second_state is not None
+    assert second_state.args_preview == '{"url": "https://example.com/docs/next"}'
+    assert manager.last_open is None
+    assert (
+        len(
+            [
+                event
+                for event in deps.run_event_hub.events
+                if event.event_type == RunEventType.TOOL_APPROVAL_REQUESTED
+            ]
+        )
+        == 1
+    )
+
+
 def test_execute_tool_republishes_requested_ticket_when_reopened() -> None:
     manager = _FakeApprovalManager(wait_result=("approve", ""))
     deps = _FakeDeps(
@@ -455,18 +1316,562 @@ def test_execute_tool_supports_projection_with_separate_visible_and_internal_dat
         tool_call_id="call-projection-1",
     )
 
-    assert result == {
-        "ok": True,
-        "data": {"output": "/tmp", "exit_code": 0},
-        "error": None,
-    }
+    assert result["ok"] is True
+    assert result["data"] == {"output": "/tmp", "exit_code": 0}
+    assert result["error"] is None
+    meta = cast(dict[str, JsonValue], result["meta"])
+    assert meta["approval_required"] is False
+    assert meta["approval_status"] == "not_required"
+    assert meta["approval_mode"] == "policy_exempt"
+    duration_ms = cast(int, meta["duration_ms"])
+    assert duration_ms >= 0
     assert state is not None
     assert state.result_envelope is not None
+    assert state.approval_mode == ToolApprovalMode.POLICY_EXEMPT
     internal_data = cast(
         dict[str, JsonValue],
         cast(dict[str, JsonValue], state.result_envelope)["internal_data"],
     )
     assert internal_data["stdout"] == "/tmp\n"
+
+
+def test_execute_tool_reports_failed_status_projection_to_reminders() -> None:
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("approve", "")),
+        policy=_FakePolicy(needs_approval=False),
+    )
+    reminder_service = _FakeReminderService()
+    deps.reminder_service = reminder_service
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-shell-failed-status"
+
+    result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="shell",
+            args_summary={"command": "cat missing.txt"},
+            action=lambda: ToolResultProjection(
+                visible_data={
+                    "status": "failed",
+                    "command": "cat missing.txt",
+                    "exit_code": 1,
+                    "output_excerpt": "cat: missing.txt: No such file or directory",
+                },
+                internal_data={
+                    "status": "failed",
+                    "command": "cat missing.txt",
+                    "exit_code": 1,
+                },
+            ),
+        )
+    )
+
+    assert result["ok"] is True
+    assert len(reminder_service.observations) == 1
+    observation = reminder_service.observations[0]
+    assert observation.ok is False
+    assert observation.error_type == "reported_failed_status"
+    assert observation.error_message == "cat: missing.txt: No such file or directory"
+
+
+def test_execute_tool_ignores_domain_failed_status_for_successful_tools() -> None:
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("approve", "")),
+        policy=_FakePolicy(needs_approval=False),
+    )
+    reminder_service = _FakeReminderService()
+    deps.reminder_service = reminder_service
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-background-status"
+
+    result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="wait_background_task",
+            args_summary={"background_task_id": "bg-1"},
+            action=lambda: ToolResultProjection(
+                visible_data={
+                    "status": "failed",
+                    "background_task_id": "bg-1",
+                    "output": "background task failed after the wait completed",
+                },
+                internal_data={
+                    "status": "failed",
+                    "background_task_id": "bg-1",
+                },
+            ),
+        )
+    )
+
+    assert result["ok"] is True
+    assert len(reminder_service.observations) == 1
+    observation = reminder_service.observations[0]
+    assert observation.ok is True
+    assert observation.error_type == ""
+    assert observation.error_message == ""
+
+
+def test_reported_failure_helper_scopes_to_shell_failure_projections() -> None:
+    assert (
+        execution_module._reported_failure_from_success_envelope(
+            tool_name="shell",
+            envelope={"ok": False},
+        )
+        is None
+    )
+    assert (
+        execution_module._reported_failure_from_success_envelope(
+            tool_name="wait_background_task",
+            envelope={"ok": True, "data": {"status": "failed", "exit_code": 1}},
+        )
+        is None
+    )
+    assert (
+        execution_module._reported_failure_from_success_envelope(
+            tool_name="shell",
+            envelope={"ok": True, "data": "failed"},
+        )
+        is None
+    )
+    assert (
+        execution_module._reported_failure_from_success_envelope(
+            tool_name="shell",
+            envelope={"ok": True, "data": {"status": "completed", "exit_code": 1}},
+        )
+        is None
+    )
+    assert (
+        execution_module._reported_failure_from_success_envelope(
+            tool_name="shell",
+            envelope={"ok": True, "data": {"status": "failed", "exit_code": 0}},
+        )
+        is None
+    )
+    assert execution_module._reported_failure_from_success_envelope(
+        tool_name="shell",
+        envelope={
+            "ok": True,
+            "data": {
+                "status": "failed",
+                "exit_code": 2,
+                "recent_output": ["line one", "line two"],
+            },
+        },
+    ) == ("reported_failed_status", "line one\nline two")
+    assert execution_module._reported_failure_from_success_envelope(
+        tool_name="shell",
+        envelope={
+            "ok": True,
+            "data": {
+                "status": "failed",
+                "exit_code": 3,
+                "command": "cat missing.txt",
+            },
+        },
+    ) == ("reported_failed_status", "Command failed with exit code 3: cat missing.txt")
+    assert execution_module._reported_failure_from_success_envelope(
+        tool_name="shell",
+        envelope={
+            "ok": True,
+            "data": {
+                "status": "failed",
+                "exit_code": 1,
+            },
+        },
+    ) == ("reported_failed_status", "The tool result reported failed status.")
+
+
+def test_execute_tool_returns_tool_return_for_tool_content_parts() -> None:
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("approve", "")),
+        policy=_FakePolicy(needs_approval=False),
+    )
+    deps.media_asset_service = SimpleNamespace()
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-read-image-1"
+
+    result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="read",
+            args_summary={"path": "docs/example.png"},
+            action=lambda: ToolResultProjection(
+                visible_data={"type": "image"},
+                tool_content_parts=(TextContentPart(text="attached image"),),
+            ),
+            allow_tool_return=True,
+        )
+    )
+
+    state = load_tool_call_state(
+        shared_store=deps.shared_store,
+        task_id=deps.task_id,
+        tool_call_id="call-read-image-1",
+    )
+
+    assert isinstance(result, ToolReturn)
+    payload = cast(dict[str, JsonValue], result.return_value)
+    meta = cast(dict[str, JsonValue], payload["meta"])
+    assert payload["ok"] is True
+    assert payload["data"] == {"type": "image"}
+    assert payload["error"] is None
+    assert isinstance(meta["duration_ms"], int | float)
+    assert meta["approval_required"] is False
+    assert meta["approval_status"] == "not_required"
+    assert meta["approval_mode"] == "policy_exempt"
+    assert meta["run_yolo"] is False
+    assert meta["tool_result_event_published"] is True
+    assert result.content == "attached image"
+    assert state is not None
+    assert state.result_envelope is not None
+    assert state.call_state == {}
+
+
+def test_execute_tool_call_allows_tool_return_passthrough() -> None:
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("approve", "")),
+        policy=_FakePolicy(needs_approval=False),
+    )
+    deps.media_asset_service = SimpleNamespace()
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-read-image-wrapper"
+
+    result = asyncio.run(
+        execute_tool_call(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="read",
+            args_summary={"path": "docs/example.png"},
+            action=lambda path: ToolResultProjection(
+                visible_data={"path": path},
+                tool_content_parts=(TextContentPart(text="attached image"),),
+            ),
+            raw_args={"ctx": ctx, "path": "docs/example.png"},
+            allow_tool_return=True,
+        )
+    )
+
+    assert isinstance(result, ToolReturn)
+    assert result.content == "attached image"
+    assert cast(dict[str, JsonValue], result.return_value)["data"] == {
+        "path": "docs/example.png"
+    }
+
+
+def test_execute_tool_reuses_duplicate_tool_return_content() -> None:
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("approve", "")),
+        policy=_FakePolicy(needs_approval=False),
+    )
+    deps.media_asset_service = SimpleNamespace()
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-read-image-duplicate"
+    call_count = 0
+
+    def action() -> ToolResultProjection:
+        nonlocal call_count
+        call_count += 1
+        return ToolResultProjection(
+            visible_data={"type": "image", "count": call_count},
+            tool_content_parts=(TextContentPart(text="attached image"),),
+        )
+
+    first = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="read",
+            args_summary={"path": "docs/example.png"},
+            action=action,
+            allow_tool_return=True,
+        )
+    )
+    second = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="read",
+            args_summary={"path": "docs/example.png"},
+            action=lambda: ToolResultProjection(
+                visible_data={"type": "image", "count": 999},
+                tool_content_parts=(TextContentPart(text="wrong image"),),
+            ),
+            allow_tool_return=True,
+        )
+    )
+
+    assert call_count == 1
+    assert isinstance(first, ToolReturn)
+    assert isinstance(second, ToolReturn)
+    assert second.return_value == first.return_value
+    assert second.content == "attached image"
+    assert len(_tool_result_payloads(deps)) == 1
+
+
+def test_execute_tool_returns_error_when_duplicate_hydration_fails() -> None:
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("approve", "")),
+        policy=_FakePolicy(needs_approval=False),
+    )
+
+    class _FakeMediaAssetService:
+        def to_provider_user_prompt_content(self, *, parts: object) -> object:
+            _ = parts
+            return ("attached image",)
+
+        def hydrate_user_prompt_content(self, *, content: object) -> object:
+            _ = content
+            return "hydrated image"
+
+    deps.media_asset_service = _FakeMediaAssetService()
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-read-image-duplicate-hydration-error"
+    call_count = 0
+    media_part = MediaRefContentPart(
+        asset_id="asset-1",
+        session_id=deps.session_id,
+        modality=MediaModality.IMAGE,
+        mime_type="image/png",
+        url="/api/sessions/session-1/media/asset-1/file",
+        name="example.png",
+    )
+
+    def action() -> ToolResultProjection:
+        nonlocal call_count
+        call_count += 1
+        return ToolResultProjection(
+            visible_data={"type": "image", "count": call_count},
+            tool_content_parts=(media_part,),
+        )
+
+    first = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="read",
+            args_summary={"path": "docs/example.png"},
+            action=action,
+            allow_tool_return=True,
+        )
+    )
+    deps.media_asset_service = None
+    second = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="read",
+            args_summary={"path": "docs/example.png"},
+            action=action,
+            allow_tool_return=True,
+        )
+    )
+
+    assert call_count == 1
+    assert isinstance(first, ToolReturn)
+    assert isinstance(second, dict)
+    assert second["ok"] is False
+    error = cast(dict[str, JsonValue], second["error"])
+    meta = cast(dict[str, JsonValue], second["meta"])
+    assert error["message"] == (
+        "Tool read returned media content without media asset support."
+    )
+    assert meta["reused_tool_call"] is True
+    assert len(_tool_result_payloads(deps)) == 1
+
+
+def test_execute_tool_hydrates_local_media_tool_return_content() -> None:
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("approve", "")),
+        policy=_FakePolicy(needs_approval=False),
+    )
+
+    class _FakeMediaAssetService:
+        def to_provider_user_prompt_content(self, *, parts: object) -> object:
+            _ = parts
+            return (
+                ImageUrl(
+                    url="http://127.0.0.1:8000/api/sessions/session-1/media/asset-1/file",
+                    media_type="image/png",
+                    force_download="allow-local",
+                ),
+            )
+
+        def hydrate_user_prompt_content(self, *, content: object) -> object:
+            if isinstance(content, tuple):
+                return (
+                    BinaryContent(
+                        data=b"image-bytes",
+                        media_type="image/png",
+                    ),
+                )
+            return content
+
+    deps.media_asset_service = _FakeMediaAssetService()
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-read-image-hydrated-1"
+
+    result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="read",
+            args_summary={"path": "docs/example.png"},
+            action=lambda: ToolResultProjection(
+                visible_data={"type": "image"},
+                tool_content_parts=(
+                    MediaRefContentPart(
+                        asset_id="asset-1",
+                        session_id=deps.session_id,
+                        modality=MediaModality.IMAGE,
+                        mime_type="image/png",
+                        url="/api/sessions/session-1/media/asset-1/file",
+                        name="example.png",
+                    ),
+                ),
+            ),
+            allow_tool_return=True,
+        )
+    )
+
+    assert isinstance(result, ToolReturn)
+    assert isinstance(result.content, tuple)
+    assert len(result.content) == 1
+    assert isinstance(result.content[0], BinaryContent)
+    assert result.content[0].data == b"image-bytes"
+
+
+def test_execute_tool_rejects_model_content_without_tool_return_support() -> None:
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("approve", "")),
+        policy=_FakePolicy(needs_approval=False),
+    )
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-read-image-no-tool-return-1"
+
+    result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="read",
+            args_summary={"path": "docs/example.png"},
+            action=lambda: ToolResultProjection(
+                visible_data={"type": "image"},
+                tool_content_parts=(TextContentPart(text="attached image"),),
+            ),
+        )
+    )
+
+    state = load_tool_call_state(
+        shared_store=deps.shared_store,
+        task_id=deps.task_id,
+        tool_call_id="call-read-image-no-tool-return-1",
+    )
+
+    assert isinstance(result, dict)
+    assert result["ok"] is False
+    error = cast(dict[str, JsonValue], result["error"])
+    assert error["message"] == (
+        "Tool read produced model content without enabling tool returns."
+    )
+    assert state is not None
+    assert state.execution_status == ToolExecutionStatus.FAILED
+    assert state.result_envelope is not None
+    record = cast(dict[str, JsonValue], state.result_envelope)
+    assert record["tool"] == "read"
+    assert cast(dict[str, JsonValue], record["visible_result"]) == result
+    tool_result_payloads = _tool_result_payloads(deps)
+    assert len(tool_result_payloads) == 1
+    assert tool_result_payloads[0]["tool_name"] == "read"
+    assert tool_result_payloads[0]["tool_call_id"] == "call-read-image-no-tool-return-1"
+    assert tool_result_payloads[0]["error"] is True
+    assert tool_result_payloads[0]["result"] == result
+
+
+def test_tool_return_content_handles_empty_missing_media_and_hydrated_text() -> None:
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("approve", "")),
+        policy=_FakePolicy(needs_approval=False),
+    )
+    ctx = _FakeCtx(deps)
+
+    assert (
+        execution_module._tool_return_content(
+            ctx=cast(ToolContext, cast(object, ctx)),
+            tool_name="read",
+            tool_content_parts=(),
+        )
+        == ""
+    )
+
+    media_part = MediaRefContentPart(
+        asset_id="asset-1",
+        session_id=deps.session_id,
+        modality=MediaModality.IMAGE,
+        mime_type="image/png",
+        url="/api/sessions/session-1/media/asset-1/file",
+        name="example.png",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Tool read returned media content without media asset support",
+    ):
+        execution_module._tool_return_content(
+            ctx=cast(ToolContext, cast(object, ctx)),
+            tool_name="read",
+            tool_content_parts=(media_part,),
+        )
+
+    class _FakeMediaAssetService:
+        def to_provider_user_prompt_content(self, *, parts: object) -> object:
+            _ = parts
+            return ("attached image",)
+
+        def hydrate_user_prompt_content(self, *, content: object) -> object:
+            _ = content
+            return "flattened image"
+
+    deps.media_asset_service = _FakeMediaAssetService()
+
+    assert (
+        execution_module._tool_return_content(
+            ctx=cast(ToolContext, cast(object, ctx)),
+            tool_name="read",
+            tool_content_parts=(media_part,),
+        )
+        == "flattened image"
+    )
+
+
+def test_load_tool_call_state_tolerates_legacy_rows_without_yolo_fields() -> None:
+    shared_store = SharedStateRepository(Path(mkdtemp()) / "legacy-state.db")
+    shared_store.manage_state(
+        StateMutation(
+            scope=ScopeRef(scope_type=ScopeType.TASK, scope_id="task-legacy"),
+            key="tool_call_state:call-legacy",
+            value_json=json.dumps(
+                {
+                    "tool_call_id": "call-legacy",
+                    "tool_name": "websearch",
+                    "instance_id": "inst-legacy",
+                    "role_id": "spec_coder",
+                    "args_preview": '{"query":"legacy"}',
+                    "approval_status": "not_required",
+                    "approval_feedback": "",
+                    "execution_status": "completed",
+                    "result_envelope": None,
+                    "call_state": {},
+                    "created_at": "2026-03-31T00:00:00+00:00",
+                    "updated_at": "2026-03-31T00:00:00+00:00",
+                }
+            ),
+        )
+    )
+
+    state = load_tool_call_state(
+        shared_store=shared_store,
+        task_id="task-legacy",
+        tool_call_id="call-legacy",
+    )
+
+    assert state is not None
+    assert state.run_id == ""
+    assert state.session_id == ""
+    assert state.run_yolo is False
+    assert state.approval_mode == ToolApprovalMode.UNKNOWN
 
 
 def test_execute_tool_marks_sqlite_lock_error_as_retryable() -> None:
@@ -480,7 +1885,7 @@ def test_execute_tool_marks_sqlite_lock_error_as_retryable() -> None:
     result = asyncio.run(
         execute_tool(
             cast(ToolContext, cast(object, ctx)),
-            tool_name="dispatch_task",
+            tool_name="orch_dispatch_task",
             args_summary={"task_id": "task-2"},
             action=lambda: (_ for _ in ()).throw(
                 sqlite3.OperationalError("database is locked")
@@ -492,3 +1897,528 @@ def test_execute_tool_marks_sqlite_lock_error_as_retryable() -> None:
     assert result["ok"] is False
     assert error["type"] == "internal_error"
     assert error["retryable"] is True
+
+
+def test_execute_tool_blocks_destructive_shell_with_runtime_guardrail() -> None:
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("approve", "")),
+        policy=ToolApprovalPolicy(yolo=True),
+    )
+    deps.role_registry.register(
+        RoleDefinition(
+            role_id="spec_coder",
+            name="Spec Coder",
+            description="Implements requested changes.",
+            version="1",
+            tools=("shell",),
+            system_prompt="Implement tasks.",
+        )
+    )
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-shell-destructive-1"
+    action_calls = 0
+
+    def action() -> str:
+        nonlocal action_calls
+        action_calls += 1
+        return "should not run"
+
+    result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="shell",
+            args_summary={"command": "rm -rf build"},
+            action=action,
+        )
+    )
+
+    error = cast(dict[str, JsonValue], result["error"])
+    meta = cast(dict[str, JsonValue], result["meta"])
+    assert action_calls == 0
+    assert result["ok"] is False
+    assert error["type"] == "runtime_guardrail_denied"
+    assert meta["runtime_guardrail_status"] == RuntimeGuardrailStatus.BLOCKED.value
+    assert meta["approval_status"] == "denied_by_guardrail"
+    assert meta["runtime_policy_decision"] == "deny"
+
+
+def test_execute_tool_keeps_result_when_in_execution_guardrail_warns() -> None:
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("approve", "")),
+        policy=ToolApprovalPolicy(
+            yolo=True,
+            guardrails=RuntimeGuardrailPolicy(
+                rules=(
+                    RuntimeGuardrailRule(
+                        rule_id="tiny-output-warning",
+                        layer=RuntimeGuardrailLayer.IN_EXECUTION,
+                        rule_type=RuntimeGuardrailRuleType.OUTPUT_SIZE,
+                        action=RuntimeGuardrailAction.WARN,
+                        max_bytes=1,
+                    ),
+                )
+            ),
+        ),
+    )
+    deps.role_registry.register(
+        RoleDefinition(
+            role_id="spec_coder",
+            name="Spec Coder",
+            description="Implements requested changes.",
+            version="1",
+            tools=("read",),
+            system_prompt="Implement tasks.",
+        )
+    )
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-read-output-warning-1"
+
+    result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="read",
+            args_summary={"path": "README.md"},
+            action=lambda: {"content": "x" * 32},
+        )
+    )
+
+    meta = cast(dict[str, JsonValue], result["meta"])
+    assert result["ok"] is True
+    assert result["data"] == {"content": "x" * 32}
+    assert meta["runtime_guardrail_status"] == RuntimeGuardrailStatus.WARNING.value
+    assert meta["runtime_guardrail_warning_count"] == 1
+
+
+def test_execute_tool_replaces_result_when_in_execution_guardrail_denies() -> None:
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("approve", "")),
+        policy=ToolApprovalPolicy(
+            yolo=True,
+            guardrails=RuntimeGuardrailPolicy(
+                rules=(
+                    RuntimeGuardrailRule(
+                        rule_id="tiny-output-deny",
+                        layer=RuntimeGuardrailLayer.IN_EXECUTION,
+                        rule_type=RuntimeGuardrailRuleType.OUTPUT_SIZE,
+                        action=RuntimeGuardrailAction.DENY,
+                        max_bytes=1,
+                    ),
+                )
+            ),
+        ),
+    )
+    deps.role_registry.register(
+        RoleDefinition(
+            role_id="spec_coder",
+            name="Spec Coder",
+            description="Implements requested changes.",
+            version="1",
+            tools=("read",),
+            system_prompt="Implement tasks.",
+        )
+    )
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-read-output-deny-1"
+
+    result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="read",
+            args_summary={"path": "README.md"},
+            action=lambda: {"content": "x" * 32},
+        )
+    )
+
+    error = cast(dict[str, JsonValue], result["error"])
+    meta = cast(dict[str, JsonValue], result["meta"])
+    assert result["ok"] is False
+    assert error["type"] == "runtime_guardrail_denied"
+    assert meta["runtime_guardrail_status"] == RuntimeGuardrailStatus.BLOCKED.value
+    assert meta["runtime_guardrail_blocked_count"] == 1
+
+
+class _FakeHookService:
+    def __init__(
+        self,
+        decision: HookDecisionType | None = None,
+        *,
+        reason: str = "",
+        bundles: dict[HookEventName, HookDecisionBundle] | None = None,
+        failing_events: set[HookEventName] | None = None,
+    ) -> None:
+        self.decision = decision or HookDecisionType.ALLOW
+        self.reason = reason
+        self.bundles = bundles or {}
+        self.failing_events = failing_events or set()
+        self.event_inputs: list[object] = []
+
+    async def execute(
+        self, *, event_input: object, run_event_hub: object
+    ) -> HookDecisionBundle:
+        _ = run_event_hub
+        self.event_inputs.append(event_input)
+        event_name = cast(HookEventName, getattr(event_input, "event_name"))
+        if event_name in self.failing_events:
+            raise RuntimeError("hook transport failed")
+        if event_name in self.bundles:
+            return self.bundles[event_name]
+        return HookDecisionBundle(decision=self.decision, reason=self.reason)
+
+
+def _hook_execution(
+    event_name: HookEventName,
+    decision: HookDecisionType,
+) -> HookExecutionResult:
+    return HookExecutionResult(
+        source=HookSourceInfo(scope=HookSourceScope.USER, path=Path("hooks.json")),
+        event_name=event_name,
+        handler_name="test-hook",
+        handler_type=HookHandlerType.COMMAND,
+        status=HookExecutionStatus.COMPLETED,
+        decision=HookDecision(decision=decision),
+    )
+
+
+def test_execute_tool_call_reuses_duplicate_after_pre_tool_rewrite() -> None:
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("approve", "")),
+        policy=_FakePolicy(needs_approval=False),
+    )
+    deps.hook_service = _FakeHookService(
+        bundles={
+            HookEventName.PRE_TOOL_USE: HookDecisionBundle(
+                decision=HookDecisionType.ALLOW,
+                updated_input={"path": "README.md"},
+            ),
+        }
+    )
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-read-rewritten-duplicate"
+    call_count = 0
+
+    def action(path: str) -> dict[str, JsonValue]:
+        nonlocal call_count
+        assert path == "README.md"
+        call_count += 1
+        return {"value": call_count}
+
+    first = asyncio.run(
+        execute_tool_call(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="read",
+            args_summary={"path": "alias.md"},
+            action=action,
+            raw_args={"ctx": ctx, "path": "alias.md"},
+        )
+    )
+    second = asyncio.run(
+        execute_tool_call(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="read",
+            args_summary={"path": "alias.md"},
+            action=lambda path: {"path": path, "value": 999},
+            raw_args={"ctx": ctx, "path": "alias.md"},
+        )
+    )
+
+    assert call_count == 1
+    assert second == first
+    assert cast(dict[str, JsonValue], second)["data"] == {"value": 1}
+    assert len(_tool_result_payloads(deps)) == 1
+
+
+def test_execute_tool_denies_pre_tool_use_when_hook_blocks_call() -> None:
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("approve", "")),
+        policy=_FakePolicy(needs_approval=False),
+    )
+    deps.hook_service = _FakeHookService(
+        HookDecisionType.DENY,
+        reason="Shell commands are blocked in this workspace.",
+    )
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-hook-deny-1"
+
+    result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="shell",
+            args_summary={"command": "rm -rf ."},
+            action=lambda: "should_not_run",
+        )
+    )
+
+    error = cast(dict[str, JsonValue], result["error"])
+    assert result["ok"] is False
+    assert error["type"] == "hook_denied"
+    assert "blocked" in str(error["message"]).lower()
+
+
+def test_execute_tool_runs_permission_denied_hook_when_user_denies() -> None:
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("deny", "too risky")),
+        policy=_FakePolicy(needs_approval=True),
+    )
+    deps.hook_service = _FakeHookService(
+        bundles={
+            HookEventName.PRE_TOOL_USE: HookDecisionBundle(
+                decision=HookDecisionType.ALLOW,
+            ),
+            HookEventName.PERMISSION_REQUEST: HookDecisionBundle(
+                decision=HookDecisionType.CONTINUE,
+            ),
+            HookEventName.PERMISSION_DENIED: HookDecisionBundle(
+                decision=HookDecisionType.OBSERVE,
+                additional_context=("choose a safer edit",),
+            ),
+        }
+    )
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-user-deny-hook"
+
+    result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="write",
+            args_summary={"path": "a.txt"},
+            action=lambda: "should_not_run",
+        )
+    )
+
+    error = cast(dict[str, JsonValue], result["error"])
+    denied_inputs = [
+        event_input
+        for event_input in deps.hook_service.event_inputs
+        if cast(HookEventName, getattr(event_input, "event_name"))
+        == HookEventName.PERMISSION_DENIED
+    ]
+    assert result["ok"] is False
+    assert error["type"] == "approval_denied"
+    assert len(denied_inputs) == 1
+    denied_input = denied_inputs[0]
+    assert getattr(denied_input, "tool_name") == "write"
+    assert getattr(denied_input, "tool_input") == {"path": "a.txt"}
+    assert getattr(denied_input, "session_mode") == "orchestration"
+    assert getattr(denied_input, "run_kind") == "generate_image"
+    assert getattr(denied_input, "denial_source") == "user_approval"
+    assert getattr(denied_input, "denial_reason") == "too risky"
+    assert [record.content for record in deps.injection_manager.records] == [
+        "choose a safer edit"
+    ]
+
+
+def test_permission_denied_hook_failure_is_best_effort() -> None:
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("deny", "too risky")),
+        policy=_FakePolicy(needs_approval=True),
+    )
+    deps.hook_service = _FakeHookService(
+        failing_events={HookEventName.PERMISSION_DENIED},
+    )
+    ctx = _FakeCtx(deps)
+
+    asyncio.run(
+        _apply_permission_denied_hooks(
+            ctx=cast(ToolContext, cast(object, ctx)),
+            tool_name="write",
+            tool_call_id="call-user-deny-hook-fails",
+            tool_input={"path": "a.txt"},
+            denial_source="user_approval",
+            denial_reason="too risky",
+            approval_status="denied",
+        )
+    )
+
+    assert len(deps.hook_service.event_inputs) == 1
+    assert deps.injection_manager.records == []
+
+
+def test_execute_tool_default_permission_request_hook_decision_keeps_approval() -> None:
+    manager = _FakeApprovalManager(wait_result=("approve", ""))
+    deps = _FakeDeps(
+        manager=manager,
+        policy=_FakePolicy(needs_approval=True),
+    )
+    deps.hook_service = _FakeHookService()
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-default-hook-approval"
+
+    result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="write",
+            args_summary={"path": "a.txt"},
+            action=lambda: "written",
+        )
+    )
+
+    state = load_tool_call_state(
+        shared_store=deps.shared_store,
+        task_id=deps.task_id,
+        tool_call_id="call-default-hook-approval",
+    )
+    assert result["ok"] is True
+    assert state is not None
+    assert state.approval_mode == ToolApprovalMode.APPROVAL_FLOW
+    assert manager.last_open is not None
+    assert any(
+        event.event_type == RunEventType.TOOL_APPROVAL_REQUESTED
+        for event in deps.run_event_hub.events
+    )
+
+
+def test_execute_tool_allows_permission_request_when_hook_overrides_approval() -> None:
+    manager = _FakeApprovalManager(wait_result=("approve", ""))
+    deps = _FakeDeps(
+        manager=manager,
+        policy=_FakePolicy(needs_approval=True),
+    )
+    deps.hook_service = _FakeHookService(
+        bundles={
+            HookEventName.PRE_TOOL_USE: HookDecisionBundle(
+                decision=HookDecisionType.ALLOW,
+            ),
+            HookEventName.PERMISSION_REQUEST: HookDecisionBundle(
+                decision=HookDecisionType.ALLOW,
+                executions=(
+                    _hook_execution(
+                        HookEventName.PERMISSION_REQUEST,
+                        HookDecisionType.ALLOW,
+                    ),
+                ),
+            ),
+        }
+    )
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-hook-allow-approval"
+
+    result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="write",
+            args_summary={"path": "a.txt"},
+            action=lambda: "written",
+        )
+    )
+
+    state = load_tool_call_state(
+        shared_store=deps.shared_store,
+        task_id=deps.task_id,
+        tool_call_id="call-hook-allow-approval",
+    )
+    assert result["ok"] is True
+    assert result["data"] == "written"
+    assert state is not None
+    assert state.approval_mode == ToolApprovalMode.POLICY_EXEMPT
+    assert manager.last_open is None
+    assert not any(
+        event.event_type == RunEventType.TOOL_APPROVAL_REQUESTED
+        for event in deps.run_event_hub.events
+    )
+
+
+def test_execute_tool_records_post_tool_hook_metadata() -> None:
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("approve", "")),
+        policy=_FakePolicy(needs_approval=False),
+    )
+    deps.hook_service = _FakeHookService(
+        bundles={
+            HookEventName.POST_TOOL_USE: HookDecisionBundle(
+                decision=HookDecisionType.CONTINUE,
+                additional_context=("summarize result",),
+                deferred_action="schedule_follow_up",
+            ),
+        }
+    )
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-hook-post-success"
+
+    result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="read",
+            args_summary={"path": "README.md"},
+            action=lambda: "hello",
+        )
+    )
+
+    meta = cast(dict[str, JsonValue], result["meta"])
+    assert result["ok"] is True
+    assert meta["hook_additional_context"] == ["summarize result"]
+    assert meta["hook_deferred_action"] == "schedule_follow_up"
+
+
+def test_execute_tool_enqueues_post_tool_hook_additional_context() -> None:
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("approve", "")),
+        policy=_FakePolicy(needs_approval=False),
+    )
+    deps.hook_service = _FakeHookService(
+        bundles={
+            HookEventName.POST_TOOL_USE: HookDecisionBundle(
+                decision=HookDecisionType.CONTINUE,
+                additional_context=("summarize result", "capture side effects"),
+            ),
+        }
+    )
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-hook-post-context"
+
+    result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="read",
+            args_summary={"path": "README.md"},
+            action=lambda: "hello",
+        )
+    )
+
+    meta = cast(dict[str, JsonValue], result["meta"])
+    assert result["ok"] is True
+    assert meta["hook_additional_context"] == [
+        "summarize result",
+        "capture side effects",
+    ]
+    assert [record.content for record in deps.injection_manager.records] == [
+        "summarize result\n\ncapture side effects"
+    ]
+
+
+def test_execute_tool_records_failure_hook_deferred_event_source() -> None:
+    deps = _FakeDeps(
+        manager=_FakeApprovalManager(wait_result=("approve", "")),
+        policy=_FakePolicy(needs_approval=False),
+    )
+    deps.hook_service = _FakeHookService(
+        bundles={
+            HookEventName.POST_TOOL_USE_FAILURE: HookDecisionBundle(
+                decision=HookDecisionType.CONTINUE,
+                deferred_action="recover from failure",
+            ),
+        }
+    )
+    ctx = _FakeCtx(deps)
+    ctx.tool_call_id = "call-hook-post-failure"
+
+    result = asyncio.run(
+        execute_tool(
+            cast(ToolContext, cast(object, ctx)),
+            tool_name="read",
+            args_summary={"path": "README.md"},
+            action=lambda: (_ for _ in ()).throw(ValueError("boom")),
+        )
+    )
+
+    assert result["ok"] is False
+    hook_events = [
+        event
+        for event in deps.run_event_hub.events
+        if event.event_type == RunEventType.HOOK_DEFERRED
+    ]
+    assert len(hook_events) == 1
+    payload = cast(dict[str, object], json.loads(hook_events[0].payload_json))
+    assert payload["hook_event"] == HookEventName.POST_TOOL_USE_FAILURE.value
+    assert [record.content for record in deps.injection_manager.records] == [
+        "recover from failure"
+    ]

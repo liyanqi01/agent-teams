@@ -7,6 +7,7 @@ import importlib.metadata
 import inspect
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
+import shutil
 import sys
 
 import pytest
@@ -44,12 +45,60 @@ _ensure_installed_mcp_package()
 
 
 def pytest_configure(config: pytest.Config) -> None:
+    _configure_windows_asyncio_policy()
+    _ensure_basetemp_parent(config)
     config.addinivalue_line(
         "markers",
         "asyncio: mark a test function to run in an asyncio event loop",
     )
 
 
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    if exitstatus != pytest.ExitCode.OK:
+        return
+    raw_basetemp = session.config.getoption("basetemp", default=None)
+    if not isinstance(raw_basetemp, str):
+        return
+    basetemp = Path(raw_basetemp)
+    expected_basetemp = Path(".tmp") / "pytest"
+    if basetemp.resolve() != expected_basetemp.resolve():
+        return
+    shutil.rmtree(basetemp, ignore_errors=True)
+    _remove_empty_directory(basetemp.parent)
+
+
+def _ensure_basetemp_parent(config: pytest.Config) -> None:
+    raw_basetemp = config.getoption("basetemp", default=None)
+    if not isinstance(raw_basetemp, str):
+        return
+    Path(raw_basetemp).parent.mkdir(parents=True, exist_ok=True)
+
+
+def _remove_empty_directory(path: Path) -> None:
+    try:
+        path.rmdir()
+    except OSError:
+        return
+
+
+def _configure_windows_asyncio_policy() -> None:
+    if sys.platform != "win32":
+        return
+    from asyncio import WindowsProactorEventLoopPolicy
+
+    asyncio.set_event_loop_policy(WindowsProactorEventLoopPolicy())
+
+
+@pytest.fixture
+def event_loop_policy() -> asyncio.AbstractEventLoopPolicy:
+    if sys.platform != "win32":
+        return asyncio.get_event_loop_policy()
+    from asyncio import WindowsProactorEventLoopPolicy
+
+    return WindowsProactorEventLoopPolicy()
+
+
+@pytest.hookimpl(tryfirst=True)
 def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
     marker = pyfuncitem.get_closest_marker("asyncio")
     if marker is None:
@@ -61,5 +110,19 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
 
     funcargs = pyfuncitem.funcargs
     test_args = {name: funcargs[name] for name in pyfuncitem._fixtureinfo.argnames}
-    asyncio.run(test_function(**test_args))
+
+    async def _run_test_with_sqlite_cleanup() -> None:
+        try:
+            await test_function(**test_args)
+        finally:
+            await _close_live_sqlite_repos_in_current_loop()
+
+    _configure_windows_asyncio_policy()
+    asyncio.run(_run_test_with_sqlite_cleanup())
     return True
+
+
+async def _close_live_sqlite_repos_in_current_loop() -> None:
+    from relay_teams.persistence import close_live_sqlite_repositories_async
+
+    await close_live_sqlite_repositories_async()

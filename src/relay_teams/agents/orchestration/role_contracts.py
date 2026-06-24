@@ -1,0 +1,321 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import re
+
+from relay_teams.agents.tasks.enums import TaskStatus, VerificationLayer
+from relay_teams.agents.tasks.models import TaskEnvelope, TaskRecord
+from relay_teams.agents.tasks.models import VerificationCheckResult
+from relay_teams.roles.role_contracts import (
+    RoleContractInvariantType,
+    RoleContractPostconditionType,
+    RoleContractPreconditionType,
+    is_empty_role_contract,
+    role_contract_invariant_failures,
+)
+from relay_teams.roles.role_models import RoleDefinition
+
+_EVIDENCE_SEMANTIC_PATTERNS: tuple[tuple[re.Pattern[str], re.Pattern[str]], ...] = (
+    # expectation contains "issue" -> match GitHub issue URL or #<number>
+    (re.compile(r"\bissue\b", re.IGNORECASE), re.compile(r"(issues/\d+)|#\d+")),
+    # expectation contains "pr" or "pull" -> match GitHub PR URL or #<number> or "PR"
+    (
+        re.compile(r"\b(?:pr|pull)\b", re.IGNORECASE),
+        re.compile(r"(pull/\d+)|#\d+|\bPR\b"),
+    ),
+    # expectation contains "url" or "link" -> match any HTTP URL
+    (re.compile(r"\b(?:url|link)\b", re.IGNORECASE), re.compile(r"https?://\S+")),
+    # expectation contains "file" or "path" -> match a path with extension or slash
+    (
+        re.compile(r"\b(?:file|path)\b", re.IGNORECASE),
+        re.compile(r"(/\S+\.\w+)|(\w+/\w+)"),
+    ),
+)
+
+
+def role_contract_precondition_failures(
+    *,
+    role: RoleDefinition,
+    task: TaskEnvelope,
+    records_by_id: dict[str, TaskRecord],
+) -> tuple[str, ...]:
+    contract = role.contract
+    if is_empty_role_contract(contract):
+        return ()
+
+    failures: list[str] = list(
+        role_contract_invariant_failures(
+            contract=contract,
+            tools=_runtime_contract_tools(role),
+            mcp_servers=role.mcp_servers,
+            skills=role.skills,
+        )
+    )
+    for precondition in contract.preconditions:
+        if precondition.condition == RoleContractPreconditionType.TASK_HAS_SPEC:
+            if task.spec is None:
+                failures.append("task_has_spec: task has no TaskSpec")
+        elif (
+            precondition.condition
+            == RoleContractPreconditionType.TASK_HAS_ACCEPTANCE_CRITERIA
+        ):
+            if not task.verification.acceptance_criteria:
+                failures.append(
+                    "task_has_acceptance_criteria: task has no acceptance criteria"
+                )
+        elif (
+            precondition.condition
+            == RoleContractPreconditionType.DEPENDENCIES_COMPLETED
+        ):
+            failures.extend(_dependency_completion_failures(task, records_by_id))
+        elif (
+            precondition.condition
+            == RoleContractPreconditionType.DEPENDENCY_ROLE_COMPLETED
+        ):
+            failures.extend(
+                _dependency_role_completion_failures(
+                    task=task,
+                    records_by_id=records_by_id,
+                    role_ids=precondition.role_ids,
+                )
+            )
+    return tuple(failures)
+
+
+def role_contract_verification_checks(
+    *,
+    role: RoleDefinition,
+    task: TaskRecord,
+    result: str,
+) -> tuple[VerificationCheckResult, ...]:
+    contract = role.contract
+    if is_empty_role_contract(contract):
+        return ()
+
+    checks: list[VerificationCheckResult] = []
+    checks.extend(_role_contract_invariant_checks(role))
+    normalized_result = result.lower()
+    for postcondition in contract.postconditions:
+        if (
+            postcondition.guarantee
+            == RoleContractPostconditionType.VERIFICATION_COMMANDS_CONFIGURED
+        ):
+            passed = bool(task.envelope.verification.command_checks)
+            checks.append(
+                _contract_check(
+                    name="contract_postcondition:verification_commands_configured",
+                    passed=passed,
+                    details=(
+                        "Verification commands are configured."
+                        if passed
+                        else "Role contract requires verification commands."
+                    ),
+                )
+            )
+        elif (
+            postcondition.guarantee
+            == RoleContractPostconditionType.RESULT_MENTIONS_ACCEPTANCE_CRITERIA
+        ):
+            checks.extend(
+                _result_mentions_checks(
+                    label="acceptance",
+                    items=task.envelope.verification.acceptance_criteria,
+                    normalized_result=normalized_result,
+                )
+            )
+        elif (
+            postcondition.guarantee
+            == RoleContractPostconditionType.RESULT_MENTIONS_EVIDENCE_EXPECTATIONS
+        ):
+            checks.extend(
+                _result_mentions_checks(
+                    label="evidence",
+                    items=task.envelope.verification.evidence_expectations,
+                    normalized_result=normalized_result,
+                )
+            )
+        elif postcondition.guarantee == RoleContractPostconditionType.HANDOFF_PRESENT:
+            passed = task.envelope.handoff is not None
+            checks.append(
+                _contract_check(
+                    name="contract_postcondition:handoff_present",
+                    passed=passed,
+                    details=(
+                        "Task handoff is present."
+                        if passed
+                        else "Role contract requires a task handoff."
+                    ),
+                )
+            )
+    return tuple(checks)
+
+
+def _role_contract_invariant_checks(
+    role: RoleDefinition,
+) -> tuple[VerificationCheckResult, ...]:
+    failures = role_contract_invariant_failures(
+        contract=role.contract,
+        tools=_runtime_contract_tools(role),
+        mcp_servers=role.mcp_servers,
+        skills=role.skills,
+    )
+    if not failures:
+        return (
+            _contract_check(
+                name="contract_invariant:role_capabilities",
+                passed=True,
+                details="Role capability invariants are satisfied.",
+            ),
+        )
+    return tuple(
+        _contract_check(
+            name=f"contract_invariant:{failure}",
+            passed=False,
+            details=failure,
+        )
+        for failure in failures
+    )
+
+
+def _runtime_contract_tools(role: RoleDefinition) -> tuple[str, ...]:
+    denied_tools: set[str] = set()
+    for invariant in role.contract.invariants:
+        if invariant.invariant == RoleContractInvariantType.MUST_NOT_HAVE_TOOLS:
+            denied_tools.update(invariant.tools)
+    if not denied_tools:
+        return role.tools
+    return tuple(tool for tool in role.tools if tool not in denied_tools)
+
+
+def _dependency_completion_failures(
+    task: TaskEnvelope,
+    records_by_id: dict[str, TaskRecord],
+) -> tuple[str, ...]:
+    failures: list[str] = []
+    for dependency_task_id in task.depends_on_task_ids:
+        dependency = records_by_id.get(dependency_task_id)
+        if dependency is None:
+            failures.append(
+                f"dependencies_completed: dependency task not found: {dependency_task_id}"
+            )
+        elif dependency.status != TaskStatus.COMPLETED:
+            failures.append(
+                "dependencies_completed: dependency task "
+                f"{dependency_task_id} is {dependency.status.value}"
+            )
+    return tuple(failures)
+
+
+def _dependency_role_completion_failures(
+    *,
+    task: TaskEnvelope,
+    records_by_id: dict[str, TaskRecord],
+    role_ids: tuple[str, ...],
+) -> tuple[str, ...]:
+    if not role_ids:
+        return _dependency_completion_failures(task, records_by_id)
+
+    dependencies = tuple(
+        records_by_id[dependency_task_id]
+        for dependency_task_id in task.depends_on_task_ids
+        if dependency_task_id in records_by_id
+    )
+    failures: list[str] = []
+    for role_id in role_ids:
+        matching_dependencies = tuple(
+            dependency
+            for dependency in dependencies
+            if dependency.envelope.role_id == role_id
+        )
+        if not matching_dependencies:
+            failures.append(
+                f"dependency_role_completed: no dependency task from role {role_id}"
+            )
+            continue
+        incomplete = tuple(
+            dependency
+            for dependency in matching_dependencies
+            if dependency.status != TaskStatus.COMPLETED
+        )
+        if incomplete:
+            statuses = ", ".join(
+                f"{dependency.envelope.task_id}:{dependency.status.value}"
+                for dependency in incomplete
+            )
+            failures.append(
+                "dependency_role_completed: dependency role "
+                f"{role_id} is not complete ({statuses})"
+            )
+    return tuple(failures)
+
+
+def _result_mentions_checks(
+    *,
+    label: str,
+    items: tuple[str, ...],
+    normalized_result: str,
+) -> tuple[VerificationCheckResult, ...]:
+    if not items:
+        return (
+            _contract_check(
+                name=f"contract_postcondition:result_mentions_{label}:none",
+                passed=True,
+                details=f"No {label} items are configured.",
+            ),
+        )
+    allow_semantic = label == "evidence"
+    results: list[VerificationCheckResult] = []
+    for item in items:
+        literal_match = item.lower() in normalized_result
+        if literal_match:
+            results.append(
+                _contract_check(
+                    name=f"contract_postcondition:result_mentions_{label}:{item}",
+                    passed=True,
+                    details=f"{label.title()} item was cited in the result.",
+                )
+            )
+            continue
+        # Try semantic pattern matching only for evidence expectations
+        if allow_semantic:
+            semantic_match = _semantic_evidence_match(item, normalized_result)
+            if semantic_match:
+                results.append(
+                    _contract_check(
+                        name=f"contract_postcondition:result_mentions_{label}:{item}",
+                        passed=True,
+                        details=f"{label.title()} item was cited in the result.",
+                    )
+                )
+                continue
+        results.append(
+            _contract_check(
+                name=f"contract_postcondition:result_mentions_{label}:{item}",
+                passed=False,
+                details=f"{label.title()} item was not cited in the result.",
+            )
+        )
+    return tuple(results)
+
+
+def _semantic_evidence_match(expectation: str, normalized_result: str) -> bool:
+    """Check whether *normalized_result* satisfies *expectation* via semantic patterns."""
+    for keyword_re, value_re in _EVIDENCE_SEMANTIC_PATTERNS:
+        if keyword_re.search(expectation):
+            if value_re.search(normalized_result):
+                return True
+    return False
+
+
+def _contract_check(
+    *,
+    name: str,
+    passed: bool,
+    details: str,
+) -> VerificationCheckResult:
+    return VerificationCheckResult(
+        layer=VerificationLayer.CONTRACT,
+        name=name,
+        passed=passed,
+        details=details,
+    )

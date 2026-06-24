@@ -1,0 +1,783 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+from collections.abc import Mapping
+from json import loads
+import logging
+from pathlib import Path
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from relay_teams.agents.execution.prompt_instructions import (
+    PromptInstructionsConfig,
+    load_prompt_instructions_config,
+)
+from relay_teams.env import load_merged_env_vars
+from relay_teams.logger import get_logger, log_event
+from relay_teams.paths import (
+    format_app_config_file_reference,
+    get_app_config_dir,
+)
+from relay_teams.providers.codeagent_auth import (
+    codeagent_access_token_secret_field_name,
+    codeagent_password_secret_field_name,
+    codeagent_refresh_token_secret_field_name,
+)
+from relay_teams.providers.maas_auth import maas_password_secret_field_name
+from relay_teams.providers.model_config import (
+    CodeAgentAuthMethod,
+    CodeAgentAuthConfig,
+    DEFAULT_ANTHROPIC_BASE_URL,
+    DEFAULT_LLM_CONNECT_TIMEOUT_SECONDS,
+    DEFAULT_MAAS_BASE_URL,
+    LlmRetryConfig,
+    MaaSAuthConfig,
+    ModelAuthSource,
+    ModelEndpointConfig,
+    ModelFallbackConfig,
+    ModelRequestHeader,
+    ProviderType,
+    SamplingConfig,
+    SpeechRealtimeConfig,
+    default_model_fallback_config,
+)
+from relay_teams.providers.model_capabilities import resolve_model_capabilities
+from relay_teams.providers.model_fallback_config_manager import (
+    ModelFallbackConfigManager,
+)
+from relay_teams.providers.model_header_utils import (
+    model_header_secret_field_name,
+    normalize_model_request_headers_payload,
+)
+from relay_teams.providers.known_model_context_windows import (
+    infer_known_context_window,
+)
+from relay_teams.providers.w3_auth_source import require_w3_credentials
+from relay_teams.secrets import get_secret_store
+
+_MODEL_PROFILE_SECRET_NAMESPACE = "model_profile"
+_MODEL_PROFILE_SECRET_FIELD = "api_key"
+_MODEL_PROFILE_MAAS_PASSWORD_FIELD = maas_password_secret_field_name()
+_MODEL_PROFILE_CODEAGENT_ACCESS_TOKEN_FIELD = codeagent_access_token_secret_field_name()
+_MODEL_PROFILE_CODEAGENT_PASSWORD_FIELD = codeagent_password_secret_field_name()
+_MODEL_PROFILE_CODEAGENT_REFRESH_TOKEN_FIELD = (
+    codeagent_refresh_token_secret_field_name()
+)
+LOGGER = get_logger(__name__)
+
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+_FALSE_VALUES = {"0", "false", "no", "off"}
+
+
+class RuntimePaths(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    config_dir: Path
+    env_file: Path
+    db_path: Path
+    roles_dir: Path
+    prompts_file: Path | None = None
+
+    @model_validator(mode="after")
+    def _default_prompts_file(self) -> RuntimePaths:
+        if self.prompts_file is None:
+            self.prompts_file = self.config_dir / "prompts.json"
+        return self
+
+
+class ModelConfigStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    loaded: bool
+    profiles: tuple[str, ...] = ()
+    error: str | None = None
+
+
+class RuntimeConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    paths: RuntimePaths
+    llm_profiles: dict[str, ModelEndpointConfig]
+    llm_retry: LlmRetryConfig = Field(default_factory=LlmRetryConfig)
+    model_fallback: ModelFallbackConfig = Field(
+        default_factory=default_model_fallback_config
+    )
+    default_model_profile: str | None = None
+    model_status: ModelConfigStatus = ModelConfigStatus(loaded=True)
+    prompt_instructions: PromptInstructionsConfig = Field(
+        default_factory=PromptInstructionsConfig
+    )
+
+
+class LoadedLlmProfiles(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    profiles: dict[str, ModelEndpointConfig]
+    default_profile_name: str
+
+
+def load_runtime_config(
+    config_dir: Path | None = None,
+    roles_dir: Path | None = None,
+    db_path: Path | None = None,
+) -> RuntimeConfig:
+    resolved_config_dir = (
+        get_app_config_dir()
+        if config_dir is None
+        else config_dir.expanduser().resolve()
+    )
+    resolved_config_dir.mkdir(parents=True, exist_ok=True)
+
+    env_file = resolved_config_dir / ".env"
+    prompts_file = resolved_config_dir / "prompts.json"
+    merged_env = load_merged_env_vars(extra_env_files=(env_file,))
+
+    resolved_roles_dir = (
+        roles_dir.expanduser().resolve()
+        if roles_dir is not None
+        else resolved_config_dir / "roles"
+    )
+    resolved_db_path = (
+        db_path.expanduser().resolve()
+        if db_path is not None
+        else resolved_config_dir / "relay_teams.db"
+    )
+    model_fallback = ModelFallbackConfigManager(
+        config_dir=resolved_config_dir
+    ).get_model_fallback_config()
+    try:
+        loaded_profiles = load_llm_profile_state(
+            resolved_config_dir,
+            merged_env,
+            model_fallback=model_fallback,
+        )
+        llm_profiles = loaded_profiles.profiles
+        model_status = ModelConfigStatus(
+            loaded=True,
+            profiles=tuple(sorted(llm_profiles.keys())),
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        llm_profiles = {}
+        default_model_profile = None
+        model_status = ModelConfigStatus(
+            loaded=False,
+            profiles=(),
+            error=str(exc),
+        )
+    else:
+        default_model_profile = loaded_profiles.default_profile_name
+    prompt_instructions = load_prompt_instructions_config(resolved_config_dir)
+    return RuntimeConfig(
+        paths=RuntimePaths(
+            config_dir=resolved_config_dir,
+            env_file=env_file,
+            db_path=resolved_db_path,
+            roles_dir=resolved_roles_dir,
+            prompts_file=prompts_file,
+        ),
+        llm_profiles=llm_profiles,
+        llm_retry=LlmRetryConfig(),
+        model_fallback=model_fallback,
+        default_model_profile=default_model_profile,
+        model_status=model_status,
+        prompt_instructions=prompt_instructions,
+    )
+
+
+def load_llm_configs(
+    config_dir: Path,
+    env_values: Mapping[str, str],
+) -> dict[str, ModelEndpointConfig]:
+    fallback_config = ModelFallbackConfigManager(
+        config_dir=config_dir
+    ).get_model_fallback_config()
+    return load_llm_profile_state(
+        config_dir,
+        env_values,
+        model_fallback=fallback_config,
+    ).profiles
+
+
+def load_llm_profile_state(
+    config_dir: Path,
+    env_values: Mapping[str, str],
+    *,
+    model_fallback: ModelFallbackConfig | None = None,
+) -> LoadedLlmProfiles:
+    model_file = config_dir / "model.json"
+    if not model_file.exists():
+        raise FileNotFoundError(
+            "model.json not found at "
+            f"{format_app_config_file_reference('model.json', config_dir=config_dir)}. "
+            "Please create model.json with at least one profile."
+        )
+
+    data = _load_model_payload(model_file)
+    fallback_config = model_fallback or default_model_fallback_config()
+    default_profile_name = _resolve_default_profile_name(data)
+
+    profiles: dict[str, ModelEndpointConfig] = {}
+    for name, cfg in data.items():
+        if not isinstance(cfg, dict):
+            raise ValueError(f"Invalid profile '{name}': expected an object.")
+
+        model = cfg.get("model")
+        base_url = cfg.get("base_url")
+        api_key = _resolve_profile_api_key(
+            config_dir=config_dir,
+            profile_name=name,
+            raw_value=cfg.get("api_key"),
+            env_values=env_values,
+        )
+        headers = _resolve_profile_headers(
+            config_dir=config_dir,
+            profile_name=name,
+            raw_value=cfg.get("headers"),
+            env_values=env_values,
+        )
+        provider_raw = cfg.get("provider", ProviderType.OPENAI_COMPATIBLE.value)
+        provider = ProviderType(provider_raw)
+        if provider == ProviderType.MAAS:
+            base_url = DEFAULT_MAAS_BASE_URL
+        elif provider == ProviderType.ANTHROPIC and not _string_is_configured(base_url):
+            base_url = DEFAULT_ANTHROPIC_BASE_URL
+        try:
+            maas_auth = _resolve_profile_maas_auth(
+                config_dir=config_dir,
+                profile_name=name,
+                raw_value=cfg.get("maas_auth"),
+                env_values=env_values,
+            )
+            codeagent_auth = _resolve_profile_codeagent_auth(
+                config_dir=config_dir,
+                profile_name=name,
+                raw_value=cfg.get("codeagent_auth"),
+                env_values=env_values,
+            )
+        except ValueError as exc:
+            if _profile_uses_w3_auth_source(cfg):
+                log_event(
+                    LOGGER,
+                    logging.WARNING,
+                    event="runtime_config.w3_profile_skipped",
+                    message="Skipping W3-backed model profile because W3 credentials are unavailable.",
+                    payload={
+                        "profile_name": name,
+                        "error": str(exc),
+                    },
+                )
+                continue
+            raise
+
+        if not model or not base_url:
+            raise ValueError(
+                f"Invalid profile '{name}': missing required fields (model, base_url)."
+            )
+        if provider == ProviderType.MAAS:
+            if maas_auth is None or maas_auth.password is None:
+                raise ValueError(
+                    f"Invalid profile '{name}': MAAS profiles require maas_auth with a password."
+                )
+        elif provider == ProviderType.CODEAGENT:
+            if codeagent_auth is None:
+                raise ValueError(
+                    f"Invalid profile '{name}': CodeAgent profiles require codeagent_auth configuration."
+                )
+            if codeagent_auth.auth_method == CodeAgentAuthMethod.PASSWORD:
+                if codeagent_auth.username is None or codeagent_auth.password is None:
+                    raise ValueError(
+                        f"Invalid profile '{name}': CodeAgent password profiles require codeagent_auth.username and password."
+                    )
+            elif codeagent_auth.refresh_token is None:
+                raise ValueError(
+                    f"Invalid profile '{name}': CodeAgent profiles require codeagent_auth from completed SSO login."
+                )
+        elif not api_key and not headers:
+            raise ValueError(
+                f"Invalid profile '{name}': missing required fields (model, base_url, api_key or headers)."
+            )
+
+        temperature = cfg.get("temperature", 0.2)
+        top_p = cfg.get("top_p", 1.0)
+        max_tokens = cfg.get("max_tokens")
+        top_k = cfg.get("top_k")
+        context_window_raw = cfg.get("context_window")
+        ssl_verify = _coerce_optional_ssl_verify(
+            cfg.get("ssl_verify"),
+            profile_name=name,
+        )
+        connect_timeout_seconds = cfg.get(
+            "connect_timeout_seconds",
+            DEFAULT_LLM_CONNECT_TIMEOUT_SECONDS,
+        )
+        fallback_policy_id = _resolve_profile_fallback_policy_id(
+            raw_value=cfg.get("fallback_policy_id"),
+            fallback_config=fallback_config,
+            profile_name=name,
+        )
+        fallback_priority = _resolve_profile_fallback_priority(
+            cfg.get("fallback_priority")
+        )
+        speech_realtime = _resolve_profile_speech_realtime(
+            raw_value=cfg.get("speech_realtime"),
+            profile_name=name,
+        )
+
+        profiles[name] = ModelEndpointConfig(
+            provider=provider,
+            model=model,
+            base_url=base_url,
+            api_key=api_key or None,
+            headers=headers,
+            maas_auth=maas_auth,
+            codeagent_auth=codeagent_auth,
+            ssl_verify=ssl_verify,
+            speech_realtime=speech_realtime,
+            capabilities=resolve_model_capabilities(
+                provider=provider,
+                base_url=base_url,
+                model_name=model,
+                metadata=cfg,
+            ),
+            context_window=(
+                int(context_window_raw)
+                if isinstance(context_window_raw, int) and context_window_raw > 0
+                else infer_known_context_window(
+                    provider=provider,
+                    model=model,
+                )
+            ),
+            fallback_policy_id=fallback_policy_id,
+            fallback_priority=fallback_priority,
+            connect_timeout_seconds=connect_timeout_seconds,
+            sampling=SamplingConfig(
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                top_k=top_k,
+            ),
+        )
+
+    if not profiles:
+        raise ValueError("No valid model profiles loaded.")
+    if default_profile_name not in profiles:
+        default_profile_name = sorted(profiles.keys())[0]
+
+    return LoadedLlmProfiles(
+        profiles=profiles,
+        default_profile_name=default_profile_name,
+    )
+
+
+def _resolve_profile_fallback_policy_id(
+    *,
+    raw_value: object,
+    fallback_config: ModelFallbackConfig,
+    profile_name: str,
+) -> str | None:
+    if not isinstance(raw_value, str):
+        return None
+    normalized_value = raw_value.strip()
+    if not normalized_value:
+        return None
+    if fallback_config.get_policy(normalized_value) is None:
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            event="runtime_config.model_fallback_policy_missing",
+            message="Ignoring unknown fallback policy reference in model profile.",
+            payload={
+                "profile_name": profile_name,
+                "fallback_policy_id": normalized_value,
+            },
+        )
+        return None
+    return normalized_value
+
+
+def _resolve_profile_fallback_priority(raw_value: object) -> int:
+    if isinstance(raw_value, bool):
+        return 0
+    if isinstance(raw_value, int):
+        return max(0, raw_value)
+    return 0
+
+
+def _resolve_profile_speech_realtime(
+    *,
+    raw_value: object,
+    profile_name: str,
+) -> SpeechRealtimeConfig:
+    if raw_value is None:
+        return SpeechRealtimeConfig()
+    if not isinstance(raw_value, Mapping):
+        raise ValueError(
+            f"Invalid profile '{profile_name}': speech_realtime must be an object."
+        )
+    return SpeechRealtimeConfig.model_validate(raw_value)
+
+
+def _profile_uses_w3_auth_source(profile: Mapping[str, object]) -> bool:
+    maas_auth = profile.get("maas_auth")
+    if isinstance(maas_auth, Mapping):
+        auth_source = maas_auth.get("auth_source")
+        if (
+            isinstance(auth_source, str)
+            and auth_source.strip() == ModelAuthSource.W3.value
+        ):
+            return True
+    codeagent_auth = profile.get("codeagent_auth")
+    if isinstance(codeagent_auth, Mapping):
+        auth_source = codeagent_auth.get("auth_source")
+        if (
+            isinstance(auth_source, str)
+            and auth_source.strip() == ModelAuthSource.W3.value
+        ):
+            return True
+    return False
+
+
+def _load_model_payload(model_file: Path) -> dict[str, object]:
+    try:
+        raw = loads(model_file.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"Failed to parse model.json: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("model.json must be a JSON object.")
+    return {str(name): value for name, value in raw.items()}
+
+
+def _resolve_default_profile_name(profile_payloads: Mapping[str, object]) -> str:
+    profile_names: list[str] = []
+    explicit_defaults: list[str] = []
+
+    for name, cfg in profile_payloads.items():
+        if not isinstance(cfg, dict):
+            raise ValueError(f"Invalid profile '{name}': expected an object.")
+        profile_names.append(name)
+        is_default = cfg.get("is_default")
+        if is_default is True:
+            explicit_defaults.append(name)
+            continue
+        if is_default not in (False, None):
+            raise ValueError(
+                f"Invalid profile '{name}': is_default must be true, false, or omitted."
+            )
+
+    if not profile_names:
+        raise ValueError("model.json must contain at least one profile.")
+    if len(explicit_defaults) > 1:
+        joined_names = ", ".join(sorted(explicit_defaults))
+        raise ValueError(
+            "model.json must not mark more than one default profile. "
+            f"Found: {joined_names}."
+        )
+    if explicit_defaults:
+        return explicit_defaults[0]
+    if "default" in profile_payloads:
+        return "default"
+    if len(profile_names) == 1:
+        return profile_names[0]
+    return sorted(profile_names)[0]
+
+
+def _resolve_required_config_value(
+    value: str,
+    env_values: Mapping[str, str],
+    *,
+    profile_name: str,
+    field_name: str,
+) -> str:
+    if value.startswith("${") and value.endswith("}"):
+        env_key = value[2:-1].strip()
+        if not env_key:
+            raise ValueError(
+                f"Invalid profile '{profile_name}': empty environment variable placeholder for {field_name}."
+            )
+
+        resolved_value = env_values.get(env_key)
+        if resolved_value is None:
+            raise ValueError(
+                f"Invalid profile '{profile_name}': environment variable '{env_key}' referenced by {field_name} is not set."
+            )
+        if not resolved_value:
+            raise ValueError(
+                f"Invalid profile '{profile_name}': environment variable '{env_key}' referenced by {field_name} is empty."
+            )
+        return resolved_value
+    return value
+
+
+def _resolve_profile_api_key(
+    *,
+    config_dir: Path,
+    profile_name: str,
+    raw_value: object,
+    env_values: Mapping[str, str],
+) -> str:
+    if isinstance(raw_value, str) and raw_value.strip():
+        return _resolve_required_config_value(
+            raw_value.strip(),
+            env_values,
+            profile_name=profile_name,
+            field_name="api_key",
+        )
+    secret_value = get_secret_store().get_secret(
+        config_dir,
+        namespace=_MODEL_PROFILE_SECRET_NAMESPACE,
+        owner_id=profile_name,
+        field_name=_MODEL_PROFILE_SECRET_FIELD,
+    )
+    if secret_value is None:
+        return ""
+    return secret_value
+
+
+def _resolve_profile_headers(
+    *,
+    config_dir: Path,
+    profile_name: str,
+    raw_value: object,
+    env_values: Mapping[str, str],
+) -> tuple[ModelRequestHeader, ...]:
+    bindings = normalize_model_request_headers_payload(raw_value)
+    resolved_bindings: list[ModelRequestHeader] = []
+    for binding in bindings:
+        value = binding.value
+        if value is not None:
+            value = _resolve_required_config_value(
+                value,
+                env_values,
+                profile_name=profile_name,
+                field_name=f"headers.{binding.name}",
+            )
+        elif binding.secret:
+            value = get_secret_store().get_secret(
+                config_dir,
+                namespace=_MODEL_PROFILE_SECRET_NAMESPACE,
+                owner_id=profile_name,
+                field_name=model_header_secret_field_name(binding.name),
+            )
+        elif binding.configured:
+            raise ValueError(
+                f"Invalid profile '{profile_name}': header '{binding.name}' is marked configured but has no value."
+            )
+        if not binding.secret and value is None:
+            raise ValueError(
+                f"Invalid profile '{profile_name}': non-secret header '{binding.name}' requires a value."
+            )
+        resolved_bindings.append(
+            binding.model_copy(
+                update={
+                    "value": value,
+                    "configured": value is not None,
+                }
+            )
+        )
+    return tuple(resolved_bindings)
+
+
+def _resolve_profile_maas_auth(
+    *,
+    config_dir: Path,
+    profile_name: str,
+    raw_value: object,
+    env_values: Mapping[str, str],
+) -> MaaSAuthConfig | None:
+    if raw_value is None:
+        return None
+    if not isinstance(raw_value, dict):
+        raise ValueError(
+            f"Invalid profile '{profile_name}': maas_auth must be an object."
+        )
+    payload = dict(raw_value)
+    normalized_payload: dict[str, str] = {}
+    auth_source = _normalize_auth_source(payload.get("auth_source"))
+    if auth_source == ModelAuthSource.W3:
+        credentials = require_w3_credentials(config_dir)
+        return MaaSAuthConfig(
+            auth_source=ModelAuthSource.W3,
+            username=credentials.username,
+            password=credentials.password,
+        )
+    normalized_payload["auth_source"] = auth_source.value
+
+    username = payload.get("username")
+    if isinstance(username, str) and username.strip():
+        normalized_payload["username"] = username.strip()
+
+    password = payload.get("password")
+    if isinstance(password, str) and password.strip():
+        normalized_payload["password"] = _resolve_required_config_value(
+            password,
+            env_values,
+            profile_name=profile_name,
+            field_name="maas_auth.password",
+        )
+    else:
+        secret_value = get_secret_store().get_secret(
+            config_dir,
+            namespace=_MODEL_PROFILE_SECRET_NAMESPACE,
+            owner_id=profile_name,
+            field_name=_MODEL_PROFILE_MAAS_PASSWORD_FIELD,
+        )
+        if secret_value is not None:
+            normalized_payload["password"] = secret_value
+    return MaaSAuthConfig.model_validate(normalized_payload)
+
+
+def _resolve_profile_codeagent_auth(
+    *,
+    config_dir: Path,
+    profile_name: str,
+    raw_value: object,
+    env_values: Mapping[str, str],
+) -> CodeAgentAuthConfig | None:
+    if raw_value is None:
+        return None
+    if not isinstance(raw_value, dict):
+        raise ValueError(
+            f"Invalid profile '{profile_name}': codeagent_auth must be an object."
+        )
+    payload = dict(raw_value)
+    normalized_payload: dict[str, str | bool] = {}
+    auth_source = _normalize_auth_source(payload.get("auth_source"))
+    normalized_payload["auth_source"] = auth_source.value
+    auth_method_raw = payload.get("auth_method")
+    if isinstance(auth_method_raw, str) and auth_method_raw.strip():
+        normalized_payload["auth_method"] = auth_method_raw.strip()
+    resolved_auth_method = (
+        CodeAgentAuthMethod.PASSWORD
+        if normalized_payload.get("auth_method") == CodeAgentAuthMethod.PASSWORD.value
+        else CodeAgentAuthMethod.SSO
+    )
+
+    username = payload.get("username")
+    if isinstance(username, str) and username.strip():
+        normalized_payload["username"] = username.strip()
+
+    password = payload.get("password")
+    if resolved_auth_method == CodeAgentAuthMethod.PASSWORD:
+        if auth_source == ModelAuthSource.W3:
+            credentials = require_w3_credentials(config_dir)
+            return CodeAgentAuthConfig(
+                auth_method=CodeAgentAuthMethod.PASSWORD,
+                auth_source=ModelAuthSource.W3,
+                username=credentials.username,
+                password=credentials.password,
+            )
+        if isinstance(password, str) and password.strip():
+            normalized_payload["password"] = _resolve_required_config_value(
+                password,
+                env_values,
+                profile_name=profile_name,
+                field_name="codeagent_auth.password",
+            )
+        else:
+            secret_value = get_secret_store().get_secret(
+                config_dir,
+                namespace=_MODEL_PROFILE_SECRET_NAMESPACE,
+                owner_id=profile_name,
+                field_name=_MODEL_PROFILE_CODEAGENT_PASSWORD_FIELD,
+            )
+            if secret_value is not None:
+                normalized_payload["password"] = _resolve_required_config_value(
+                    secret_value,
+                    env_values,
+                    profile_name=profile_name,
+                    field_name="codeagent_auth.password",
+                )
+        if payload.get("has_password"):
+            normalized_payload["has_password"] = True
+        return CodeAgentAuthConfig.model_validate(normalized_payload).with_secret_owner(
+            config_dir=config_dir,
+            owner_id=profile_name,
+        )
+
+    access_token = _resolve_profile_codeagent_token(
+        config_dir=config_dir,
+        profile_name=profile_name,
+        raw_value=payload.get("access_token"),
+        env_values=env_values,
+        field_name="codeagent_auth.access_token",
+        secret_field_name=_MODEL_PROFILE_CODEAGENT_ACCESS_TOKEN_FIELD,
+    )
+    refresh_token = _resolve_profile_codeagent_token(
+        config_dir=config_dir,
+        profile_name=profile_name,
+        raw_value=payload.get("refresh_token"),
+        env_values=env_values,
+        field_name="codeagent_auth.refresh_token",
+        secret_field_name=_MODEL_PROFILE_CODEAGENT_REFRESH_TOKEN_FIELD,
+    )
+    if access_token is not None:
+        normalized_payload["access_token"] = access_token
+    if refresh_token is not None:
+        normalized_payload["refresh_token"] = refresh_token
+    if payload.get("has_access_token") is True:
+        normalized_payload["has_access_token"] = True
+    if payload.get("has_refresh_token") is True:
+        normalized_payload["has_refresh_token"] = True
+    return CodeAgentAuthConfig.model_validate(normalized_payload).with_secret_owner(
+        config_dir=config_dir,
+        owner_id=profile_name,
+    )
+
+
+def _resolve_profile_codeagent_token(
+    *,
+    config_dir: Path,
+    profile_name: str,
+    raw_value: object,
+    env_values: Mapping[str, str],
+    field_name: str,
+    secret_field_name: str,
+) -> str | None:
+    if isinstance(raw_value, str) and raw_value.strip():
+        return _resolve_required_config_value(
+            raw_value,
+            env_values,
+            profile_name=profile_name,
+            field_name=field_name,
+        )
+    return get_secret_store().get_secret(
+        config_dir,
+        namespace=_MODEL_PROFILE_SECRET_NAMESPACE,
+        owner_id=profile_name,
+        field_name=secret_field_name,
+    )
+
+
+def _coerce_optional_ssl_verify(value: object, *, profile_name: str) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if not normalized:
+            return None
+        if normalized in _TRUE_VALUES:
+            return True
+        if normalized in _FALSE_VALUES:
+            return False
+    raise ValueError(
+        f"Invalid profile '{profile_name}': ssl_verify must be true, false, or null."
+    )
+
+
+def _string_is_configured(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _normalize_auth_source(value: object) -> ModelAuthSource:
+    if isinstance(value, str) and value.strip() == ModelAuthSource.W3.value:
+        return ModelAuthSource.W3
+    return ModelAuthSource.PROFILE
+
+
+def _resolve_path(config_dir: Path, raw_path: str) -> Path:
+    candidate = Path(raw_path)
+    if candidate.is_absolute():
+        return candidate
+    return config_dir / candidate

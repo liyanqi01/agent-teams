@@ -3,9 +3,10 @@
  * Provider-reported token usage badges for coordinator and subagent composers.
  */
 import { fetchModelProfiles, fetchRunTokenUsage } from '../core/api.js';
-import { state, getPrimaryRoleId } from '../core/state.js';
+import { state, getPrimaryRoleId, getRoleOption } from '../core/state.js';
 import { els } from '../utils/dom.js';
-import { currentRounds } from './rounds.js';
+import { formatMessage, t } from '../utils/i18n.js';
+import { currentRounds } from './rounds/timeline.js';
 import {
     getActiveInstanceId,
     getPanel,
@@ -49,15 +50,23 @@ export function refreshVisibleContextIndicators({ immediate = false } = {}) {
     }
 }
 
-export function clearContextIndicators() {
+export function clearContextIndicators({ preserveDisplay = false } = {}) {
     resetPreviewState(mainPreviewState);
-    renderIdle(getMainIndicator());
+    if (preserveDisplay) {
+        renderLoading(getMainIndicator());
+    } else {
+        renderIdle(getMainIndicator());
+    }
     panelPreviewStates.forEach(previewState => {
         resetPreviewState(previewState);
     });
     getPanels().forEach(panel => {
         const indicator = panel?.panelEl?.querySelector('.panel-context-indicator');
-        renderIdle(indicator);
+        if (preserveDisplay) {
+            renderLoading(indicator);
+        } else {
+            renderIdle(indicator);
+        }
     });
 }
 
@@ -124,9 +133,6 @@ async function fetchAndRenderUsage({
 }) {
     const nextRequestId = previewState.requestId + 1;
     previewState.requestId = nextRequestId;
-    if (previewState.controller) {
-        previewState.controller.abort();
-    }
 
     const controller = new AbortController();
     previewState.controller = controller;
@@ -137,9 +143,7 @@ async function fetchAndRenderUsage({
             fetchRunTokenUsage(sessionId, runId, {
                 signal: controller.signal,
             }),
-            fetchModelProfiles({
-                signal: controller.signal,
-            }),
+            fetchModelProfiles(),
         ]);
         if (previewState.requestId !== nextRequestId) return;
         const agentUsage = selectAgentUsage(usage, { roleId, instanceId });
@@ -147,7 +151,11 @@ async function fetchAndRenderUsage({
             renderIdle(indicator);
             return;
         }
-        renderUsage(indicator, agentUsage, resolveContextWindow(profiles));
+        renderUsage(
+            indicator,
+            agentUsage,
+            resolveContextWindow(profiles, agentUsage, agentUsage.role_id || roleId),
+        );
     } catch (error) {
         if (error?.name === 'AbortError') return;
         if (previewState.requestId !== nextRequestId) return;
@@ -208,20 +216,26 @@ function renderUsage(indicator, usage, contextWindow) {
     if (!indicator) return;
     indicator.style.display = 'inline-flex';
     indicator.dataset.state = 'ready';
+    const inputTokens = resolveLatestInputTokens(usage);
     const upper = typeof contextWindow === 'number' && contextWindow > 0
         ? formatTokenCount(contextWindow)
         : '--';
-    indicator.textContent = `${formatTokenCount(usage.input_tokens)} / ${upper}`;
+    indicator.textContent = `${formatTokenCount(inputTokens)} / ${upper}`;
     indicator.title = typeof contextWindow === 'number' && contextWindow > 0
-        ? `Latest provider context usage: ${usage.input_tokens} / ${contextWindow} tokens`
-        : `Latest provider context usage: ${usage.input_tokens} tokens`;
+        ? formatMessage('context_indicator.latest_with_window', {
+            input_tokens: inputTokens,
+            context_window: contextWindow,
+        })
+        : formatMessage('context_indicator.latest_without_window', {
+            input_tokens: inputTokens,
+        });
 }
 
 function renderIdle(indicator, { hidden = false } = {}) {
     if (!indicator) return;
     indicator.dataset.state = 'idle';
     indicator.textContent = EMPTY_LABEL;
-    indicator.title = 'Latest provider context usage';
+    indicator.title = t('context_indicator.latest_title');
     indicator.style.display = hidden ? 'none' : 'inline-flex';
 }
 
@@ -229,7 +243,7 @@ function renderLoading(indicator) {
     if (!indicator) return;
     indicator.style.display = 'inline-flex';
     indicator.dataset.state = 'loading';
-    indicator.title = 'Loading provider context usage';
+    indicator.title = t('context_indicator.loading_title');
     if (!indicator.textContent || indicator.textContent === EMPTY_LABEL) {
         indicator.textContent = EMPTY_LABEL;
     }
@@ -240,7 +254,7 @@ function renderError(indicator) {
     indicator.style.display = 'inline-flex';
     indicator.dataset.state = 'error';
     indicator.textContent = EMPTY_LABEL;
-    indicator.title = 'Provider context usage unavailable';
+    indicator.title = t('context_indicator.unavailable_title');
 }
 
 function resolveUsageRunId() {
@@ -271,14 +285,45 @@ function selectAgentUsage(usage, { roleId = '', instanceId = '' } = {}) {
     return agents.length === 1 ? agents[0] : null;
 }
 
-function resolveContextWindow(profiles) {
+function resolveContextWindow(profiles, usage, roleId = '') {
+    const usageContextWindow = Number(usage?.context_window);
+    if (Number.isFinite(usageContextWindow) && usageContextWindow > 0) {
+        return usageContextWindow;
+    }
     if (!profiles || typeof profiles !== 'object') {
         return null;
     }
-    const profileEntries = Object.values(profiles).filter(profile => profile && typeof profile === 'object');
-    const defaultProfile = profileEntries.find(profile => profile.is_default === true);
+    const modelProfile = String(usage?.model_profile || '').trim();
+    if (modelProfile && profiles[modelProfile] && typeof profiles[modelProfile] === 'object') {
+        const profileContextWindow = Number(profiles[modelProfile].context_window);
+        if (Number.isFinite(profileContextWindow) && profileContextWindow > 0) {
+            return profileContextWindow;
+        }
+    }
+    const profileEntries = Object.entries(profiles).filter(([, profile]) => (
+        profile && typeof profile === 'object'
+    ));
+    const roleProfileName = String(getRoleOption(roleId)?.model_profile || '').trim();
+    if (roleProfileName) {
+        const activeProfile = profileEntries.find(([name]) => name === roleProfileName)?.[1];
+        const activeContextWindow = Number(activeProfile?.context_window);
+        if (Number.isFinite(activeContextWindow) && activeContextWindow > 0) {
+            return activeContextWindow;
+        }
+    }
+    const defaultProfile = profileEntries
+        .map(([, profile]) => profile)
+        .find(profile => profile.is_default === true);
     const contextWindow = Number(defaultProfile?.context_window);
     return Number.isFinite(contextWindow) && contextWindow > 0 ? contextWindow : null;
+}
+
+function resolveLatestInputTokens(usage) {
+    const latestInputTokens = Number(usage?.latest_input_tokens);
+    if (Number.isFinite(latestInputTokens) && latestInputTokens > 0) {
+        return latestInputTokens;
+    }
+    return Number(usage?.input_tokens);
 }
 
 function formatTokenCount(value) {

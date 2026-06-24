@@ -1,29 +1,47 @@
 from __future__ import annotations
 
+import pytest
+
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
+import threading
+from typing import cast
 
-from agent_teams.automation import (
-    AutomationDeliveryEvent,
+from relay_teams.automation.automation_delivery_repository import (
     AutomationDeliveryRepository,
+)
+from relay_teams.automation.automation_delivery_service import (
     AutomationDeliveryService,
+    AutomationDeliveryWorker,
+)
+from relay_teams.automation.automation_models import (
+    AutomationCleanupStatus,
+    AutomationDeliveryEvent,
     AutomationDeliveryStatus,
     AutomationFeishuBinding,
     AutomationProjectRecord,
     AutomationProjectStatus,
     AutomationRunConfig,
     AutomationScheduleMode,
+    AutomationXiaolubanBinding,
 )
-from agent_teams.gateway.feishu.models import FeishuEnvironment
-from agent_teams.sessions.runs.enums import RunEventType
-from agent_teams.sessions.runs.event_log import EventLog
-from agent_teams.sessions.runs.run_models import RunEvent
-from agent_teams.sessions.runs.run_runtime_repo import (
+from relay_teams.gateway.feishu.models import FeishuEnvironment
+from relay_teams.gateway.xiaoluban import format_xiaoluban_notification_text
+from relay_teams.media import content_parts_from_text
+from relay_teams.notifications import NotificationContext, NotificationType
+from relay_teams.sessions.runs.enums import RunEventType
+from relay_teams.sessions.runs.event_log import EventLog
+from relay_teams.sessions.runs.run_models import RunEvent, RunResult
+from relay_teams.sessions.runs.run_runtime_repo import (
     RunRuntimePhase,
     RunRuntimeRecord,
     RunRuntimeRepository,
     RunRuntimeStatus,
 )
+from relay_teams.sessions.session_models import SessionRecord
+
+pytestmark = pytest.mark.asyncio
 
 
 class _FakeRuntimeConfigLookup:
@@ -35,17 +53,153 @@ class _FakeRuntimeConfigLookup:
                 app_name="Agent Teams Bot",
             )
 
-    def get_runtime_config_by_trigger_id(self, trigger_id: str):
+    def get_runtime_config_by_trigger_id(self, trigger_id: str) -> _RuntimeConfig:
         return self._RuntimeConfig(trigger_id)
 
 
 class _FakeFeishuClient:
     def __init__(self) -> None:
         self.sent_messages: list[dict[str, str]] = []
+        self.reply_messages: list[dict[str, str]] = []
+        self.deleted_messages: list[str] = []
+        self.fail_delete = False
+        self.fail_send_error: RuntimeError | None = None
+        self.fail_reply_error: RuntimeError | None = None
 
-    def send_text_message(self, *, chat_id: str, text: str, environment=None) -> None:
+    async def send_text_message(
+        self, *, chat_id: str, text: str, environment=None
+    ) -> str:
         _ = environment
+        if self.fail_send_error is not None:
+            raise self.fail_send_error
         self.sent_messages.append({"chat_id": chat_id, "text": text})
+        return f"om_{len(self.sent_messages)}"
+
+    async def reply_text_message(
+        self,
+        *,
+        message_id: str,
+        text: str,
+        environment=None,
+    ) -> str:
+        _ = environment
+        if self.fail_reply_error is not None:
+            raise self.fail_reply_error
+        self.reply_messages.append({"message_id": message_id, "text": text})
+        return f"om_reply_{len(self.reply_messages)}"
+
+    def delete_message(self, *, message_id: str, environment=None) -> None:
+        _ = environment
+        if self.fail_delete:
+            raise RuntimeError("delete_failed")
+        self.deleted_messages.append(message_id)
+
+
+class _FakeAutomationDeliveryWorkerService:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def process_pending(self) -> bool:
+        self.calls += 1
+        return self.calls == 1
+
+
+class _BlockingAutomationDeliveryWorkerService:
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+
+    async def process_pending(self) -> bool:
+        self.entered.set()
+        _ = await asyncio.to_thread(self.release.wait, 2.0)
+        self.finished.set()
+        return False
+
+
+class _FakeNotificationService:
+    def __init__(self) -> None:
+        self.emit_calls: list[dict[str, object]] = []
+
+    def emit(
+        self,
+        *,
+        notification_type: NotificationType,
+        title: str,
+        body: str,
+        context: NotificationContext,
+        dedupe_key: str | None = None,
+    ) -> bool:
+        self.emit_calls.append(
+            {
+                "notification_type": notification_type,
+                "title": title,
+                "body": body,
+                "context": context,
+                "dedupe_key": dedupe_key,
+            }
+        )
+        return True
+
+    async def emit_async(
+        self,
+        *,
+        notification_type: NotificationType,
+        title: str,
+        body: str,
+        context: NotificationContext,
+        dedupe_key: str | None = None,
+    ) -> bool:
+        return self.emit(
+            notification_type=notification_type,
+            title=title,
+            body=body,
+            context=context,
+            dedupe_key=dedupe_key,
+        )
+
+
+class _FakeSessionLookup:
+    def get(self, session_id: str) -> SessionRecord:
+        return SessionRecord(session_id=session_id, workspace_id="default")
+
+
+class _MissingSessionLookup:
+    def get(self, session_id: str) -> SessionRecord:
+        raise KeyError(session_id)
+
+
+class _FakeXiaolubanGatewayService:
+    def __init__(self) -> None:
+        self.sent_messages: list[dict[str, object]] = []
+        self.fail_send_key_error = False
+
+    async def send_notification_message(
+        self,
+        *,
+        account_id: str,
+        workspace_id: str,
+        session_id: str,
+        status: str,
+        body: str,
+        receiver_uid: str | None = None,
+    ) -> str:
+        if self.fail_send_key_error:
+            raise KeyError(f"Unknown Xiaoluban account_id: {account_id}")
+        text = format_xiaoluban_notification_text(
+            workspace_id=workspace_id,
+            session_id=session_id,
+            status=status,
+            body=body,
+        )
+        self.sent_messages.append(
+            {
+                "account_id": account_id,
+                "text": text,
+                "receiver_uid": receiver_uid,
+            }
+        )
+        return f"xlbmsg_{len(self.sent_messages)}"
 
 
 def _build_project() -> AutomationProjectRecord:
@@ -76,18 +230,35 @@ def _build_project() -> AutomationProjectRecord:
     )
 
 
+def _build_xiaoluban_project() -> AutomationProjectRecord:
+    return _build_project().model_copy(
+        update={
+            "delivery_binding": AutomationXiaolubanBinding(
+                account_id="xlb_main",
+                display_name="小鲁班主账号",
+                derived_uid="stale_uid",
+                source_label="发送给自己（stale_uid）",
+            )
+        }
+    )
+
+
 def _build_service(
     tmp_path: Path,
+    *,
+    session_lookup: _FakeSessionLookup | _MissingSessionLookup | None = None,
 ) -> tuple[
     AutomationDeliveryService,
     _FakeFeishuClient,
     RunRuntimeRepository,
     EventLog,
     AutomationDeliveryRepository,
+    _FakeNotificationService,
 ]:
     db_path = tmp_path / "automation-delivery.db"
     repository = AutomationDeliveryRepository(db_path)
     feishu_client = _FakeFeishuClient()
+    notification_service = _FakeNotificationService()
     run_runtime_repo = RunRuntimeRepository(db_path)
     event_log = EventLog(db_path)
     service = AutomationDeliveryService(
@@ -96,13 +267,83 @@ def _build_service(
         feishu_client=feishu_client,
         run_runtime_repo=run_runtime_repo,
         event_log=event_log,
+        notification_service=notification_service,
+        session_lookup=session_lookup,
     )
-    return service, feishu_client, run_runtime_repo, event_log, repository
+    return (
+        service,
+        feishu_client,
+        run_runtime_repo,
+        event_log,
+        repository,
+        notification_service,
+    )
 
 
-def test_register_run_sends_started_message_immediately(tmp_path: Path) -> None:
-    service, feishu_client, _run_runtime_repo, _event_log, repository = _build_service(
-        tmp_path
+def _build_service_with_xiaoluban(
+    tmp_path: Path,
+) -> tuple[
+    AutomationDeliveryService,
+    _FakeFeishuClient,
+    _FakeXiaolubanGatewayService,
+    RunRuntimeRepository,
+    EventLog,
+    AutomationDeliveryRepository,
+]:
+    db_path = tmp_path / "automation-delivery-xlb.db"
+    repository = AutomationDeliveryRepository(db_path)
+    feishu_client = _FakeFeishuClient()
+    xiaoluban_gateway_service = _FakeXiaolubanGatewayService()
+    run_runtime_repo = RunRuntimeRepository(db_path)
+    event_log = EventLog(db_path)
+    service = AutomationDeliveryService(
+        repository=repository,
+        runtime_config_lookup=_FakeRuntimeConfigLookup(),
+        feishu_client=feishu_client,
+        xiaoluban_gateway_service=xiaoluban_gateway_service,
+        run_runtime_repo=run_runtime_repo,
+        event_log=event_log,
+        notification_service=_FakeNotificationService(),
+        session_lookup=_FakeSessionLookup(),
+    )
+    return (
+        service,
+        feishu_client,
+        xiaoluban_gateway_service,
+        run_runtime_repo,
+        event_log,
+        repository,
+    )
+
+
+async def test_resolve_workspace_id_handles_blank_lookup_and_missing_session(
+    tmp_path: Path,
+) -> None:
+    service, _feishu_client, _run_runtime_repo, _event_log, _repository, _ = (
+        _build_service(tmp_path)
+    )
+    missing_lookup_path = tmp_path / "missing-lookup"
+    missing_lookup_path.mkdir()
+    (
+        missing_session_service,
+        _feishu_client_2,
+        _run_runtime_repo_2,
+        _event_log_2,
+        _repository_2,
+        _notification_service_2,
+    ) = _build_service(
+        missing_lookup_path,
+        session_lookup=_MissingSessionLookup(),
+    )
+
+    assert service._resolve_workspace_id("") == ""
+    assert service._resolve_workspace_id("session-1") == ""
+    assert missing_session_service._resolve_workspace_id("session-1") == ""
+
+
+async def test_register_run_sends_started_message_immediately(tmp_path: Path) -> None:
+    service, feishu_client, _run_runtime_repo, _event_log, repository, _ = (
+        _build_service(tmp_path)
     )
 
     record = service.register_run(
@@ -113,19 +354,20 @@ def test_register_run_sends_started_message_immediately(tmp_path: Path) -> None:
     )
 
     assert record is not None
+    _ = await service.process_pending()
     assert len(feishu_client.sent_messages) == 1
-    assert (
-        feishu_client.sent_messages[0]["text"]
-        == "Daily Briefing 定时任务开始执行（手动触发）。"
-    )
+    assert feishu_client.sent_messages[0]["text"] == "定时任务 Daily Briefing 开始执行"
     persisted = repository.get_by_run_id("run-1")
     assert persisted.started_status.value == "sent"
+    assert persisted.started_message_id == "om_1"
     assert persisted.terminal_status.value == "pending"
 
 
-def test_attempt_started_delivery_claim_prevents_duplicate_send(tmp_path: Path) -> None:
-    service, feishu_client, _run_runtime_repo, _event_log, repository = _build_service(
-        tmp_path
+async def test_attempt_started_delivery_claim_prevents_duplicate_send(
+    tmp_path: Path,
+) -> None:
+    service, feishu_client, _run_runtime_repo, _event_log, repository, _ = (
+        _build_service(tmp_path)
     )
     persisted = service.register_run(
         project=_build_project(),
@@ -135,22 +377,242 @@ def test_attempt_started_delivery_claim_prevents_duplicate_send(tmp_path: Path) 
     )
 
     assert persisted is not None
+    _ = await service.process_pending()
     stale_record = repository.get_by_run_id("run-1").model_copy(
         update={"started_status": AutomationDeliveryStatus.PENDING}
     )
 
-    progressed = service._attempt_started_delivery(stale_record)
+    progressed = await service._attempt_started_delivery(stale_record)
 
     assert progressed is False
     assert len(feishu_client.sent_messages) == 1
 
 
-def test_process_pending_sends_completed_message_when_run_finishes(
+async def test_process_pending_sends_completed_message_when_run_finishes(
     tmp_path: Path,
 ) -> None:
-    service, feishu_client, run_runtime_repo, event_log, repository = _build_service(
+    service, feishu_client, run_runtime_repo, event_log, repository, _ = _build_service(
         tmp_path
     )
+    _ = service.register_run(
+        project=_build_project(),
+        session_id="session-1",
+        run_id="run-1",
+        reason="schedule",
+    )
+    _ = await service.process_pending()
+    run_runtime_repo.upsert(
+        RunRuntimeRecord(
+            run_id="run-1",
+            session_id="session-1",
+            status=RunRuntimeStatus.COMPLETED,
+            phase=RunRuntimePhase.TERMINAL,
+        )
+    )
+    event_log.emit_run_event(
+        RunEvent(
+            session_id="session-1",
+            run_id="run-1",
+            trace_id="run-1",
+            event_type=RunEventType.RUN_COMPLETED,
+            payload_json='{"status":"completed","output":"Daily report is ready."}',
+            occurred_at=datetime.now(tz=timezone.utc),
+        )
+    )
+
+    progressed = await service.process_pending()
+
+    assert progressed is True
+    assert len(feishu_client.sent_messages) == 1
+    assert feishu_client.reply_messages == [
+        {"message_id": "om_1", "text": "Daily report is ready."}
+    ]
+    persisted = repository.get_by_run_id("run-1")
+    assert persisted.terminal_status.value == "sent"
+    assert persisted.terminal_event == AutomationDeliveryEvent.COMPLETED
+    assert persisted.terminal_message_id == "om_reply_1"
+    assert persisted.started_cleanup_status == AutomationCleanupStatus.SKIPPED
+    assert feishu_client.deleted_messages == []
+
+
+async def test_process_pending_skips_completed_message_when_run_has_no_output(
+    tmp_path: Path,
+) -> None:
+    service, feishu_client, run_runtime_repo, event_log, repository, _ = _build_service(
+        tmp_path
+    )
+    _ = service.register_run(
+        project=_build_project(),
+        session_id="session-1",
+        run_id="run-1",
+        reason="schedule",
+    )
+    _ = await service.process_pending()
+    run_runtime_repo.upsert(
+        RunRuntimeRecord(
+            run_id="run-1",
+            session_id="session-1",
+            status=RunRuntimeStatus.COMPLETED,
+            phase=RunRuntimePhase.TERMINAL,
+        )
+    )
+    event_log.emit_run_event(
+        RunEvent(
+            session_id="session-1",
+            run_id="run-1",
+            trace_id="run-1",
+            event_type=RunEventType.RUN_COMPLETED,
+            payload_json='{"status":"completed","output":"   "}',
+            occurred_at=datetime.now(tz=timezone.utc),
+        )
+    )
+
+    progressed = await service.process_pending()
+
+    assert progressed is True
+    assert len(feishu_client.sent_messages) == 1
+    assert feishu_client.reply_messages == []
+    persisted = repository.get_by_run_id("run-1")
+    assert persisted.terminal_status.value == "skipped"
+    assert persisted.terminal_event == AutomationDeliveryEvent.COMPLETED
+    assert persisted.terminal_message == ""
+    assert persisted.started_cleanup_status == AutomationCleanupStatus.SKIPPED
+    assert feishu_client.deleted_messages == []
+
+
+async def test_process_pending_sends_structured_completed_message_when_run_finishes(
+    tmp_path: Path,
+) -> None:
+    service, feishu_client, run_runtime_repo, event_log, repository, _ = _build_service(
+        tmp_path
+    )
+    _ = service.register_run(
+        project=_build_project(),
+        session_id="session-1",
+        run_id="run-1",
+        reason="schedule",
+    )
+    _ = await service.process_pending()
+    run_runtime_repo.upsert(
+        RunRuntimeRecord(
+            run_id="run-1",
+            session_id="session-1",
+            status=RunRuntimeStatus.COMPLETED,
+            phase=RunRuntimePhase.TERMINAL,
+        )
+    )
+    event_log.emit_run_event(
+        RunEvent(
+            session_id="session-1",
+            run_id="run-1",
+            trace_id="run-1",
+            event_type=RunEventType.RUN_COMPLETED,
+            payload_json=RunResult(
+                trace_id="run-1",
+                root_task_id="task-root-1",
+                status="completed",
+                output=content_parts_from_text("Daily report is ready."),
+            ).model_dump_json(),
+            occurred_at=datetime.now(tz=timezone.utc),
+        )
+    )
+
+    progressed = await service.process_pending()
+
+    assert progressed is True
+    assert len(feishu_client.sent_messages) == 1
+    assert feishu_client.reply_messages == [
+        {"message_id": "om_1", "text": "Daily report is ready."}
+    ]
+    persisted = repository.get_by_run_id("run-1")
+    assert persisted.terminal_status.value == "sent"
+    assert persisted.terminal_event == AutomationDeliveryEvent.COMPLETED
+    assert persisted.started_cleanup_status == AutomationCleanupStatus.SKIPPED
+
+
+async def test_process_pending_uses_terminal_error_when_failed_output_is_empty(
+    tmp_path: Path,
+) -> None:
+    service, feishu_client, run_runtime_repo, event_log, repository, _ = _build_service(
+        tmp_path
+    )
+    _ = service.register_run(
+        project=_build_project(),
+        session_id="session-1",
+        run_id="run-1",
+        reason="schedule",
+    )
+    _ = await service.process_pending()
+    run_runtime_repo.upsert(
+        RunRuntimeRecord(
+            run_id="run-1",
+            session_id="session-1",
+            status=RunRuntimeStatus.FAILED,
+            phase=RunRuntimePhase.TERMINAL,
+        )
+    )
+    event_log.emit_run_event(
+        RunEvent(
+            session_id="session-1",
+            run_id="run-1",
+            trace_id="run-1",
+            event_type=RunEventType.RUN_FAILED,
+            payload_json='{"status":"failed","output":"","error":"provider timeout"}',
+            occurred_at=datetime.now(tz=timezone.utc),
+        )
+    )
+
+    progressed = await service.process_pending()
+
+    assert progressed is True
+    assert len(feishu_client.sent_messages) == 1
+    assert len(feishu_client.reply_messages) == 1
+    assert "provider timeout" in feishu_client.reply_messages[0]["text"]
+    persisted = repository.get_by_run_id("run-1")
+    assert persisted.terminal_status.value == "sent"
+    assert persisted.terminal_event == AutomationDeliveryEvent.FAILED
+    assert persisted.started_cleanup_status == AutomationCleanupStatus.SKIPPED
+
+
+async def test_process_pending_defers_failed_delivery_while_run_is_awaiting_recovery(
+    tmp_path: Path,
+) -> None:
+    service, feishu_client, run_runtime_repo, _event_log, repository, _ = (
+        _build_service(tmp_path)
+    )
+    _ = service.register_run(
+        project=_build_project(),
+        session_id="session-1",
+        run_id="run-1",
+        reason="schedule",
+    )
+    _ = await service.process_pending()
+    run_runtime_repo.upsert(
+        RunRuntimeRecord(
+            run_id="run-1",
+            session_id="session-1",
+            status=RunRuntimeStatus.FAILED,
+            phase=RunRuntimePhase.AWAITING_RECOVERY,
+            last_error="stream interrupted",
+        )
+    )
+
+    progressed = await service.process_pending()
+
+    persisted = repository.get_by_run_id("run-1")
+    assert progressed is False
+    assert len(feishu_client.sent_messages) == 1
+    assert persisted.terminal_status == AutomationDeliveryStatus.PENDING
+    assert persisted.terminal_message_id is None
+
+
+async def test_process_pending_cleanup_failure_does_not_break_terminal_delivery(
+    tmp_path: Path,
+) -> None:
+    service, feishu_client, run_runtime_repo, event_log, repository, _ = _build_service(
+        tmp_path
+    )
+    feishu_client.fail_delete = True
     _ = service.register_run(
         project=_build_project(),
         session_id="session-1",
@@ -176,14 +638,433 @@ def test_process_pending_sends_completed_message_when_run_finishes(
         )
     )
 
-    progressed = service.process_pending()
+    progressed = await service.process_pending()
+
+    persisted = repository.get_by_run_id("run-1")
+    assert progressed is True
+    assert len(feishu_client.sent_messages) == 1
+    assert feishu_client.reply_messages == [
+        {"message_id": "om_1", "text": "Daily report is ready."}
+    ]
+    assert feishu_client.deleted_messages == []
+    assert persisted.terminal_status == AutomationDeliveryStatus.SENT
+    assert persisted.started_cleanup_status == AutomationCleanupStatus.SKIPPED
+    assert persisted.started_cleanup_attempts == 0
+
+
+async def test_delivery_service_suppresses_generic_terminal_notification_for_owned_run(
+    tmp_path: Path,
+) -> None:
+    service, _feishu_client, _run_runtime_repo, _event_log, _repository, _ = (
+        _build_service(tmp_path)
+    )
+    _ = service.register_run(
+        project=_build_project(),
+        session_id="session-1",
+        run_id="run-1",
+        reason="schedule",
+    )
+
+    assert service.should_suppress_terminal_notification("run-1") is True
+    assert service.should_suppress_terminal_notification("missing-run") is False
+    assert service.should_suppress_xiaoluban_terminal_notification("run-1") is False
+
+
+async def test_delivery_service_suppresses_xiaoluban_terminal_notification_only_for_xiaoluban_binding(
+    tmp_path: Path,
+) -> None:
+    (
+        service,
+        _feishu_client,
+        _xiaoluban_gateway_service,
+        _run_runtime_repo,
+        _event_log,
+        _repository,
+    ) = _build_service_with_xiaoluban(tmp_path)
+    _ = service.register_run(
+        project=_build_xiaoluban_project(),
+        session_id="session-1",
+        run_id="run-1",
+        reason="schedule",
+    )
+
+    assert service.should_suppress_terminal_notification("run-1") is True
+    assert service.should_suppress_xiaoluban_terminal_notification("run-1") is True
+    assert (
+        service.should_suppress_xiaoluban_terminal_notification("missing-run") is False
+    )
+
+
+async def test_delivery_service_does_not_suppress_when_terminal_delivery_is_disabled(
+    tmp_path: Path,
+) -> None:
+    service, _feishu_client, _run_runtime_repo, _event_log, _repository, _ = (
+        _build_service(tmp_path)
+    )
+    project = _build_project().model_copy(update={"delivery_events": ()})
+    _ = service.register_run(
+        project=project,
+        session_id="session-1",
+        run_id="run-1",
+        reason="schedule",
+    )
+
+    assert service.should_suppress_terminal_notification("run-1") is False
+
+
+async def test_delivery_service_emits_fallback_notification_after_terminal_delivery_failure(
+    tmp_path: Path,
+) -> None:
+    service, feishu_client, run_runtime_repo, event_log, repository, notifications = (
+        _build_service(tmp_path)
+    )
+    _ = service.register_run(
+        project=_build_project(),
+        session_id="session-1",
+        run_id="run-1",
+        reason="schedule",
+    )
+    feishu_client.fail_reply_error = RuntimeError("reply_failed")
+    run_runtime_repo.upsert(
+        RunRuntimeRecord(
+            run_id="run-1",
+            session_id="session-1",
+            status=RunRuntimeStatus.FAILED,
+            phase=RunRuntimePhase.TERMINAL,
+            last_error="provider timeout",
+        )
+    )
+    event_log.emit_run_event(
+        RunEvent(
+            session_id="session-1",
+            run_id="run-1",
+            trace_id="run-1",
+            event_type=RunEventType.RUN_FAILED,
+            payload_json='{"status":"failed","output":"","error":"provider timeout"}',
+            occurred_at=datetime.now(tz=timezone.utc),
+        )
+    )
+
+    for _ in range(5):
+        assert await service.process_pending() is True
+
+    persisted = repository.get_by_run_id("run-1")
+    assert persisted.terminal_status == AutomationDeliveryStatus.FAILED
+    assert notifications.emit_calls == [
+        {
+            "notification_type": NotificationType.RUN_FAILED,
+            "title": "Run Failed",
+            "body": "定时任务 Daily Briefing 执行失败。\n\nprovider timeout",
+            "context": NotificationContext(
+                session_id="session-1",
+                run_id="run-1",
+                trace_id="run-1",
+            ),
+            "dedupe_key": "automation-terminal-fallback:run-1",
+        }
+    ]
+    assert service.should_suppress_terminal_notification("run-1") is False
+
+
+async def test_delivery_service_emits_fallback_through_rebound_notification_service(
+    tmp_path: Path,
+) -> None:
+    (
+        service,
+        feishu_client,
+        run_runtime_repo,
+        event_log,
+        _repository,
+        original_notifications,
+    ) = _build_service(tmp_path)
+    rebound_notifications = _FakeNotificationService()
+    service.bind_notification_service(rebound_notifications)
+    _ = service.register_run(
+        project=_build_project(),
+        session_id="session-1",
+        run_id="run-1",
+        reason="schedule",
+    )
+    feishu_client.fail_reply_error = RuntimeError("reply_failed")
+    run_runtime_repo.upsert(
+        RunRuntimeRecord(
+            run_id="run-1",
+            session_id="session-1",
+            status=RunRuntimeStatus.COMPLETED,
+            phase=RunRuntimePhase.TERMINAL,
+        )
+    )
+    event_log.emit_run_event(
+        RunEvent(
+            session_id="session-1",
+            run_id="run-1",
+            trace_id="run-1",
+            event_type=RunEventType.RUN_COMPLETED,
+            payload_json='{"status":"completed","output":"Daily report is ready."}',
+            occurred_at=datetime.now(tz=timezone.utc),
+        )
+    )
+
+    for _ in range(5):
+        assert await service.process_pending() is True
+
+    assert original_notifications.emit_calls == []
+    assert rebound_notifications.emit_calls == [
+        {
+            "notification_type": NotificationType.RUN_COMPLETED,
+            "title": "Run Completed",
+            "body": "Daily report is ready.",
+            "context": NotificationContext(
+                session_id="session-1",
+                run_id="run-1",
+                trace_id="run-1",
+            ),
+            "dedupe_key": "automation-terminal-fallback:run-1",
+        }
+    ]
+
+
+async def test_automation_delivery_worker_start_wake_stop() -> None:
+    async def run_worker() -> None:
+        service = _FakeAutomationDeliveryWorkerService()
+        worker = AutomationDeliveryWorker(
+            delivery_service=cast(AutomationDeliveryService, service),
+            poll_interval_seconds=0.01,
+        )
+
+        await worker.stop()
+        await worker.start()
+        await worker.start()
+        worker.wake()
+        await asyncio.sleep(0.03)
+        await worker.stop()
+
+        assert service.calls >= 2
+
+    await run_worker()
+
+
+async def test_automation_delivery_worker_stop_waits_for_inflight_processing() -> None:
+    async def run_worker() -> None:
+        service = _BlockingAutomationDeliveryWorkerService()
+        worker = AutomationDeliveryWorker(
+            delivery_service=cast(AutomationDeliveryService, service),
+            poll_interval_seconds=0.01,
+        )
+
+        await worker.start()
+        assert await asyncio.to_thread(service.entered.wait, 1.0)
+        stop_task = asyncio.create_task(worker.stop())
+        await asyncio.sleep(0.03)
+        assert stop_task.done() is False
+
+        service.release.set()
+        await asyncio.wait_for(stop_task, timeout=1.0)
+
+        assert service.finished.is_set()
+
+    await run_worker()
+
+
+async def test_automation_delivery_worker_stop_times_out_for_stalled_processing() -> (
+    None
+):
+    async def run_worker() -> None:
+        service = _BlockingAutomationDeliveryWorkerService()
+        worker = AutomationDeliveryWorker(
+            delivery_service=cast(AutomationDeliveryService, service),
+            poll_interval_seconds=0.01,
+            stop_timeout_seconds=0.05,
+        )
+
+        await worker.start()
+        assert await asyncio.to_thread(service.entered.wait, 1.0)
+
+        await asyncio.wait_for(worker.stop(), timeout=1.0)
+        assert service.finished.is_set() is False
+
+        service.release.set()
+        assert service.finished.is_set() is False
+
+    await run_worker()
+
+
+async def test_register_run_sends_started_message_to_xiaoluban_account(
+    tmp_path: Path,
+) -> None:
+    (
+        service,
+        feishu_client,
+        xiaoluban_gateway_service,
+        _run_runtime_repo,
+        _event_log,
+        repository,
+    ) = _build_service_with_xiaoluban(tmp_path)
+
+    record = service.register_run(
+        project=_build_xiaoluban_project(),
+        session_id="session-1",
+        run_id="run-1",
+        reason="manual",
+    )
+
+    assert record is not None
+    _ = await service.process_pending()
+    assert feishu_client.sent_messages == []
+    assert xiaoluban_gateway_service.sent_messages == [
+        {
+            "account_id": "xlb_main",
+            "text": (
+                "【relay-teams】\n"
+                "session-1\n"
+                "────────────────────\n"
+                "定时任务 Daily Briefing 开始执行"
+            ),
+            "receiver_uid": None,
+        }
+    ]
+    persisted = repository.get_by_run_id("run-1")
+    assert persisted.started_message_id == "xlbmsg_1"
+    assert persisted.binding.provider == "xiaoluban"
+
+
+async def test_register_run_marks_started_delivery_pending_when_xiaoluban_account_is_missing(
+    tmp_path: Path,
+) -> None:
+    (
+        service,
+        _feishu_client,
+        xiaoluban_gateway_service,
+        _run_runtime_repo,
+        _event_log,
+        repository,
+    ) = _build_service_with_xiaoluban(tmp_path)
+    xiaoluban_gateway_service.fail_send_key_error = True
+
+    record = service.register_run(
+        project=_build_xiaoluban_project(),
+        session_id="session-1",
+        run_id="run-1",
+        reason="manual",
+    )
+
+    assert record is not None
+    _ = await service.process_pending()
+    persisted = repository.get_by_run_id("run-1")
+    assert persisted.started_status == AutomationDeliveryStatus.PENDING
+    assert persisted.started_attempts == 1
+    assert persisted.last_error == "missing_xiaoluban_account"
+
+
+async def test_process_pending_sends_default_completed_message_to_xiaoluban(
+    tmp_path: Path,
+) -> None:
+    (
+        service,
+        _feishu_client,
+        xiaoluban_gateway_service,
+        run_runtime_repo,
+        event_log,
+        repository,
+    ) = _build_service_with_xiaoluban(tmp_path)
+    _ = service.register_run(
+        project=_build_xiaoluban_project(),
+        session_id="session-1",
+        run_id="run-1",
+        reason="schedule",
+    )
+    run_runtime_repo.upsert(
+        RunRuntimeRecord(
+            run_id="run-1",
+            session_id="session-1",
+            status=RunRuntimeStatus.COMPLETED,
+            phase=RunRuntimePhase.TERMINAL,
+        )
+    )
+    event_log.emit_run_event(
+        RunEvent(
+            session_id="session-1",
+            run_id="run-1",
+            trace_id="run-1",
+            event_type=RunEventType.RUN_COMPLETED,
+            payload_json='{"status":"completed","output":"   "}',
+            occurred_at=datetime.now(tz=timezone.utc),
+        )
+    )
+
+    progressed = await service.process_pending()
 
     assert progressed is True
-    assert len(feishu_client.sent_messages) == 2
-    assert (
-        feishu_client.sent_messages[1]["text"]
-        == "Daily Briefing 定时任务执行完成。\n\nDaily report is ready."
-    )
+    assert xiaoluban_gateway_service.sent_messages == [
+        {
+            "account_id": "xlb_main",
+            "text": (
+                "【relay-teams】\n"
+                "session-1\n"
+                "────────────────────\n"
+                "定时任务 Daily Briefing 开始执行"
+            ),
+            "receiver_uid": None,
+        },
+        {
+            "account_id": "xlb_main",
+            "text": (
+                "【relay-teams】\n"
+                "session-1\n"
+                "────────────────────\n"
+                "定时任务 Daily Briefing 执行完成。"
+            ),
+            "receiver_uid": None,
+        },
+    ]
     persisted = repository.get_by_run_id("run-1")
-    assert persisted.terminal_status.value == "sent"
+    assert persisted.terminal_status == AutomationDeliveryStatus.SENT
     assert persisted.terminal_event == AutomationDeliveryEvent.COMPLETED
+    assert persisted.terminal_message == "定时任务 Daily Briefing 执行完成。"
+
+
+async def test_process_pending_marks_terminal_delivery_pending_when_xiaoluban_account_is_missing(
+    tmp_path: Path,
+) -> None:
+    (
+        service,
+        _feishu_client,
+        xiaoluban_gateway_service,
+        run_runtime_repo,
+        event_log,
+        repository,
+    ) = _build_service_with_xiaoluban(tmp_path)
+    _ = service.register_run(
+        project=_build_xiaoluban_project(),
+        session_id="session-1",
+        run_id="run-1",
+        reason="schedule",
+    )
+    xiaoluban_gateway_service.fail_send_key_error = True
+    run_runtime_repo.upsert(
+        RunRuntimeRecord(
+            run_id="run-1",
+            session_id="session-1",
+            status=RunRuntimeStatus.COMPLETED,
+            phase=RunRuntimePhase.TERMINAL,
+        )
+    )
+    event_log.emit_run_event(
+        RunEvent(
+            session_id="session-1",
+            run_id="run-1",
+            trace_id="run-1",
+            event_type=RunEventType.RUN_COMPLETED,
+            payload_json='{"status":"completed","output":"   "}',
+            occurred_at=datetime.now(tz=timezone.utc),
+        )
+    )
+
+    progressed = await service.process_pending()
+
+    assert progressed is True
+    persisted = repository.get_by_run_id("run-1")
+    assert persisted.terminal_status == AutomationDeliveryStatus.PENDING
+    assert persisted.terminal_attempts == 1
+    assert persisted.terminal_message == "定时任务 Daily Briefing 执行完成。"
+    assert persisted.last_error == "missing_xiaoluban_account"

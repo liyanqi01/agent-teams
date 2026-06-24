@@ -18,6 +18,18 @@ export function renderMarkdownToHtml(source = '') {
     return renderFallbackMarkdown(text);
 }
 
+export function stripMarkdownFrontmatter(source = '') {
+    const normalized = String(source || '').replace(/\r\n?/g, '\n');
+    if (!normalized.startsWith('---\n')) {
+        return normalized;
+    }
+    const endIndex = normalized.indexOf('\n---\n', 4);
+    if (endIndex < 0) {
+        return normalized;
+    }
+    return normalized.slice(endIndex + 5);
+}
+
 export function parseMarkdown(source = '') {
     ensureMarkdownInteractions();
     
@@ -56,9 +68,12 @@ export function parseMarkdown(source = '') {
         if (pre.parentElement?.classList.contains('markdown-code-block')) return;
         const code = pre.querySelector('code');
         if (!code) return;
+
+        const language = extractCodeLanguage(code);
+        applyHighlight(code, language);
+
         const wrapper = document.createElement('div');
         wrapper.className = 'markdown-code-block';
-        const language = extractCodeLanguage(code);
         wrapper.dataset.language = language;
 
         const header = document.createElement('div');
@@ -99,19 +114,14 @@ function getMarkedRuntime() {
     if (
         !runtime
         || typeof runtime.parse !== 'function'
-        || typeof runtime.setOptions !== 'function'
     ) {
         return null;
     }
 
     if (!markedConfigured) {
-        runtime.setOptions({
-            gfm: true,
-            breaks: true,
-            highlight(code, lang) {
-                return highlightCode(code, lang);
-            },
-        });
+        if (typeof runtime.setOptions === 'function') {
+            runtime.setOptions({ gfm: true, breaks: true });
+        }
         markedConfigured = true;
     }
 
@@ -257,6 +267,19 @@ function highlightCode(code, lang) {
     return highlightRuntime.highlight(source, { language }).value;
 }
 
+function applyHighlight(codeElement, language) {
+    const hljs = getHighlightRuntime();
+    if (!hljs) return;
+    const source = codeElement.textContent || '';
+    const lang = hljs.getLanguage(language) ? language : null;
+    if (lang) {
+        codeElement.innerHTML = hljs.highlight(source, { language: lang }).value;
+    } else {
+        const result = hljs.highlightAuto(source);
+        codeElement.innerHTML = result.value;
+    }
+}
+
 function normalizeCodeLanguage(language) {
     const normalized = String(language || '').trim().toLowerCase();
     return normalized || 'text';
@@ -352,8 +375,8 @@ async function handleCopyCodeBlock(button) {
     const copyText = codeEl ? String(codeEl.textContent || '').trimEnd() : '';
     if (!copyText) {
         showToast({
-            title: 'Copy Failed',
-            message: 'No code content was found in this block.',
+            title: t('markdown.copy_failed_title'),
+            message: t('markdown.copy_empty_message'),
             tone: 'warning',
         });
         return;
@@ -363,15 +386,15 @@ async function handleCopyCodeBlock(button) {
         await navigator.clipboard.writeText(copyText);
         indicateCopySuccess(button);
         showToast({
-            title: 'Code Copied',
-            message: 'The code block has been copied to your clipboard.',
+            title: t('markdown.copy_success_title'),
+            message: t('markdown.copy_success_message'),
             tone: 'success',
             durationMs: 1800,
         });
     } catch (error) {
         showToast({
-            title: 'Copy Failed',
-            message: 'Clipboard access is not available right now.',
+            title: t('markdown.copy_failed_title'),
+            message: t('markdown.copy_unavailable_message'),
             tone: 'danger',
         });
     }

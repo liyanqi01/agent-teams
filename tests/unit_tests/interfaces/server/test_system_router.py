@@ -1,60 +1,211 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
+from collections.abc import Awaitable
+from typing import Callable, cast
+from datetime import UTC, datetime, timedelta
+from urllib.parse import parse_qs, urlparse
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import httpx
+import pytest
+from pydantic import JsonValue
 
-from agent_teams.env.proxy_env import ProxyEnvInput
-from agent_teams.external_agents import (
+from relay_teams.env.proxy_env import ProxyEnvInput
+from relay_teams.agent_runtimes import (
+    AcpRegistryError,
+    AcpRegistryAgentView,
+    AcpRegistryCatalogResponse,
+    AcpRegistryDistribution,
+    AcpRegistryInstallRequest,
+    AcpRegistryInstallResult,
+    AgentRuntimeJobStatus,
+    AgentRuntimeSetupPhase,
+    AgentRuntimeTestJob,
     ExternalAgentConfig,
+    ExternalAgentProtocol,
+    ExternalAgentSecretBinding,
     ExternalAgentSummary,
     ExternalAgentTestResult,
+    RegistryTransportConfig,
     StdioTransportConfig,
 )
-from agent_teams.env.github_config_models import GitHubConfig
-from agent_teams.env.github_connectivity import GitHubConnectivityProbeRequest
-from agent_teams.env.github_connectivity import GitHubConnectivityProbeResult
-from agent_teams.env.web_config_models import WebConfig, WebProvider
-from agent_teams.env.web_connectivity import WebConnectivityProbeResult
-from agent_teams.interfaces.server.deps import (
+from relay_teams.agent_runtimes import test_job_service as test_job_service_module
+from relay_teams.env.clawhub_config_models import ClawHubConfig
+from relay_teams.net.clawhub_connectivity import (
+    ClawHubConnectivityProbeRequest,
+    ClawHubConnectivityProbeResult,
+)
+from relay_teams.env.github_config_models import (
+    GitHubConfig,
+    GitHubConfigUpdate,
+    GitHubConfigView,
+)
+from relay_teams.net.github_connectivity import (
+    GitHubConnectivityProbeRequest,
+    GitHubConnectivityProbeResult,
+    GitHubWebhookConnectivityProbeRequest,
+    GitHubWebhookConnectivityProbeResult,
+)
+from relay_teams.env.localhost_run_tunnel_service import (
+    LocalhostRunTunnelStartRequest,
+    LocalhostRunTunnelStatus,
+)
+from relay_teams.env.web_config_models import (
+    DEFAULT_SEARXNG_INSTANCE_SEEDS,
+    DEFAULT_SEARXNG_INSTANCE_URL,
+    WebConfig,
+    WebFallbackProvider,
+    WebProvider,
+)
+from relay_teams.general import GeneralConfig, GeneralConfigUpdate
+from relay_teams.net.web_connectivity import (
+    WebConnectivityProbeRequest,
+    WebConnectivityProbeResult,
+)
+from relay_teams.media import MediaModality
+from relay_teams.interfaces.server.deps import (
+    get_acp_registry_service,
+    get_agent_runtime_test_job_service,
+    get_clawhub_connectivity_probe_service,
+    get_clawhub_config_service,
+    get_clawhub_skill_market_service,
+    get_clawhub_skill_service,
     get_config_status_service,
     get_environment_variable_service,
     get_external_agent_config_service,
+    get_general_config_service,
+    get_github_connectivity_probe_service,
     get_github_config_service,
+    get_github_webhook_connectivity_probe_service,
+    get_hook_service,
+    get_localhost_run_tunnel_service,
+    get_github_trigger_service,
     get_mcp_config_reload_service,
     get_model_config_service,
     get_notification_settings_service,
     get_orchestration_settings_service,
     get_proxy_config_service,
+    get_ssh_profile_service,
     get_skills_config_reload_service,
+    get_skill_registry,
     get_ui_language_settings_service,
     get_web_config_service,
+    get_web_connectivity_probe_service,
+    get_workspace_manager,
 )
-from agent_teams.interfaces.server.ui_language_models import (
+from relay_teams.interfaces.server.control_plane import (
+    CONTROL_PLANE_HOST_ENV,
+    CONTROL_PLANE_MAIN_URL_ENV,
+    CONTROL_PLANE_PORT_ENV,
+    CONTROL_PLANE_STARTED_AT_ENV,
+    CONTROL_PLANE_URL_ENV,
+)
+from relay_teams.interfaces.server.ui_language_models import (
     UiLanguage,
     UiLanguageSettings,
 )
-from agent_teams.interfaces.server.routers import system
-from agent_teams.providers.model_connectivity import (
+from relay_teams.interfaces.server.routers import system
+from relay_teams.providers.model_connectivity import (
+    CodeAgentAuthVerifyResult,
     ModelConnectivityProbeRequest,
     ModelConnectivityProbeResult,
+    ModelDiscoveryRequest,
     ModelDiscoveryResult,
 )
-from agent_teams.providers.model_config import ProviderModelInfo, ProviderType
+from relay_teams.providers.model_config import (
+    DEFAULT_ANTHROPIC_BASE_URL,
+    DEFAULT_CODEAGENT_BASE_URL,
+    DEFAULT_CODEAGENT_CLIENT_ID,
+    DEFAULT_MAAS_BASE_URL,
+    MASKED_MODEL_PASSWORD,
+    ModelConfigPayload,
+    ModelFallbackConfig,
+    ModelFallbackPolicy,
+    ModelFallbackStrategy,
+    ProviderModelInfo,
+    ProviderType,
+)
+from relay_teams.providers.model_catalog import ModelCatalogResult
+from relay_teams.providers.codeagent_auth import (
+    CodeAgentOAuthError,
+    CodeAgentOAuthTokenResult,
+    clear_codeagent_oauth_session_store,
+    consume_codeagent_oauth_tokens,
+    save_codeagent_oauth_tokens_for_session,
+)
+from relay_teams.skills.clawhub_models import (
+    ClawHubSkillDetail,
+    ClawHubSkillSummary,
+    ClawHubSkillWriteRequest,
+)
+from relay_teams.skills.skill_market_models import (
+    ClawHubSkillMarketDetailResponse,
+    ClawHubSkillMarketFile,
+    ClawHubSkillMarketInstallDiagnostics,
+    ClawHubSkillMarketInstallRequest,
+    ClawHubSkillMarketInstallResponse,
+    ClawHubSkillMarketSearchItem,
+    ClawHubSkillMarketSearchResponse,
+    ClawHubSkillMarketUninstallResponse,
+)
+from relay_teams.skills.skill_models import Skill, SkillMetadata, SkillSource
+from relay_teams.hooks import HookRuntimeView, HooksConfig
+from relay_teams.notifications.models import NotificationConfig
+from relay_teams.agents.orchestration.settings_models import OrchestrationSettings
+from relay_teams.workspace import (
+    SshProfileConfig,
+    SshProfileConnectivityProbeRequest,
+    SshProfileConnectivityProbeResult,
+    SshProfilePasswordRevealView,
+    SshProfileRecord,
+)
 
 
 class _FakeSystemService:
-    def __init__(self) -> None:
+    def __init__(self, *, skill_dir: Path | None = None) -> None:
+        self.general_config = GeneralConfig(shell_safety_policy_enabled=True)
+        self.general_config_error: OSError | None = None
         self.saved_notification_config: dict[str, object] | None = None
+        self.saved_general_config: dict[str, object] | None = None
         self.saved_orchestration_config: dict[str, object] | None = None
+        self.saved_model_config: dict[str, object] | None = None
+        self.saved_model_fallback_config: dict[str, object] | None = None
         self.saved_model_profile: tuple[str, dict[str, object], str | None] | None = (
             None
         )
+        self.last_verified_codeagent_profile_name: str | None = None
+        self.last_model_probe_request: ModelConnectivityProbeRequest | None = None
+        self.last_model_discovery_request: ModelDiscoveryRequest | None = None
+        self.codeagent_auth_verify_result = CodeAgentAuthVerifyResult(
+            status="valid",
+            checked_at=datetime.now(UTC),
+            detail=None,
+        )
+        self.model_profile_error: Exception | None = None
+        self.model_profile_delete_error: Exception | None = None
+        self.model_config_error: Exception | None = None
         self.saved_proxy_config: dict[str, object] | None = None
         self.saved_web_config: dict[str, object] | None = None
+        self.saved_clawhub_config: dict[str, object] | None = None
         self.saved_github_config: dict[str, object] | None = None
+        self.current_github_token: str | None = None
+        self.current_github_webhook_base_url: str | None = None
+        self.refreshed_github_callback_previous_base_url: str | None = None
+        self.tunnel_status = LocalhostRunTunnelStatus()
+        self.started_tunnel_request: dict[str, object] | None = None
+        self.stopped_tunnel_request: dict[str, object] | None = None
         self.saved_ui_language_settings: dict[str, object] | None = None
+        self.saved_hooks_config: dict[str, object] | None = None
         self.proxy_save_error: RuntimeError | None = None
+        self.model_reload_error: Exception | None = None
+        self.proxy_reload_error: Exception | None = None
+        self.mcp_reload_error: Exception | None = None
+        self.skills_reload_error: Exception | None = None
+        self.skills_reload_calls = 0
         self.external_agents: dict[str, ExternalAgentConfig] = {
             "codex_local": ExternalAgentConfig(
                 agent_id="codex_local",
@@ -63,9 +214,137 @@ class _FakeSystemService:
                 transport=StdioTransportConfig(command="codex", args=("--serve",)),
             )
         }
+        self.registry_refresh_count = 0
+        self.registry_install_requests: list[tuple[str, AcpRegistryInstallRequest]] = []
+        self.registry_install_current_agents: list[ExternalAgentConfig | None] = []
+        self.registry_catalog_error: Exception | None = None
+        self.registry_install_error: Exception | None = None
+        self.resolved_runtime_agent_ids: list[str] = []
+        self.runtime_resolve_error: Exception | None = None
+        self.clawhub_skills: dict[str, ClawHubSkillDetail] = {
+            "skill-creator-2": ClawHubSkillDetail(
+                skill_id="skill-creator-2",
+                runtime_name="skill-creator",
+                description="Create Codex skills.",
+                ref="skill-creator",
+                source=SkillSource.USER_RELAY_TEAMS,
+                directory="/tmp/.relay-teams/skills/skill-creator-2",
+                manifest_path="/tmp/.relay-teams/skills/skill-creator-2/SKILL.md",
+                valid=True,
+                error=None,
+                instructions="Create skills safely.",
+                manifest_content="---\nname: skill-creator\n---\nCreate skills safely.\n",
+                files=(),
+            )
+        }
+        runtime_skill_dir = skill_dir or Path("/tmp/.relay-teams/skills/skill-creator")
+        self.skill_definitions: dict[str, Skill] = {
+            "skill-creator": Skill(
+                ref="skill-creator",
+                metadata=SkillMetadata(
+                    name="Skill Creator",
+                    description="Create Codex skills.",
+                    instructions="Create skills safely.",
+                ),
+                directory=runtime_skill_dir,
+                source=SkillSource.USER_RELAY_TEAMS,
+            )
+        }
+        self.clawhub_market_search_response = ClawHubSkillMarketSearchResponse(
+            ok=True,
+            query="skill creator",
+            items=(
+                ClawHubSkillMarketSearchItem(
+                    slug="skill-creator",
+                    title="Skill Creator",
+                    version="v1.0.0",
+                    score=3.2,
+                    installed=False,
+                ),
+            ),
+        )
+        self.clawhub_market_browse_response = ClawHubSkillMarketSearchResponse(
+            ok=True,
+            query="",
+            sort="popular",
+            next_cursor="next-page",
+            items=(
+                ClawHubSkillMarketSearchItem(
+                    slug="self-improving-agent",
+                    title="Self-Improving Agent",
+                    summary="Captures learnings.",
+                    version="3.0.21",
+                    installed=False,
+                ),
+            ),
+        )
+        self.clawhub_market_detail_response = ClawHubSkillMarketDetailResponse(
+            ok=True,
+            slug="skill-creator",
+            title="Skill Creator",
+            summary="Create skills.",
+            version="0.1.0",
+            manifest_content="# Skill Creator\n\nCreate skills safely.",
+            files=(
+                ClawHubSkillMarketFile(
+                    path="SKILL.md",
+                    size=42,
+                    sha256="abc123",
+                    content_type="text/plain",
+                ),
+            ),
+        )
+        self.clawhub_market_install_response = ClawHubSkillMarketInstallResponse(
+            ok=True,
+            slug="skill-creator",
+            requested_version=None,
+            installed_skill=None,
+            diagnostics=ClawHubSkillMarketInstallDiagnostics(
+                binary_available=True,
+                token_configured=True,
+                skills_reloaded=True,
+            ),
+        )
+        self.clawhub_market_uninstall_response = ClawHubSkillMarketUninstallResponse(
+            ok=True,
+            slug="skill-creator",
+            skills_reloaded=True,
+        )
+        self.last_clawhub_market_search: tuple[str, int] | None = None
+        self.last_clawhub_market_browse: tuple[int, str, str] | None = None
+        self.last_clawhub_market_detail: tuple[str, str | None] | None = None
+        self.last_clawhub_market_install: ClawHubSkillMarketInstallRequest | None = None
+        self.last_clawhub_market_uninstall: str | None = None
+        self.ssh_profiles: dict[str, SshProfileRecord] = {
+            "prod": SshProfileRecord(
+                ssh_profile_id="prod",
+                host="prod-alias",
+                username="deploy",
+                port=22,
+                has_password=True,
+                has_private_key=True,
+                private_key_name="id_ed25519",
+            )
+        }
+        self.ssh_profile_passwords: dict[str, str] = {
+            "prod": "relay-secret",
+        }
 
     def get_config_status(self) -> dict[str, object]:
         return {"model": {"loaded": True}}
+
+    def get_skill_definition(self, name: str) -> Skill | None:
+        return self.skill_definitions.get(name)
+
+    def get_config(self) -> GeneralConfig:
+        return self.general_config
+
+    def save_config(self, config: GeneralConfigUpdate) -> GeneralConfig:
+        if self.general_config_error is not None:
+            raise self.general_config_error
+        self.saved_general_config = config.model_dump(mode="json")
+        self.general_config = GeneralConfig.model_validate(self.saved_general_config)
+        return self.general_config
 
     def get_ui_language_settings(self) -> UiLanguageSettings:
         return UiLanguageSettings(language=UiLanguage.ZH_CN)
@@ -78,7 +357,23 @@ class _FakeSystemService:
         return settings
 
     def get_model_config(self) -> dict[str, object]:
-        return {}
+        return {
+            "default": {
+                "provider": "openai_compatible",
+                "model": "gpt-4o-mini",
+                "base_url": "https://example.test/v1",
+                "api_key": "secret",
+                "headers": [],
+                "temperature": 0.2,
+                "top_p": 1.0,
+                "max_tokens": 2048,
+                "context_window": 128000,
+                "connect_timeout_seconds": 25.0,
+                "is_default": True,
+                "maas_auth": None,
+                "ssl_verify": None,
+            }
+        }
 
     def get_model_profiles(self) -> dict[str, object]:
         return {
@@ -88,10 +383,54 @@ class _FakeSystemService:
                 "base_url": "https://example.test/v1",
                 "api_key": "secret",
                 "has_api_key": True,
+                "headers": [],
                 "is_default": True,
                 "context_window": 128000,
+                "fallback_policy_id": "same_provider_then_other_provider",
+                "fallback_priority": 3,
+                "capabilities": {
+                    "input": {
+                        "text": True,
+                        "image": True,
+                        "audio": False,
+                        "video": False,
+                        "pdf": False,
+                    },
+                    "output": {
+                        "text": True,
+                        "image": False,
+                        "audio": False,
+                        "video": False,
+                        "pdf": False,
+                    },
+                },
+                "input_modalities": ["image"],
             }
         }
+
+    def get_model_fallback_config(self) -> ModelFallbackConfig:
+        return ModelFallbackConfig(
+            policies=(
+                ModelFallbackPolicy(
+                    policy_id="same_provider_then_other_provider",
+                    name="Same Provider Then Other Provider",
+                    strategy=(ModelFallbackStrategy.SAME_PROVIDER_THEN_OTHER_PROVIDER),
+                ),
+            )
+        )
+
+    def get_model_catalog(self, *, refresh: bool = False) -> ModelCatalogResult:
+        return ModelCatalogResult(
+            ok=True,
+            source_url="https://models.dev/api.json",
+            stale=refresh,
+            providers=(),
+        )
+
+    async def get_model_catalog_async(
+        self, *, refresh: bool = False
+    ) -> ModelCatalogResult:
+        return self.get_model_catalog(refresh=refresh)
 
     def save_model_profile(
         self,
@@ -100,18 +439,31 @@ class _FakeSystemService:
         *,
         source_name: str | None = None,
     ) -> None:
+        if self.model_profile_error is not None:
+            raise self.model_profile_error
         self.saved_model_profile = (name, profile, source_name)
 
     def delete_model_profile(self, _name: str) -> None:
+        if self.model_profile_delete_error is not None:
+            raise self.model_profile_delete_error
         return None
 
-    def save_model_config(self, _config: dict[str, object]) -> None:
-        return None
+    def save_model_config(self, config: ModelConfigPayload) -> None:
+        if self.model_config_error is not None:
+            raise self.model_config_error
+        self.saved_model_config = config.model_dump(mode="json")
+
+    def save_model_fallback_config(self, config: ModelFallbackConfig) -> None:
+        self.saved_model_fallback_config = config.model_dump(mode="json")
 
     def reload_model_config(self) -> None:
+        if self.model_reload_error is not None:
+            raise self.model_reload_error
         return None
 
     def reload_proxy_config(self) -> None:
+        if self.proxy_reload_error is not None:
+            raise self.proxy_reload_error
         return None
 
     def get_saved_proxy_config(self) -> dict[str, object]:
@@ -131,7 +483,12 @@ class _FakeSystemService:
         self.saved_proxy_config = config.model_dump(mode="json")
 
     def get_web_config(self) -> WebConfig:
-        return WebConfig(provider=WebProvider.EXA, api_key=None)
+        return WebConfig(
+            provider=WebProvider.EXA,
+            exa_api_key=None,
+            fallback_provider=WebFallbackProvider.SEARXNG,
+            searxng_instance_url=DEFAULT_SEARXNG_INSTANCE_URL,
+        )
 
     def list_agents(self) -> tuple[ExternalAgentSummary, ...]:
         return tuple(
@@ -139,10 +496,14 @@ class _FakeSystemService:
                 agent_id=agent.agent_id,
                 name=agent.name,
                 description=agent.description,
+                protocol=agent.protocol,
                 transport=agent.transport.transport,
             )
             for agent in self.external_agents.values()
         )
+
+    def list_agent_configs(self) -> tuple[ExternalAgentConfig, ...]:
+        return tuple(self.external_agents.values())
 
     def get_agent(self, agent_id: str) -> ExternalAgentConfig:
         return self.external_agents[agent_id]
@@ -158,67 +519,355 @@ class _FakeSystemService:
     def delete_agent(self, agent_id: str) -> None:
         self.external_agents.pop(agent_id)
 
-    def resolve_runtime_agent(self, agent_id: str) -> ExternalAgentConfig:
+    async def resolve_runtime_agent_async(
+        self,
+        agent_id: str,
+        *,
+        progress_callback: object | None = None,
+    ) -> ExternalAgentConfig:
+        _ = progress_callback
+        if self.runtime_resolve_error is not None:
+            raise self.runtime_resolve_error
+        self.resolved_runtime_agent_ids.append(agent_id)
         return self.external_agents[agent_id]
 
+    async def get_catalog(
+        self,
+        *,
+        installed_agents: tuple[ExternalAgentConfig, ...] = (),
+        refresh: bool = False,
+    ) -> AcpRegistryCatalogResponse:
+        if self.registry_catalog_error is not None:
+            raise self.registry_catalog_error
+        if refresh:
+            self.registry_refresh_count += 1
+        return AcpRegistryCatalogResponse(
+            source_url="https://registry.example.test/registry.json",
+            registry_version="1.0.0",
+            agents=(
+                AcpRegistryAgentView(
+                    registry_id="vendor/runtime",
+                    name="Vendor Runtime",
+                    version="2.0.0",
+                    description="Official runtime",
+                    distributions=(AcpRegistryDistribution.NPX,),
+                    selected_distribution=AcpRegistryDistribution.NPX,
+                    supports_current_platform=True,
+                    installed=any(
+                        isinstance(agent.transport, RegistryTransportConfig)
+                        and agent.transport.registry_id == "vendor/runtime"
+                        for agent in installed_agents
+                    ),
+                ),
+            ),
+            cache_path="/tmp/registry.json",
+        )
+
+    async def refresh_catalog(
+        self,
+        *,
+        installed_agents: tuple[ExternalAgentConfig, ...] = (),
+    ) -> AcpRegistryCatalogResponse:
+        self.registry_refresh_count += 1
+        return await self.get_catalog(installed_agents=installed_agents)
+
+    async def build_install_config(
+        self,
+        *,
+        registry_id: str,
+        request: AcpRegistryInstallRequest,
+        current_agent: ExternalAgentConfig | None = None,
+    ) -> AcpRegistryInstallResult:
+        if self.registry_install_error is not None:
+            raise self.registry_install_error
+        self.registry_install_requests.append((registry_id, request))
+        self.registry_install_current_agents.append(current_agent)
+        distribution = request.distribution or AcpRegistryDistribution.NPX
+        agent = ExternalAgentConfig(
+            agent_id=request.agent_id or "vendor-runtime",
+            name="Vendor Runtime",
+            description="Official runtime",
+            protocol=ExternalAgentProtocol.ACP,
+            transport=RegistryTransportConfig(
+                registry_id=registry_id,
+                distribution=distribution.value,
+                registry_version="2.0.0",
+            ),
+        )
+        return AcpRegistryInstallResult(
+            status="installed",
+            agent=agent,
+            registry_agent=AcpRegistryAgentView(
+                registry_id=registry_id,
+                name="Vendor Runtime",
+                version="2.0.0",
+                description="Official runtime",
+                distributions=(distribution,),
+                selected_distribution=distribution,
+                supports_current_platform=True,
+                installed=True,
+                installed_agent_id=agent.agent_id,
+                installed_version="2.0.0",
+            ),
+            message="Installed registry runtime.",
+        )
+
     def save_web_config(self, config: WebConfig) -> None:
-        self.saved_web_config = config.model_dump(mode="json")
+        self.saved_web_config = config.model_dump(
+            mode="json",
+            exclude={"searxng_instance_seeds"},
+        )
 
     def get_github_config(self) -> GitHubConfig:
-        return GitHubConfig(token=None)
+        return GitHubConfig(
+            token=self.current_github_token,
+            webhook_base_url=self.current_github_webhook_base_url,
+        )
 
-    def save_github_config(self, config: GitHubConfig) -> None:
+    def get_github_config_view(self) -> GitHubConfigView:
+        return GitHubConfigView(
+            token_configured=self.current_github_token is not None,
+            webhook_base_url=self.current_github_webhook_base_url,
+        )
+
+    def reveal_github_token(self) -> dict[str, str | None]:
+        return {"token": self.current_github_token}
+
+    def update_github_config(self, config: GitHubConfigUpdate) -> GitHubConfig:
         self.saved_github_config = config.model_dump(mode="json")
+        if "token" in config.model_fields_set and config.token is not None:
+            self.current_github_token = config.token
+        if "webhook_base_url" in config.model_fields_set:
+            self.current_github_webhook_base_url = config.webhook_base_url
+        return GitHubConfig(
+            token=self.current_github_token,
+            webhook_base_url=self.current_github_webhook_base_url,
+        )
+
+    def get_status(self) -> LocalhostRunTunnelStatus:
+        return self.tunnel_status
+
+    def start(
+        self, request: LocalhostRunTunnelStartRequest
+    ) -> LocalhostRunTunnelStatus:
+        self.started_tunnel_request = request.model_dump(mode="json")
+        self.tunnel_status = LocalhostRunTunnelStatus(
+            status="active",
+            public_url="https://demo-tunnel.lhr.life",
+            address="demo-tunnel.lhr.life",
+            local_host=request.local_host or "127.0.0.1",
+            local_port=request.local_port or 8000,
+            pid=4321,
+            started_at="2026-04-14T03:00:00Z",
+            last_event="tcpip-forward",
+            last_message="demo-tunnel.lhr.life tunneled with tls termination",
+        )
+        return self.tunnel_status
+
+    def stop(self) -> LocalhostRunTunnelStatus:
+        self.stopped_tunnel_request = {}
+        self.tunnel_status = self.tunnel_status.model_copy(
+            update={
+                "status": "stopped",
+                "stopped_at": "2026-04-14T03:05:00Z",
+                "last_event": "stopped",
+            }
+        )
+        return self.tunnel_status
+
+    def refresh_repo_callback_urls_from_system_config(
+        self,
+        *,
+        previous_webhook_base_url: str | None = None,
+    ) -> tuple[object, ...]:
+        self.refreshed_github_callback_previous_base_url = previous_webhook_base_url
+        return ()
+
+    def get_clawhub_config(self) -> ClawHubConfig:
+        return ClawHubConfig(token=None)
+
+    def save_clawhub_config(self, config: ClawHubConfig) -> None:
+        self.saved_clawhub_config = config.model_dump(mode="json")
+
+    def list_skills(self) -> tuple[ClawHubSkillSummary, ...]:
+        return tuple(
+            ClawHubSkillSummary(
+                skill_id=skill.skill_id,
+                runtime_name=skill.runtime_name,
+                description=skill.description,
+                ref=skill.ref,
+                source=skill.source,
+                directory=skill.directory,
+                manifest_path=skill.manifest_path,
+                valid=skill.valid,
+                error=skill.error,
+            )
+            for skill in self.clawhub_skills.values()
+        )
+
+    def get_skill(self, skill_id: str) -> ClawHubSkillDetail:
+        return self.clawhub_skills[skill_id]
+
+    def save_skill(
+        self,
+        skill_id: str,
+        request: ClawHubSkillWriteRequest,
+    ) -> ClawHubSkillDetail:
+        skill = ClawHubSkillDetail(
+            skill_id=skill_id,
+            runtime_name=request.runtime_name,
+            description=request.description,
+            ref=request.runtime_name,
+            source=SkillSource.USER_RELAY_TEAMS,
+            directory=f"/tmp/.relay-teams/skills/{skill_id}",
+            manifest_path=f"/tmp/.relay-teams/skills/{skill_id}/SKILL.md",
+            valid=True,
+            error=None,
+            instructions=request.instructions,
+            manifest_content=None,
+            files=request.files,
+        )
+        self.clawhub_skills[skill_id] = skill
+        return skill
+
+    def delete_skill(self, skill_id: str) -> None:
+        self.clawhub_skills.pop(skill_id)
+
+    def search_clawhub_skills(
+        self,
+        *,
+        query: str,
+        limit: int,
+    ) -> ClawHubSkillMarketSearchResponse:
+        self.last_clawhub_market_search = (query, limit)
+        return self.clawhub_market_search_response
+
+    def browse_clawhub_skills(
+        self,
+        *,
+        limit: int,
+        cursor: str = "",
+        sort: str = "popular",
+    ) -> ClawHubSkillMarketSearchResponse:
+        self.last_clawhub_market_browse = (limit, cursor, sort)
+        return self.clawhub_market_browse_response
+
+    def get_clawhub_skill_market_detail(
+        self,
+        *,
+        slug: str,
+        version: str | None = None,
+    ) -> ClawHubSkillMarketDetailResponse:
+        self.last_clawhub_market_detail = (slug, version)
+        return self.clawhub_market_detail_response
+
+    def install_clawhub_skill(
+        self,
+        request: ClawHubSkillMarketInstallRequest,
+    ) -> ClawHubSkillMarketInstallResponse:
+        self.last_clawhub_market_install = request
+        return self.clawhub_market_install_response
+
+    def uninstall_clawhub_skill(
+        self,
+        *,
+        slug: str,
+    ) -> ClawHubSkillMarketUninstallResponse:
+        self.last_clawhub_market_uninstall = slug
+        return self.clawhub_market_uninstall_response
 
     def reload_mcp_config(self) -> None:
+        if self.mcp_reload_error is not None:
+            raise self.mcp_reload_error
         return None
 
     def reload_skills_config(self) -> None:
+        if self.skills_reload_error is not None:
+            raise self.skills_reload_error
+        self.skills_reload_calls += 1
         return None
 
-    def get_notification_config(self) -> dict[str, object]:
-        return {
-            "tool_approval_requested": {
-                "enabled": True,
-                "channels": ["browser", "toast"],
-                "feishu_format": "text",
-            },
-            "run_completed": {
-                "enabled": False,
-                "channels": ["toast"],
-                "feishu_format": "text",
-            },
-            "run_failed": {
-                "enabled": True,
-                "channels": ["browser", "toast"],
-                "feishu_format": "text",
-            },
-            "run_stopped": {
-                "enabled": False,
-                "channels": ["toast"],
-                "feishu_format": "text",
-            },
-        }
+    def get_notification_config(self) -> NotificationConfig:
+        return NotificationConfig.model_validate(
+            {
+                "tool_approval_requested": {
+                    "enabled": True,
+                    "channels": ["browser", "toast"],
+                    "feishu_format": "text",
+                },
+                "run_completed": {
+                    "enabled": False,
+                    "channels": ["toast"],
+                    "feishu_format": "text",
+                },
+                "run_failed": {
+                    "enabled": True,
+                    "channels": ["browser", "toast"],
+                    "feishu_format": "text",
+                },
+                "run_stopped": {
+                    "enabled": False,
+                    "channels": ["toast"],
+                    "feishu_format": "text",
+                },
+            }
+        )
 
-    def save_notification_config(self, config: dict[str, object]) -> None:
-        self.saved_notification_config = config
+    def save_notification_config(self, config: NotificationConfig) -> None:
+        self.saved_notification_config = config.model_dump(mode="json")
 
-    def get_orchestration_config(self) -> dict[str, object]:
-        return {
-            "default_orchestration_preset_id": "default",
-            "presets": [
-                {
-                    "preset_id": "default",
-                    "name": "Default",
-                    "description": "General delegation flow.",
-                    "role_ids": ["writer", "reviewer"],
-                    "orchestration_prompt": "Delegate by capability and keep the final answer concise.",
-                }
-            ],
-        }
+    def get_orchestration_config(self) -> OrchestrationSettings:
+        return OrchestrationSettings.model_validate(
+            {
+                "default_orchestration_preset_id": "default",
+                "presets": [
+                    {
+                        "preset_id": "default",
+                        "name": "Default",
+                        "description": "General delegation flow.",
+                        "role_ids": ["writer", "reviewer"],
+                        "orchestration_prompt": "Delegate by capability and keep the final answer concise.",
+                        "graph": {
+                            "nodes": [
+                                {
+                                    "node_id": "write",
+                                    "role_id": "writer",
+                                    "objective": "Write the update.",
+                                },
+                                {
+                                    "node_id": "review",
+                                    "role_id": "reviewer",
+                                    "objective": "Review the update.",
+                                },
+                            ],
+                            "edges": [
+                                {
+                                    "from_node_id": "write",
+                                    "to_node_id": "review",
+                                }
+                            ],
+                        },
+                    }
+                ],
+            }
+        )
 
-    def save_orchestration_config(self, config: dict[str, object]) -> None:
-        self.saved_orchestration_config = config
+    def save_orchestration_config(self, config: OrchestrationSettings) -> None:
+        self.saved_orchestration_config = config.model_dump(mode="json")
+
+    def get_user_config(self) -> HooksConfig:
+        return HooksConfig()
+
+    def get_runtime_view(self) -> HookRuntimeView:
+        return HookRuntimeView()
+
+    def save_user_config(self, config: object) -> HooksConfig:
+        parsed = HooksConfig.model_validate(config)
+        self.saved_hooks_config = parsed.model_dump(mode="json")
+        return parsed
+
+    def validate_config(self, config: object) -> HooksConfig:
+        return HooksConfig.model_validate(config)
 
     def get_provider_models(
         self,
@@ -231,12 +880,14 @@ class _FakeSystemService:
                 provider=ProviderType.OPENAI_COMPATIBLE,
                 model="gpt-4o-mini",
                 base_url="https://example.com/v1",
+                input_modalities=(MediaModality.IMAGE,),
             ),
             ProviderModelInfo(
                 profile="glm",
                 provider=ProviderType.BIGMODEL,
                 model="glm-4.5",
-                base_url="https://open.bigmodel.cn/api/paas/v4",
+                base_url="https://open.bigmodel.cn/api/coding/paas/v4",
+                input_modalities=(MediaModality.IMAGE,),
             ),
             ProviderModelInfo(
                 profile="echo",
@@ -252,7 +903,69 @@ class _FakeSystemService:
     def probe_connectivity(
         self,
         request: object,
-    ) -> ModelConnectivityProbeResult | GitHubConnectivityProbeResult:
+    ) -> (
+        ModelConnectivityProbeResult
+        | GitHubConnectivityProbeResult
+        | ClawHubConnectivityProbeResult
+        | SshProfileConnectivityProbeResult
+    ):
+        if isinstance(request, SshProfileConnectivityProbeRequest):
+            ssh_profile_id = request.ssh_profile_id or "draft"
+            record = self.ssh_profiles.get(ssh_profile_id)
+            return SshProfileConnectivityProbeResult.model_validate(
+                {
+                    "ok": True,
+                    "ssh_profile_id": request.ssh_profile_id,
+                    "host": (
+                        request.override.host
+                        if request.override is not None
+                        else record.host
+                        if record is not None
+                        else "draft-host"
+                    ),
+                    "port": (
+                        request.override.port
+                        if request.override is not None
+                        else record.port
+                        if record is not None
+                        else None
+                    ),
+                    "username": (
+                        request.override.username
+                        if request.override is not None
+                        else record.username
+                        if record is not None
+                        else None
+                    ),
+                    "latency_ms": 44,
+                    "checked_at": "2026-04-21T00:00:00Z",
+                    "diagnostics": {
+                        "binary_available": True,
+                        "host_reachable": True,
+                        "used_password": False,
+                        "used_private_key": False,
+                        "used_system_config": True,
+                        "exit_code": 0,
+                    },
+                    "retryable": False,
+                }
+            )
+        if isinstance(request, ClawHubConnectivityProbeRequest):
+            return ClawHubConnectivityProbeResult.model_validate(
+                {
+                    "ok": True,
+                    "clawhub_path": "/usr/bin/clawhub",
+                    "clawhub_version": "clawhub 0.4.2",
+                    "exit_code": 0,
+                    "latency_ms": 37,
+                    "checked_at": "2026-04-09T08:00:00Z",
+                    "diagnostics": {
+                        "binary_available": True,
+                        "token_configured": True,
+                    },
+                    "retryable": False,
+                }
+            )
         if isinstance(request, GitHubConnectivityProbeRequest):
             return GitHubConnectivityProbeResult.model_validate(
                 {
@@ -296,10 +1009,46 @@ class _FakeSystemService:
             }
         )
 
+    async def probe_connectivity_async(
+        self,
+        request: ModelConnectivityProbeRequest,
+    ) -> ModelConnectivityProbeResult:
+        self.last_model_probe_request = request
+        result = self.probe_connectivity(request)
+        assert isinstance(result, ModelConnectivityProbeResult)
+        return result
+
+    def probe(
+        self,
+        request: object,
+    ) -> (
+        ModelConnectivityProbeResult
+        | GitHubConnectivityProbeResult
+        | GitHubWebhookConnectivityProbeResult
+        | ClawHubConnectivityProbeResult
+        | WebConnectivityProbeResult
+        | SshProfileConnectivityProbeResult
+    ):
+        if isinstance(request, WebConnectivityProbeRequest):
+            return self.probe_web_connectivity(request)
+        if isinstance(request, GitHubWebhookConnectivityProbeRequest):
+            return self.probe_webhook_connectivity(request)
+        return self.probe_connectivity(request)
+
+    async def probe_async(
+        self,
+        request: GitHubConnectivityProbeRequest,
+    ) -> GitHubConnectivityProbeResult:
+        result = self.probe_connectivity(request)
+        assert isinstance(result, GitHubConnectivityProbeResult)
+        return result
+
     def discover_models(
         self,
         _request: object,
     ) -> ModelDiscoveryResult:
+        assert isinstance(_request, ModelDiscoveryRequest)
+        self.last_model_discovery_request = _request
         return ModelDiscoveryResult.model_validate(
             {
                 "ok": True,
@@ -314,6 +1063,52 @@ class _FakeSystemService:
                 },
                 "models": ["fake-chat-model", "reasoning-model"],
                 "retryable": False,
+            }
+        )
+
+    async def discover_models_async(
+        self,
+        request: ModelDiscoveryRequest,
+    ) -> ModelDiscoveryResult:
+        return self.discover_models(request)
+
+    def verify_codeagent_auth(
+        self,
+        *,
+        profile_name: str,
+    ) -> CodeAgentAuthVerifyResult:
+        self.last_verified_codeagent_profile_name = profile_name
+        return self.codeagent_auth_verify_result
+
+    async def verify_codeagent_auth_async(
+        self,
+        *,
+        profile_name: str,
+    ) -> CodeAgentAuthVerifyResult:
+        return self.verify_codeagent_auth(profile_name=profile_name)
+
+    def probe_webhook_connectivity(
+        self,
+        request: GitHubWebhookConnectivityProbeRequest,
+    ) -> GitHubWebhookConnectivityProbeResult:
+        return GitHubWebhookConnectivityProbeResult.model_validate(
+            {
+                "ok": True,
+                "webhook_base_url": request.webhook_base_url,
+                "callback_url": "https://agent-teams.example.com/api/triggers/github/deliveries",
+                "health_url": "https://agent-teams.example.com/api/system/health",
+                "final_url": "https://agent-teams.example.com/api/system/health",
+                "status_code": 200,
+                "latency_ms": 44,
+                "checked_at": "2026-04-13T08:00:00Z",
+                "diagnostics": {
+                    "endpoint_reachable": True,
+                    "used_proxy": False,
+                    "redirected": False,
+                },
+                "retryable": False,
+                "error_code": None,
+                "error_message": None,
             }
         )
 
@@ -339,22 +1134,363 @@ class _FakeSystemService:
             }
         )
 
+    def list_profiles(self) -> tuple[SshProfileRecord, ...]:
+        return tuple(self.ssh_profiles.values())
 
-def _create_test_client(fake_service: object) -> TestClient:
+    def get_profile(self, ssh_profile_id: str) -> SshProfileRecord:
+        return self.ssh_profiles[ssh_profile_id]
+
+    def reveal_password(self, ssh_profile_id: str) -> SshProfilePasswordRevealView:
+        if ssh_profile_id not in self.ssh_profiles:
+            raise KeyError(ssh_profile_id)
+        return SshProfilePasswordRevealView(
+            password=self.ssh_profile_passwords.get(ssh_profile_id)
+        )
+
+    def save_profile(
+        self,
+        *,
+        ssh_profile_id: str,
+        config: SshProfileConfig,
+    ) -> SshProfileRecord:
+        existing = self.ssh_profiles.get(ssh_profile_id)
+        has_password = config.password is not None or (
+            existing.has_password if existing is not None else False
+        )
+        has_private_key = config.private_key is not None or (
+            existing.has_private_key if existing is not None else False
+        )
+        record = SshProfileRecord(
+            ssh_profile_id=ssh_profile_id,
+            host=config.host,
+            username=config.username,
+            port=config.port,
+            remote_shell=config.remote_shell,
+            connect_timeout_seconds=config.connect_timeout_seconds,
+            has_password=has_password,
+            has_private_key=has_private_key,
+            private_key_name=(
+                config.private_key_name
+                if config.private_key is not None
+                else (
+                    existing.private_key_name
+                    if existing is not None and has_private_key
+                    else None
+                )
+            ),
+            created_at=(
+                existing.created_at
+                if existing is not None
+                else SshProfileRecord(
+                    ssh_profile_id=ssh_profile_id,
+                    host=config.host,
+                    username=config.username,
+                ).created_at
+            ),
+        )
+        self.ssh_profiles[ssh_profile_id] = record
+        if config.password is not None:
+            self.ssh_profile_passwords[ssh_profile_id] = config.password
+        return record
+
+    def delete_profile(self, ssh_profile_id: str) -> None:
+        if ssh_profile_id not in self.ssh_profiles:
+            raise KeyError(ssh_profile_id)
+        del self.ssh_profiles[ssh_profile_id]
+        self.ssh_profile_passwords.pop(ssh_profile_id, None)
+
+
+class _AsyncWebProbeAdapter:
+    def __init__(self, delegate: _FakeSystemService) -> None:
+        self._delegate = delegate
+
+    async def probe(
+        self, request: WebConnectivityProbeRequest
+    ) -> WebConnectivityProbeResult:
+        result = self._delegate.probe(request)
+        assert isinstance(result, WebConnectivityProbeResult)
+        return result
+
+
+class _FakeWorkspaceHandle:
+    def __init__(self, workdir: Path) -> None:
+        self._workdir = workdir
+
+    def resolve_workdir(self) -> Path:
+        return self._workdir
+
+
+class _FakeWorkspaceManager:
+    def __init__(self, workdir: Path) -> None:
+        self.workdir = workdir
+        self.resolve_calls: list[dict[str, object]] = []
+
+    async def resolve_async(
+        self,
+        *,
+        session_id: str,
+        role_id: str,
+        instance_id: str | None,
+        workspace_id: str,
+        conversation_id: str | None = None,
+        profile: object | None = None,
+    ) -> _FakeWorkspaceHandle:
+        self.resolve_calls.append(
+            {
+                "session_id": session_id,
+                "role_id": role_id,
+                "instance_id": instance_id,
+                "workspace_id": workspace_id,
+                "conversation_id": conversation_id,
+                "profile": profile,
+            }
+        )
+        return _FakeWorkspaceHandle(self.workdir)
+
+
+class _FakeAgentRuntimeTestJobService:
+    def __init__(
+        self,
+        service: _FakeSystemService,
+        workspace_manager: _FakeWorkspaceManager,
+    ) -> None:
+        self._service = service
+        self._workspace_manager = workspace_manager
+        self.jobs: dict[str, AgentRuntimeTestJob] = {}
+
+    async def run_test(self, agent_id: str) -> ExternalAgentTestResult:
+        config = await self._service.resolve_runtime_agent_async(agent_id)
+        runtime_cwd = None
+        if config.protocol == ExternalAgentProtocol.CLI:
+            runtime_cwd = (
+                await self._workspace_manager.resolve_async(
+                    session_id="agent-runtime-probe",
+                    role_id="agent-runtime-probe",
+                    instance_id=None,
+                    workspace_id="default",
+                    conversation_id="agent-runtime-probe",
+                )
+            ).resolve_workdir()
+        return await test_job_service_module.probe_agent_runtime(
+            config,
+            runtime_cwd=runtime_cwd,
+        )
+
+    async def start_job(self, agent_id: str) -> AgentRuntimeTestJob:
+        result = await self.run_test(agent_id)
+        job = AgentRuntimeTestJob(
+            job_id=f"job-{agent_id}",
+            agent_id=agent_id,
+            status=(
+                AgentRuntimeJobStatus.SUCCEEDED
+                if result.ok
+                else AgentRuntimeJobStatus.FAILED
+            ),
+            phase=(
+                AgentRuntimeSetupPhase.COMPLETED
+                if result.ok
+                else AgentRuntimeSetupPhase.FAILED
+            ),
+            message=result.message,
+            progress_percent=100 if result.ok else None,
+            result=result,
+            error_message=None if result.ok else result.message,
+        )
+        self.jobs[job.job_id] = job
+        return job
+
+    async def get_job(self, job_id: str) -> AgentRuntimeTestJob:
+        job = self.jobs.get(job_id)
+        if job is None:
+            raise KeyError(job_id)
+        return job
+
+
+class _FailingAgentRuntimeTestJobService:
+    async def start_job(self, agent_id: str) -> AgentRuntimeTestJob:
+        _ = agent_id
+        raise ValueError("Invalid runtime")
+
+    async def get_job(self, job_id: str) -> AgentRuntimeTestJob:
+        raise KeyError(job_id)
+
+
+def _create_test_client(
+    fake_service: object,
+    *,
+    workspace_manager: _FakeWorkspaceManager | None = None,
+) -> TestClient:
     app = FastAPI()
     app.include_router(system.router, prefix="/api")
+    resolved_workspace_manager = workspace_manager or _FakeWorkspaceManager(Path.cwd())
+    runtime_test_job_service = (
+        _FakeAgentRuntimeTestJobService(fake_service, resolved_workspace_manager)
+        if isinstance(fake_service, _FakeSystemService)
+        else fake_service
+    )
     app.dependency_overrides[get_config_status_service] = lambda: fake_service
+    app.dependency_overrides[get_general_config_service] = lambda: fake_service
     app.dependency_overrides[get_model_config_service] = lambda: fake_service
     app.dependency_overrides[get_notification_settings_service] = lambda: fake_service
     app.dependency_overrides[get_orchestration_settings_service] = lambda: fake_service
     app.dependency_overrides[get_mcp_config_reload_service] = lambda: fake_service
     app.dependency_overrides[get_skills_config_reload_service] = lambda: fake_service
+    app.dependency_overrides[get_skill_registry] = lambda: fake_service
     app.dependency_overrides[get_proxy_config_service] = lambda: fake_service
+    app.dependency_overrides[get_web_connectivity_probe_service] = lambda: (
+        _AsyncWebProbeAdapter(fake_service)
+        if isinstance(fake_service, _FakeSystemService)
+        else fake_service
+    )
+    app.dependency_overrides[get_github_connectivity_probe_service] = lambda: (
+        fake_service
+    )
+    app.dependency_overrides[get_github_webhook_connectivity_probe_service] = lambda: (
+        fake_service
+    )
+    app.dependency_overrides[get_clawhub_connectivity_probe_service] = lambda: (
+        fake_service
+    )
+    app.dependency_overrides[get_ssh_profile_service] = lambda: fake_service
     app.dependency_overrides[get_ui_language_settings_service] = lambda: fake_service
     app.dependency_overrides[get_web_config_service] = lambda: fake_service
+    app.dependency_overrides[get_clawhub_config_service] = lambda: fake_service
+    app.dependency_overrides[get_clawhub_skill_service] = lambda: fake_service
+    app.dependency_overrides[get_clawhub_skill_market_service] = lambda: fake_service
     app.dependency_overrides[get_github_config_service] = lambda: fake_service
+    app.dependency_overrides[get_localhost_run_tunnel_service] = lambda: fake_service
+    app.dependency_overrides[get_github_trigger_service] = lambda: fake_service
+    app.dependency_overrides[get_acp_registry_service] = lambda: fake_service
+    app.dependency_overrides[get_agent_runtime_test_job_service] = lambda: (
+        runtime_test_job_service
+    )
     app.dependency_overrides[get_external_agent_config_service] = lambda: fake_service
+    app.dependency_overrides[get_hook_service] = lambda: fake_service
+    app.dependency_overrides[get_workspace_manager] = lambda: resolved_workspace_manager
     return TestClient(app)
+
+
+def test_health_check_returns_runtime_identity_and_skill_sanity() -> None:
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.get("/api/system/health")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "ok"
+    assert payload["version"] == "0.1.0"
+    assert payload["python_executable"]
+    assert payload["package_root"]
+    assert payload["config_dir"]
+    assert payload["builtin_roles_dir"]
+    assert payload["builtin_skills_dir"]
+    role_registry_sanity = payload["role_registry_sanity"]
+    assert role_registry_sanity["builtin_role_count"] >= 1
+    assert role_registry_sanity["has_builtin_coordinator"] is True
+    assert role_registry_sanity["has_builtin_main_agent"] is True
+    skill_registry_sanity = payload["skill_registry_sanity"]
+    assert skill_registry_sanity["builtin_skill_count"] >= 1
+    assert "deepresearch" in skill_registry_sanity["builtin_skill_names"]
+    assert skill_registry_sanity["has_builtin_deepresearch"] is True
+    tool_registry_sanity = payload["tool_registry_sanity"]
+    assert tool_registry_sanity["available_tool_count"] >= 1
+    assert "write" in tool_registry_sanity["available_tool_names"]
+
+
+def test_live_check_returns_lightweight_liveness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(CONTROL_PLANE_MAIN_URL_ENV, "http://127.0.0.1:8000")
+    monkeypatch.setenv(CONTROL_PLANE_STARTED_AT_ENV, "100")
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.get("/api/system/live")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "alive"
+    assert payload["version"] == "0.1.0"
+    assert payload["pid"]
+    assert payload["uptime_seconds"] >= 0
+    assert payload["main_base_url"] == "http://127.0.0.1:8000"
+
+
+def test_control_plane_discovery_route_returns_published_liveness_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(CONTROL_PLANE_HOST_ENV, "127.0.0.1")
+    monkeypatch.setenv(CONTROL_PLANE_PORT_ENV, "8001")
+    monkeypatch.setenv(CONTROL_PLANE_URL_ENV, "http://127.0.0.1:8001/live")
+    monkeypatch.setenv(CONTROL_PLANE_MAIN_URL_ENV, "http://127.0.0.1:8000")
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.get("/api/system/control-plane")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "enabled": True,
+        "live_url": "http://127.0.0.1:8001/live",
+        "host": "127.0.0.1",
+        "port": 8001,
+        "main_base_url": "http://127.0.0.1:8000",
+    }
+
+
+def test_control_plane_discovery_route_degrades_when_unpublished(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(CONTROL_PLANE_HOST_ENV, raising=False)
+    monkeypatch.delenv(CONTROL_PLANE_PORT_ENV, raising=False)
+    monkeypatch.delenv(CONTROL_PLANE_URL_ENV, raising=False)
+    monkeypatch.delenv(CONTROL_PLANE_MAIN_URL_ENV, raising=False)
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.get("/api/system/control-plane")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "enabled": False,
+        "live_url": None,
+        "host": None,
+        "port": None,
+        "main_base_url": None,
+    }
+
+
+def test_health_check_builds_payload_in_worker_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+    async def fake_to_thread(
+        func: Callable[..., object],
+        /,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        calls.append((func.__name__, args, kwargs))
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(system, "call_maybe_async_in_isolated_thread", fake_to_thread)
+    client = _create_test_client(_FakeSystemService())
+    app = cast(FastAPI, client.app)
+    app.state.container = SimpleNamespace(
+        config_dir=Path("/tmp/config"),
+        role_registry=None,
+        skill_registry=None,
+        tool_registry=None,
+    )
+
+    response = client.get("/api/system/health")
+
+    assert response.status_code == 200
+    assert [call[0] for call in calls] == ["build_server_health_payload"]
+    assert calls[0][2] == {
+        "config_dir": Path("/tmp/config"),
+        "role_registry": None,
+        "skill_registry": None,
+        "tool_registry": None,
+    }
 
 
 def test_get_notification_config() -> None:
@@ -366,6 +1502,17 @@ def test_get_notification_config() -> None:
     assert payload["run_completed"]["channels"] == ["toast"]
 
 
+def test_get_general_config() -> None:
+    service = _FakeSystemService()
+    service.general_config = GeneralConfig(shell_safety_policy_enabled=False)
+    client = _create_test_client(service)
+
+    response = client.get("/api/system/configs/general")
+
+    assert response.status_code == 200
+    assert response.json() == {"shell_safety_policy_enabled": False}
+
+
 def test_get_ui_language_settings() -> None:
     client = _create_test_client(_FakeSystemService())
 
@@ -373,6 +1520,421 @@ def test_get_ui_language_settings() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"language": "zh-CN"}
+
+
+def test_list_and_get_ssh_profiles() -> None:
+    client = _create_test_client(_FakeSystemService())
+
+    list_response = client.get("/api/system/configs/workspace/ssh-profiles")
+    get_response = client.get("/api/system/configs/workspace/ssh-profiles/prod")
+
+    assert list_response.status_code == 200
+    assert list_response.json()[0]["ssh_profile_id"] == "prod"
+    assert list_response.json()[0]["host"] == "prod-alias"
+    assert list_response.json()[0]["has_password"] is True
+    assert get_response.status_code == 200
+    assert get_response.json()["username"] == "deploy"
+    assert get_response.json()["has_private_key"] is True
+    assert get_response.json()["private_key_name"] == "id_ed25519"
+
+
+def test_reveal_ssh_profile_password() -> None:
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.post(
+        "/api/system/configs/workspace/ssh-profiles/prod:reveal-password"
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"password": "relay-secret"}
+
+
+def test_probe_ssh_profile_connectivity() -> None:
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.post(
+        "/api/system/configs/workspace/ssh-profiles:probe",
+        json={"ssh_profile_id": "prod"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["ssh_profile_id"] == "prod"
+    assert payload["host"] == "prod-alias"
+    assert payload["latency_ms"] == 44
+
+
+def test_probe_ssh_profile_connectivity_runs_service_call_in_threadpool(
+    monkeypatch,
+) -> None:
+    calls: list[SshProfileConnectivityProbeRequest] = []
+
+    async def fake_to_thread(
+        operation: str,
+        func: Callable[
+            [SshProfileConnectivityProbeRequest],
+            SshProfileConnectivityProbeResult,
+        ],
+        request: SshProfileConnectivityProbeRequest,
+    ) -> SshProfileConnectivityProbeResult:
+        assert operation == "ssh.probe_connectivity"
+        calls.append(request)
+        return func(request)
+
+    monkeypatch.setattr(
+        system,
+        "call_maybe_async_in_network_probe_thread",
+        fake_to_thread,
+    )
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.post(
+        "/api/system/configs/workspace/ssh-profiles:probe",
+        json={"ssh_profile_id": "prod"},
+    )
+
+    assert response.status_code == 200
+    assert [call.ssh_profile_id for call in calls] == ["prod"]
+
+
+def test_ssh_profile_routes_run_service_calls_in_threadpool(monkeypatch) -> None:
+    calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+    async def fake_to_thread(
+        func: Callable[..., object],
+        /,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        calls.append((func.__name__, args, kwargs))
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(system.asyncio, "to_thread", fake_to_thread)
+    client = _create_test_client(_FakeSystemService())
+
+    responses = [
+        client.get("/api/system/configs/workspace/ssh-profiles"),
+        client.get("/api/system/configs/workspace/ssh-profiles/prod"),
+        client.post("/api/system/configs/workspace/ssh-profiles/prod:reveal-password"),
+        client.put(
+            "/api/system/configs/workspace/ssh-profiles/staging",
+            json={
+                "config": {
+                    "host": "staging-alias",
+                    "username": "ops",
+                    "password": "relay-secret",
+                    "port": 2222,
+                    "remote_shell": "/bin/bash",
+                    "connect_timeout_seconds": 15,
+                    "private_key": ("-----BEGIN KEY-----\ncontent\n-----END KEY-----"),
+                    "private_key_name": "id_rsa",
+                }
+            },
+        ),
+        client.delete("/api/system/configs/workspace/ssh-profiles/staging"),
+    ]
+
+    assert [response.status_code for response in responses] == [200] * len(responses)
+    assert [call[0] for call in calls] == [
+        "list_profiles",
+        "get_profile",
+        "reveal_password",
+        "save_profile",
+        "delete_profile",
+    ]
+
+
+def test_sync_system_read_routes_run_service_calls_in_threadpool(monkeypatch) -> None:
+    calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+    async def fake_to_thread(
+        func: Callable[..., object],
+        /,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        calls.append((func.__name__, args, kwargs))
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(system.asyncio, "to_thread", fake_to_thread)
+    client = _create_test_client(_FakeSystemService())
+
+    responses = [
+        client.get("/api/system/configs"),
+        client.get("/api/system/configs/ui-language"),
+        client.get("/api/system/configs/model"),
+        client.get("/api/system/configs/model/profiles"),
+        client.get("/api/system/configs/model-fallback"),
+        client.get("/api/system/configs/model/catalog"),
+        client.get("/api/system/configs/model/providers/models"),
+        client.get("/api/system/configs/notifications"),
+        client.get("/api/system/configs/proxy"),
+        client.get("/api/system/configs/web"),
+        client.get("/api/system/configs/agent-runtimes"),
+        client.get("/api/system/configs/agent-runtimes/codex_local"),
+        client.get("/api/system/configs/github"),
+        client.post("/api/system/configs/github:reveal"),
+        client.get("/api/system/configs/clawhub"),
+        client.get("/api/system/configs/clawhub/skills"),
+        client.get("/api/system/configs/clawhub/skills/skill-creator-2"),
+        client.get("/api/system/configs/orchestration"),
+        client.get("/api/system/configs/github/webhook/tunnel"),
+        client.get("/api/system/configs/hooks"),
+        client.get("/api/system/configs/hooks/runtime"),
+    ]
+
+    assert [response.status_code for response in responses] == [200] * len(responses)
+    assert [call[0] for call in calls] == [
+        "get_config_status",
+        "get_ui_language_settings",
+        "get_model_config",
+        "get_model_profiles",
+        "get_model_fallback_config",
+        "get_provider_models",
+        "get_notification_config",
+        "get_saved_proxy_config",
+        "get_web_config",
+        "list_agents",
+        "get_agent",
+        "get_github_config_view",
+        "reveal_github_token",
+        "get_clawhub_config",
+        "list_skills",
+        "get_skill",
+        "get_orchestration_config",
+        "get_status",
+        "get_user_config",
+        "get_runtime_view",
+    ]
+
+
+def test_sync_system_write_routes_run_service_calls_in_threadpool(monkeypatch) -> None:
+    calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+    async def fake_to_thread(
+        func: Callable[..., object],
+        /,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        calls.append((func.__name__, args, kwargs))
+        return func(*args, **kwargs)
+
+    async def fake_probe(
+        _config: ExternalAgentConfig,
+        *,
+        runtime_cwd: Path | None = None,
+    ) -> ExternalAgentTestResult:
+        _ = runtime_cwd
+        return ExternalAgentTestResult(
+            ok=True,
+            message="Connected",
+            protocol=ExternalAgentProtocol.ACP,
+            agent_name="Codex",
+            agent_version="1.0.0",
+            protocol_version=1,
+        )
+
+    monkeypatch.setattr(system.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(test_job_service_module, "probe_agent_runtime", fake_probe)
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    responses = [
+        client.put("/api/system/configs/ui-language", json={"language": "en-US"}),
+        client.put(
+            "/api/system/configs/model/profiles/default",
+            json={
+                "provider": "openai_compatible",
+                "model": "gpt-4o-mini",
+                "base_url": "https://example.test/v1",
+                "temperature": 0.2,
+                "top_p": 1.0,
+                "connect_timeout_seconds": 25.0,
+            },
+        ),
+        client.delete("/api/system/configs/model/profiles/default"),
+        client.put(
+            "/api/system/configs/model",
+            json={
+                "default": {
+                    "provider": "openai_compatible",
+                    "model": "gpt-4o-mini",
+                    "base_url": "https://example.test/v1",
+                    "api_key": "secret",
+                }
+            },
+        ),
+        client.put(
+            "/api/system/configs/model-fallback",
+            json={
+                "policies": [
+                    {
+                        "policy_id": "same_provider_then_other_provider",
+                        "name": "Same Provider Then Other Provider",
+                        "enabled": True,
+                        "trigger": "rate_limit_after_retries",
+                        "strategy": "same_provider_then_other_provider",
+                        "max_hops": 4,
+                        "cooldown_seconds": 90,
+                    }
+                ]
+            },
+        ),
+        client.put(
+            "/api/system/configs/notifications",
+            json={
+                "tool_approval_requested": {
+                    "enabled": True,
+                    "channels": ["browser", "toast"],
+                    "feishu_format": "text",
+                },
+                "run_completed": {
+                    "enabled": True,
+                    "channels": ["toast"],
+                    "feishu_format": "text",
+                },
+                "run_failed": {
+                    "enabled": True,
+                    "channels": ["browser", "toast"],
+                    "feishu_format": "text",
+                },
+                "run_stopped": {
+                    "enabled": False,
+                    "channels": ["toast"],
+                    "feishu_format": "text",
+                },
+            },
+        ),
+        client.put(
+            "/api/system/configs/proxy",
+            json={
+                "http_proxy": "http://proxy.example:8080",
+                "proxy_username": "alice",
+                "proxy_password": "secret",
+            },
+        ),
+        client.put(
+            "/api/system/configs/web",
+            json={
+                "provider": "exa",
+                "exa_api_key": "secret",
+                "fallback_provider": "searxng",
+                "searxng_instance_url": "https://search.example.test/",
+            },
+        ),
+        client.put(
+            "/api/system/configs/agent-runtimes/claude_http",
+            json={
+                "agent_id": "claude_http",
+                "name": "Claude HTTP",
+                "description": "Runs Claude over HTTP",
+                "transport": {
+                    "transport": "streamable_http",
+                    "url": "http://127.0.0.1:4100/acp",
+                    "headers": [],
+                    "ssl_verify": True,
+                },
+            },
+        ),
+        client.delete("/api/system/configs/agent-runtimes/claude_http"),
+        client.post("/api/system/configs/agent-runtimes/codex_local:test"),
+        client.put("/api/system/configs/clawhub", json={"token": "ch_secret"}),
+        client.put(
+            "/api/system/configs/clawhub/skills/demo-skill",
+            json={
+                "runtime_name": "demo-skill",
+                "description": "Demo skill",
+                "instructions": "Use with care.",
+                "files": [],
+            },
+        ),
+        client.delete("/api/system/configs/clawhub/skills/demo-skill"),
+        client.put(
+            "/api/system/configs/orchestration",
+            json={
+                "default_orchestration_preset_id": "shipping",
+                "presets": [
+                    {
+                        "preset_id": "shipping",
+                        "name": "Shipping",
+                        "description": "Release work.",
+                        "role_ids": ["writer"],
+                        "orchestration_prompt": "Use writer for outward-facing updates.",
+                    }
+                ],
+            },
+        ),
+        client.post("/api/system/configs/model:reload"),
+        client.post("/api/system/configs/model/catalog:refresh"),
+        client.post("/api/system/configs/proxy:reload"),
+        client.post("/api/system/configs/mcp:reload"),
+        client.post("/api/system/configs/skills:reload"),
+        client.put("/api/system/configs/hooks", json={"hooks": {}}),
+        client.post("/api/system/configs/hooks:validate", json={"hooks": {}}),
+    ]
+
+    assert [response.status_code for response in responses] == [200] * len(responses)
+    assert [call[0] for call in calls] == [
+        "save_ui_language_settings",
+        "save_model_profile",
+        "delete_model_profile",
+        "save_model_config",
+        "save_model_fallback_config",
+        "save_notification_config",
+        "save_proxy_config",
+        "save_web_config",
+        "save_agent",
+        "delete_agent",
+        "save_clawhub_config",
+        "save_skill",
+        "delete_skill",
+        "save_orchestration_config",
+        "reload_model_config",
+        "reload_proxy_config",
+        "reload_mcp_config",
+        "reload_skills_config",
+        "save_user_config",
+        "validate_config",
+    ]
+    assert service.resolved_runtime_agent_ids == ["codex_local"]
+
+
+def test_save_and_delete_ssh_profile() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    save_response = client.put(
+        "/api/system/configs/workspace/ssh-profiles/staging",
+        json={
+            "config": {
+                "host": "staging-alias",
+                "username": "ops",
+                "password": "relay-secret",
+                "port": 2222,
+                "remote_shell": "/bin/bash",
+                "connect_timeout_seconds": 15,
+                "private_key": "-----BEGIN KEY-----\ncontent\n-----END KEY-----",
+                "private_key_name": "id_rsa",
+            }
+        },
+    )
+
+    assert save_response.status_code == 200
+    assert save_response.json()["ssh_profile_id"] == "staging"
+    assert save_response.json()["has_password"] is True
+    assert save_response.json()["has_private_key"] is True
+    assert save_response.json()["private_key_name"] == "id_rsa"
+    assert service.ssh_profiles["staging"].remote_shell == "/bin/bash"
+
+    delete_response = client.delete(
+        "/api/system/configs/workspace/ssh-profiles/staging"
+    )
+
+    assert delete_response.status_code == 200
+    assert delete_response.json() == {"status": "ok"}
+    assert "staging" not in service.ssh_profiles
 
 
 def test_save_ui_language_settings() -> None:
@@ -387,6 +1949,23 @@ def test_save_ui_language_settings() -> None:
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
     assert service.saved_ui_language_settings == {"language": "en-US"}
+
+
+def test_save_ssh_profile_requires_username() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.put(
+        "/api/system/configs/workspace/ssh-profiles/staging",
+        json={
+            "config": {
+                "host": "staging-alias",
+            }
+        },
+    )
+
+    assert response.status_code == 422
+    assert "username" in response.text
 
 
 def test_save_model_profile_includes_connect_timeout_seconds() -> None:
@@ -404,6 +1983,8 @@ def test_save_model_profile_includes_connect_timeout_seconds() -> None:
             "top_p": 1.0,
             "max_tokens": 2048,
             "context_window": 128000,
+            "fallback_policy_id": "same_provider_then_other_provider",
+            "fallback_priority": 5,
             "connect_timeout_seconds": 25.0,
         },
     )
@@ -414,35 +1995,102 @@ def test_save_model_profile_includes_connect_timeout_seconds() -> None:
     _, saved_profile, source_name = service.saved_model_profile
     assert saved_profile["connect_timeout_seconds"] == 25.0
     assert saved_profile["context_window"] == 128000
+    assert saved_profile["fallback_policy_id"] == ("same_provider_then_other_provider")
+    assert saved_profile["fallback_priority"] == 5
     assert source_name is None
+
+
+def test_save_model_profile_omits_fallback_settings_when_not_provided() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.put(
+        "/api/system/configs/model/profiles/default",
+        json={
+            "provider": "openai_compatible",
+            "model": "gpt-4o-mini",
+            "base_url": "https://example.test/v1",
+            "api_key": "secret",
+            "temperature": 0.2,
+            "top_p": 1.0,
+            "context_window": 128000,
+            "connect_timeout_seconds": 25.0,
+        },
+    )
+
+    assert response.status_code == 200
+    assert service.saved_model_profile is not None
+    _, saved_profile, _ = service.saved_model_profile
+    assert "fallback_policy_id" not in saved_profile
+    assert "fallback_priority" not in saved_profile
+
+
+def test_get_model_fallback_config() -> None:
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.get("/api/system/configs/model-fallback")
+
+    assert response.status_code == 200
+    payload = response.json()
+    policies = cast(list[dict[str, object]], payload["policies"])
+    assert policies[0]["policy_id"] == "same_provider_then_other_provider"
+
+
+def test_save_model_fallback_config() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.put(
+        "/api/system/configs/model-fallback",
+        json={
+            "policies": [
+                {
+                    "policy_id": "same_provider_then_other_provider",
+                    "name": "Same Provider Then Other Provider",
+                    "enabled": True,
+                    "trigger": "rate_limit_after_retries",
+                    "strategy": "same_provider_then_other_provider",
+                    "max_hops": 4,
+                    "cooldown_seconds": 90,
+                }
+            ]
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert service.saved_model_fallback_config is not None
+    saved_policies = cast(
+        list[dict[str, object]],
+        service.saved_model_fallback_config["policies"],
+    )
+    assert saved_policies[0]["max_hops"] == 4
 
 
 def test_save_notification_config() -> None:
     service = _FakeSystemService()
     client = _create_test_client(service)
     request_payload = {
-        "config": {
-            "tool_approval_requested": {
-                "enabled": True,
-                "channels": ["browser", "toast"],
-                "feishu_format": "text",
-            },
-            "run_completed": {
-                "enabled": True,
-                "channels": ["toast", "feishu"],
-                "feishu_format": "card",
-            },
-            "run_failed": {
-                "enabled": True,
-                "channels": ["browser", "toast"],
-                "feishu_format": "text",
-            },
-            "run_stopped": {
-                "enabled": True,
-                "channels": ["toast"],
-                "feishu_format": "text",
-            },
-        }
+        "tool_approval_requested": {
+            "enabled": True,
+            "channels": ["browser", "toast"],
+            "feishu_format": "text",
+        },
+        "run_completed": {
+            "enabled": True,
+            "channels": ["toast", "feishu"],
+            "feishu_format": "card",
+        },
+        "run_failed": {
+            "enabled": True,
+            "channels": ["browser", "toast"],
+            "feishu_format": "text",
+        },
+        "run_stopped": {
+            "enabled": True,
+            "channels": ["toast"],
+            "feishu_format": "text",
+        },
     }
     response = client.put("/api/system/configs/notifications", json=request_payload)
     assert response.status_code == 200
@@ -463,6 +2111,38 @@ def test_get_orchestration_config() -> None:
     payload = response.json()
     assert payload["default_orchestration_preset_id"] == "default"
     assert payload["presets"][0]["role_ids"] == ["writer", "reviewer"]
+    assert payload["presets"][0]["policy"]["max_orchestration_cycles"] == 8
+    assert payload["presets"][0]["policy"]["max_parallel_delegated_tasks"] == 4
+    assert payload["presets"][0]["graph"]["nodes"][0]["node_id"] == "write"
+
+
+def test_save_general_config() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.put(
+        "/api/system/configs/general",
+        json={"config": {"shell_safety_policy_enabled": False}},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert service.saved_general_config == {"shell_safety_policy_enabled": False}
+    assert service.general_config.shell_safety_policy_enabled is False
+
+
+def test_save_general_config_returns_500_for_persist_error() -> None:
+    service = _FakeSystemService()
+    service.general_config_error = OSError("disk full")
+    client = _create_test_client(service)
+
+    response = client.put(
+        "/api/system/configs/general",
+        json={"shell_safety_policy_enabled": False},
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "disk full"}
 
 
 def test_save_github_config() -> None:
@@ -471,12 +2151,808 @@ def test_save_github_config() -> None:
 
     response = client.put(
         "/api/system/configs/github",
-        json={"token": "ghp_secret"},
+        json={
+            "token": "ghp_secret",
+            "webhook_base_url": "https://agent-teams.example.com",
+        },
     )
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
-    assert service.saved_github_config == {"token": "ghp_secret"}
+    assert service.saved_github_config == {
+        "token": "ghp_secret",
+        "webhook_base_url": "https://agent-teams.example.com",
+    }
+    assert service.refreshed_github_callback_previous_base_url is None
+
+
+def test_save_github_config_runs_refresh_in_threadpool(monkeypatch) -> None:
+    calls: list[str] = []
+
+    async def fake_to_thread(func: Callable[[], None]) -> None:
+        calls.append("save")
+        func()
+
+    monkeypatch.setattr(system.asyncio, "to_thread", fake_to_thread)
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.put(
+        "/api/system/configs/github",
+        json={"webhook_base_url": "https://agent-teams.example.com"},
+    )
+
+    assert response.status_code == 200
+    assert calls == ["save"]
+    assert service.current_github_webhook_base_url == "https://agent-teams.example.com"
+
+
+def test_save_github_config_rejects_removed_clear_token_field() -> None:
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.put(
+        "/api/system/configs/github",
+        json={"clear_token": True},
+    )
+
+    assert response.status_code == 422
+
+
+def test_get_github_config_hides_token_value() -> None:
+    service = _FakeSystemService()
+    service.current_github_token = "ghp_saved"
+    client = _create_test_client(service)
+
+    response = client.get("/api/system/configs/github")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "token_configured": True,
+        "webhook_base_url": None,
+    }
+
+
+def test_reveal_github_token() -> None:
+    service = _FakeSystemService()
+    service.current_github_token = "ghp_saved"
+    client = _create_test_client(service)
+
+    response = client.post("/api/system/configs/github:reveal")
+
+    assert response.status_code == 200
+    assert response.json() == {"token": "ghp_saved"}
+
+
+def test_probe_github_webhook_connectivity() -> None:
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.post(
+        "/api/system/configs/github/webhook:probe",
+        json={"webhook_base_url": "https://agent-teams.example.com"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": True,
+        "webhook_base_url": "https://agent-teams.example.com",
+        "callback_url": "https://agent-teams.example.com/api/triggers/github/deliveries",
+        "health_url": "https://agent-teams.example.com/api/system/health",
+        "final_url": "https://agent-teams.example.com/api/system/health",
+        "status_code": 200,
+        "latency_ms": 44,
+        "checked_at": "2026-04-13T08:00:00Z",
+        "diagnostics": {
+            "endpoint_reachable": True,
+            "used_proxy": False,
+            "redirected": False,
+        },
+        "retryable": False,
+        "error_code": None,
+        "error_message": None,
+    }
+
+
+def test_probe_github_webhook_connectivity_runs_service_call_in_threadpool(
+    monkeypatch,
+) -> None:
+    calls: list[GitHubWebhookConnectivityProbeRequest] = []
+
+    async def fake_to_thread(
+        func: Callable[
+            [GitHubWebhookConnectivityProbeRequest],
+            GitHubWebhookConnectivityProbeResult,
+        ],
+        request: GitHubWebhookConnectivityProbeRequest,
+    ) -> GitHubWebhookConnectivityProbeResult:
+        calls.append(request)
+        return func(request)
+
+    monkeypatch.setattr(system.asyncio, "to_thread", fake_to_thread)
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.post(
+        "/api/system/configs/github/webhook:probe",
+        json={"webhook_base_url": "https://agent-teams.example.com"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert [call.webhook_base_url for call in calls] == [
+        "https://agent-teams.example.com"
+    ]
+
+
+def test_get_github_webhook_tunnel_status() -> None:
+    service = _FakeSystemService()
+    service.tunnel_status = LocalhostRunTunnelStatus(
+        status="active",
+        public_url="https://demo-tunnel.lhr.life",
+        address="demo-tunnel.lhr.life",
+        local_host="127.0.0.1",
+        local_port=8000,
+        pid=4321,
+        started_at="2026-04-14T03:00:00Z",
+        last_event="tcpip-forward",
+        last_message="demo-tunnel.lhr.life tunneled with tls termination",
+    )
+    client = _create_test_client(service)
+
+    response = client.get("/api/system/configs/github/webhook/tunnel")
+
+    assert response.status_code == 200
+    assert response.json()["public_url"] == "https://demo-tunnel.lhr.life"
+    assert response.json()["status"] == "active"
+
+
+def test_start_github_webhook_tunnel_saves_webhook_base_url() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.post(
+        "/api/system/configs/github/webhook/tunnel:start",
+        json={"auto_save_webhook_base_url": True},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["public_url"] == "https://demo-tunnel.lhr.life"
+    assert service.started_tunnel_request == {
+        "local_host": None,
+        "local_port": 8000,
+        "wait_timeout_ms": 15000,
+        "auto_save_webhook_base_url": True,
+    }
+    assert service.saved_github_config == {
+        "token": None,
+        "webhook_base_url": "https://demo-tunnel.lhr.life",
+    }
+    assert service.current_github_webhook_base_url == "https://demo-tunnel.lhr.life"
+    assert service.refreshed_github_callback_previous_base_url is None
+
+
+def test_start_github_webhook_tunnel_runs_service_call_in_threadpool(
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+
+    async def fake_to_thread(
+        func: Callable[[], LocalhostRunTunnelStatus],
+    ) -> LocalhostRunTunnelStatus:
+        calls.append("start")
+        return func()
+
+    monkeypatch.setattr(system.asyncio, "to_thread", fake_to_thread)
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.post(
+        "/api/system/configs/github/webhook/tunnel:start",
+        json={"auto_save_webhook_base_url": True},
+    )
+
+    assert response.status_code == 200
+    assert calls == ["start"]
+    assert service.current_github_webhook_base_url == "https://demo-tunnel.lhr.life"
+
+
+def test_stop_github_webhook_tunnel_clears_matching_webhook_base_url() -> None:
+    service = _FakeSystemService()
+    service.current_github_webhook_base_url = "https://demo-tunnel.lhr.life"
+    service.tunnel_status = LocalhostRunTunnelStatus(
+        status="active",
+        public_url="https://demo-tunnel.lhr.life",
+        address="demo-tunnel.lhr.life",
+        local_host="127.0.0.1",
+        local_port=8000,
+        pid=4321,
+        started_at="2026-04-14T03:00:00Z",
+    )
+    client = _create_test_client(service)
+
+    response = client.post(
+        "/api/system/configs/github/webhook/tunnel:stop",
+        json={"clear_webhook_base_url_if_matching": True},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "stopped"
+    assert service.saved_github_config == {"token": None, "webhook_base_url": None}
+    assert service.current_github_webhook_base_url is None
+    assert (
+        service.refreshed_github_callback_previous_base_url
+        == "https://demo-tunnel.lhr.life"
+    )
+
+
+def test_stop_github_webhook_tunnel_runs_service_call_in_threadpool(
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+
+    async def fake_to_thread(
+        func: Callable[[], LocalhostRunTunnelStatus],
+    ) -> LocalhostRunTunnelStatus:
+        calls.append("stop")
+        return func()
+
+    monkeypatch.setattr(system.asyncio, "to_thread", fake_to_thread)
+    service = _FakeSystemService()
+    service.tunnel_status = LocalhostRunTunnelStatus(
+        status="active",
+        public_url="https://demo-tunnel.lhr.life",
+    )
+    client = _create_test_client(service)
+
+    response = client.post(
+        "/api/system/configs/github/webhook/tunnel:stop",
+        json={"clear_webhook_base_url_if_matching": False},
+    )
+
+    assert response.status_code == 200
+    assert calls == ["stop"]
+
+
+def test_get_clawhub_config() -> None:
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.get("/api/system/configs/clawhub")
+
+    assert response.status_code == 200
+    assert response.json() == {"token": None}
+
+
+def test_save_clawhub_config() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.put(
+        "/api/system/configs/clawhub",
+        json={"token": "ch_secret"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert service.saved_clawhub_config == {"token": "ch_secret"}
+
+
+def test_probe_clawhub_connectivity() -> None:
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.post(
+        "/api/system/configs/clawhub:probe",
+        json={"token": "ch_secret", "timeout_ms": 2500},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert response.json()["clawhub_version"] == "clawhub 0.4.2"
+
+
+def test_probe_clawhub_connectivity_runs_service_call_in_threadpool(
+    monkeypatch,
+) -> None:
+    calls: list[ClawHubConnectivityProbeRequest] = []
+
+    async def fake_to_thread(
+        func: Callable[
+            [ClawHubConnectivityProbeRequest],
+            ClawHubConnectivityProbeResult,
+        ],
+        request: ClawHubConnectivityProbeRequest,
+    ) -> ClawHubConnectivityProbeResult:
+        calls.append(request)
+        return func(request)
+
+    monkeypatch.setattr(system.asyncio, "to_thread", fake_to_thread)
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.post(
+        "/api/system/configs/clawhub:probe",
+        json={"token": "ch_secret", "timeout_ms": 2500},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert [call.token for call in calls] == ["ch_secret"]
+
+
+def test_search_clawhub_skill_market() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.get(
+        "/api/system/skills/market/clawhub/search",
+        params={"query": "skill creator", "limit": "12"},
+    )
+
+    assert response.status_code == 200
+    assert service.last_clawhub_market_search == ("skill creator", 12)
+    assert response.json() == {
+        "ok": True,
+        "query": "skill creator",
+        "items": [
+            {
+                "slug": "skill-creator",
+                "title": "Skill Creator",
+                "summary": "",
+                "version": "v1.0.0",
+                "score": 3.2,
+                "stats": None,
+                "owner_handle": None,
+                "owner_display_name": None,
+                "owner_image": None,
+                "created_at_ms": None,
+                "updated_at_ms": None,
+                "installed": False,
+            }
+        ],
+        "sort": None,
+        "next_cursor": None,
+        "error_message": None,
+    }
+
+
+def test_browse_clawhub_skill_market() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.get(
+        "/api/system/skills/market/clawhub",
+        params={"limit": "12", "cursor": "next-cursor", "sort": "downloads"},
+    )
+
+    assert response.status_code == 200
+    assert service.last_clawhub_market_browse == (12, "next-cursor", "downloads")
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["query"] == ""
+    assert payload["sort"] == "popular"
+    assert payload["next_cursor"] == "next-page"
+    assert payload["items"][0]["slug"] == "self-improving-agent"
+    assert payload["items"][0]["summary"] == "Captures learnings."
+
+
+def test_get_clawhub_skill_market_detail() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.get(
+        "/api/system/skills/market/clawhub/skill-creator",
+        params={"version": "0.1.0"},
+    )
+
+    assert response.status_code == 200
+    assert service.last_clawhub_market_detail == ("skill-creator", "0.1.0")
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["slug"] == "skill-creator"
+    assert payload["manifest_content"] == "# Skill Creator\n\nCreate skills safely."
+    assert payload["files"][0] == {
+        "path": "SKILL.md",
+        "size": 42,
+        "sha256": "abc123",
+        "content_type": "text/plain",
+    }
+
+
+def test_search_clawhub_skill_market_allows_default_listing() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.get(
+        "/api/system/skills/market/clawhub/search",
+        params={"limit": "20"},
+    )
+
+    assert response.status_code == 200
+    assert service.last_clawhub_market_search == ("", 20)
+    assert response.json()["ok"] is True
+
+
+def test_search_clawhub_skill_market_returns_runtime_failure_payload() -> None:
+    service = _FakeSystemService()
+    service.clawhub_market_search_response = ClawHubSkillMarketSearchResponse(
+        ok=False,
+        query="broken",
+        items=(),
+        error_message="ClawHub CLI is not available on PATH.",
+    )
+    client = _create_test_client(service)
+
+    response = client.get(
+        "/api/system/skills/market/clawhub/search",
+        params={"query": "broken"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": False,
+        "query": "broken",
+        "items": [],
+        "sort": None,
+        "next_cursor": None,
+        "error_message": "ClawHub CLI is not available on PATH.",
+    }
+
+
+def test_install_clawhub_skill_market() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.post(
+        "/api/system/skills/market/clawhub/install",
+        json={"slug": "skill-creator", "version": "v1.0.0", "force": True},
+    )
+
+    assert response.status_code == 200
+    assert service.last_clawhub_market_install == ClawHubSkillMarketInstallRequest(
+        slug="skill-creator",
+        version="v1.0.0",
+        force=True,
+    )
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["slug"] == "skill-creator"
+    assert payload["diagnostics"]["token_configured"] is True
+    assert payload["diagnostics"]["skills_reloaded"] is True
+
+
+def test_install_clawhub_skill_market_rejects_invalid_slug() -> None:
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.post(
+        "/api/system/skills/market/clawhub/install",
+        json={"slug": "openai/skill-creator"},
+    )
+
+    assert response.status_code == 422
+
+
+def test_install_clawhub_skill_market_maps_value_error(monkeypatch) -> None:
+    service = _FakeSystemService()
+
+    def fail_install(
+        request: ClawHubSkillMarketInstallRequest,
+    ) -> ClawHubSkillMarketInstallResponse:
+        raise ValueError(f"Invalid skill slug: {request.slug}")
+
+    monkeypatch.setattr(service, "install_clawhub_skill", fail_install)
+    client = _create_test_client(service)
+
+    response = client.post(
+        "/api/system/skills/market/clawhub/install",
+        json={"slug": "bad-skill"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid skill slug: bad-skill"
+
+
+def test_uninstall_clawhub_skill_market() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.delete("/api/system/skills/market/clawhub/skill-creator")
+
+    assert response.status_code == 200
+    assert service.last_clawhub_market_uninstall == "skill-creator"
+    assert response.json() == {
+        "ok": True,
+        "slug": "skill-creator",
+        "skills_reloaded": True,
+        "error_code": None,
+        "error_message": None,
+    }
+
+
+def test_uninstall_clawhub_skill_market_returns_runtime_failure_payload() -> None:
+    service = _FakeSystemService()
+    service.clawhub_market_uninstall_response = ClawHubSkillMarketUninstallResponse(
+        ok=False,
+        slug="skill-creator",
+        error_code="skill_not_installed",
+        error_message="'skill-creator'",
+    )
+    client = _create_test_client(service)
+
+    response = client.delete("/api/system/skills/market/clawhub/skill-creator")
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is False
+    assert response.json()["error_code"] == "skill_not_installed"
+
+
+def test_uninstall_clawhub_skill_market_maps_value_error(monkeypatch) -> None:
+    service = _FakeSystemService()
+
+    def fail_uninstall(*, slug: str) -> ClawHubSkillMarketUninstallResponse:
+        raise ValueError(f"Invalid skill slug: {slug}")
+
+    monkeypatch.setattr(service, "uninstall_clawhub_skill", fail_uninstall)
+    client = _create_test_client(service)
+
+    response = client.delete("/api/system/skills/market/clawhub/bad-skill")
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid skill slug: bad-skill"
+
+
+def test_uninstall_clawhub_skill_market_rejects_invalid_slug() -> None:
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.delete("/api/system/skills/market/clawhub/openai%2Fskill")
+
+    assert response.status_code == 404
+
+
+def test_get_runtime_skill_detail_returns_skill_markdown(tmp_path: Path) -> None:
+    skill_dir = tmp_path / "skills" / "skill-creator"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "# Skill Creator\n\n## Quick Start\nCreate skills safely.\n",
+        encoding="utf-8",
+    )
+    client = _create_test_client(_FakeSystemService(skill_dir=skill_dir))
+
+    response = client.get("/api/system/skills/skill-creator")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ref"] == "skill-creator"
+    assert payload["name"] == "Skill Creator"
+    assert payload["manifest_path"] == str(skill_dir / "SKILL.md")
+    assert payload["manifest_content"] == (
+        "# Skill Creator\n\n## Quick Start\nCreate skills safely.\n"
+    )
+    assert payload["instructions"] == "Create skills safely."
+
+
+def test_get_runtime_skill_detail_accepts_slash_ref(tmp_path: Path) -> None:
+    skill_dir = tmp_path / "skills" / "plugin-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Plugin Skill\n", encoding="utf-8")
+    service = _FakeSystemService()
+    service.skill_definitions["plugin/skill"] = Skill(
+        ref="plugin/skill",
+        metadata=SkillMetadata(
+            name="Plugin Skill",
+            description="Plugin skill.",
+            instructions="Use plugin skill.",
+        ),
+        directory=skill_dir,
+        source=SkillSource.USER_CODEX,
+    )
+    client = _create_test_client(service)
+
+    response = client.get("/api/system/skills/plugin%2Fskill")
+
+    assert response.status_code == 200
+    assert response.json()["ref"] == "plugin/skill"
+
+
+def test_get_runtime_skill_detail_returns_404_for_unknown_skill() -> None:
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.get("/api/system/skills/missing-skill")
+
+    assert response.status_code == 404
+
+
+def test_get_runtime_skill_detail_maps_registry_value_error(monkeypatch) -> None:
+    service = _FakeSystemService()
+
+    def fail_get_skill_definition(name: str) -> Skill | None:
+        raise ValueError(f"Invalid skill ref: {name}")
+
+    monkeypatch.setattr(service, "get_skill_definition", fail_get_skill_definition)
+    client = _create_test_client(service)
+
+    response = client.get("/api/system/skills/bad-skill")
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid skill ref: bad-skill"
+
+
+def test_get_runtime_skill_detail_returns_none_for_missing_markdown(
+    tmp_path: Path,
+) -> None:
+    skill_dir = tmp_path / "skills" / "skill-creator"
+    skill_dir.mkdir(parents=True)
+    client = _create_test_client(_FakeSystemService(skill_dir=skill_dir))
+
+    response = client.get("/api/system/skills/skill-creator")
+
+    assert response.status_code == 200
+    assert response.json()["manifest_content"] is None
+
+
+def test_uninstall_runtime_skill_deletes_user_skill_and_reloads(
+    tmp_path: Path,
+) -> None:
+    skill_dir = tmp_path / "skills" / "skill-creator"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "# Skill Creator\n\nCreate skills safely.\n",
+        encoding="utf-8",
+    )
+    service = _FakeSystemService(skill_dir=skill_dir)
+    client = _create_test_client(service)
+
+    response = client.delete("/api/system/skills/skill-creator")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": True,
+        "ref": "skill-creator",
+        "skills_reloaded": True,
+        "error_code": None,
+        "error_message": None,
+    }
+    assert not skill_dir.exists()
+    assert service.skills_reload_calls == 1
+
+
+def test_uninstall_runtime_skill_reports_reload_failure_after_delete(
+    tmp_path: Path,
+) -> None:
+    skill_dir = tmp_path / "skills" / "skill-creator"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Skill Creator\n", encoding="utf-8")
+    service = _FakeSystemService(skill_dir=skill_dir)
+    service.skills_reload_error = RuntimeError("Invalid skills config")
+    client = _create_test_client(service)
+
+    response = client.delete("/api/system/skills/skill-creator")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": True,
+        "ref": "skill-creator",
+        "skills_reloaded": False,
+        "error_code": "skills_reload_failed",
+        "error_message": "Invalid skills config",
+    }
+    assert not skill_dir.exists()
+    assert service.skills_reload_calls == 0
+
+
+def test_uninstall_runtime_skill_accepts_slash_ref(
+    tmp_path: Path,
+) -> None:
+    skill_dir = tmp_path / "skills" / "plugin-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Plugin Skill\n", encoding="utf-8")
+    service = _FakeSystemService()
+    service.skill_definitions["plugin/skill"] = Skill(
+        ref="plugin/skill",
+        metadata=SkillMetadata(
+            name="Plugin Skill",
+            description="Plugin skill.",
+            instructions="Use plugin skill.",
+        ),
+        directory=skill_dir,
+        source=SkillSource.USER_CODEX,
+    )
+    client = _create_test_client(service)
+
+    response = client.delete("/api/system/skills/plugin%2Fskill")
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert not skill_dir.exists()
+    assert service.skills_reload_calls == 1
+
+
+def test_uninstall_runtime_root_skill_preserves_sibling_skills(
+    tmp_path: Path,
+) -> None:
+    skill_root = tmp_path / "skills"
+    sibling_dir = skill_root / "sibling"
+    sibling_dir.mkdir(parents=True)
+    (skill_root / "SKILL.md").write_text("# Root Skill\n", encoding="utf-8")
+    (sibling_dir / "SKILL.md").write_text("# Sibling Skill\n", encoding="utf-8")
+    service = _FakeSystemService(skill_dir=skill_root)
+    client = _create_test_client(service)
+
+    response = client.delete("/api/system/skills/skill-creator")
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert skill_root.exists()
+    assert not (skill_root / "SKILL.md").exists()
+    assert (sibling_dir / "SKILL.md").exists()
+    assert service.skills_reload_calls == 1
+
+
+def test_uninstall_runtime_skill_refuses_project_skill(
+    tmp_path: Path,
+) -> None:
+    skill_dir = tmp_path / "project" / ".codex" / "skills" / "project-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "# Project Skill\n",
+        encoding="utf-8",
+    )
+    service = _FakeSystemService()
+    service.skill_definitions["project-skill"] = Skill(
+        ref="project-skill",
+        metadata=SkillMetadata(
+            name="Project Skill",
+            description="Project-local skill.",
+            instructions="Use project rules.",
+        ),
+        directory=skill_dir,
+        source=SkillSource.PROJECT_CODEX,
+    )
+    client = _create_test_client(service)
+
+    response = client.delete("/api/system/skills/project-skill")
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is False
+    assert response.json()["error_code"] == "skill_not_removable"
+    assert skill_dir.exists()
+    assert service.skills_reload_calls == 0
+
+
+def test_uninstall_runtime_skill_returns_404_for_unknown_skill() -> None:
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.delete("/api/system/skills/missing-skill")
+
+    assert response.status_code == 404
+
+
+def test_uninstall_runtime_skill_maps_registry_value_error(monkeypatch) -> None:
+    service = _FakeSystemService()
+
+    def fail_get_skill_definition(name: str) -> Skill | None:
+        raise ValueError(f"Invalid skill ref: {name}")
+
+    monkeypatch.setattr(service, "get_skill_definition", fail_get_skill_definition)
+    client = _create_test_client(service)
+
+    response = client.delete("/api/system/skills/bad-skill")
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid skill ref: bad-skill"
+
+
+def test_uninstall_runtime_skill_reports_missing_manifest(
+    tmp_path: Path,
+) -> None:
+    skill_dir = tmp_path / "skills" / "skill-creator"
+    skill_dir.mkdir(parents=True)
+    service = _FakeSystemService(skill_dir=skill_dir)
+    client = _create_test_client(service)
+
+    response = client.delete("/api/system/skills/skill-creator")
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is False
+    assert response.json()["error_code"] == "uninstall_failed"
+    assert "missing SKILL.md" in response.json()["error_message"]
+    assert skill_dir.exists()
+    assert service.skills_reload_calls == 0
 
 
 def test_probe_github_connectivity() -> None:
@@ -492,7 +2968,106 @@ def test_probe_github_connectivity() -> None:
     assert response.json()["username"] == "octocat"
 
 
+def test_list_clawhub_skills() -> None:
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.get("/api/system/configs/clawhub/skills")
+
+    assert response.status_code == 200
+    assert response.json() == [
+        {
+            "skill_id": "skill-creator-2",
+            "runtime_name": "skill-creator",
+            "description": "Create Codex skills.",
+            "ref": "skill-creator",
+            "source": "user_relay_teams",
+            "directory": "/tmp/.relay-teams/skills/skill-creator-2",
+            "manifest_path": "/tmp/.relay-teams/skills/skill-creator-2/SKILL.md",
+            "valid": True,
+            "error": None,
+        }
+    ]
+
+
+def test_save_and_delete_clawhub_skill() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    save_response = client.put(
+        "/api/system/configs/clawhub/skills/demo-skill",
+        json={
+            "runtime_name": "demo-skill",
+            "description": "Demo skill",
+            "instructions": "Use with care.",
+            "files": [
+                {
+                    "path": "scripts/run.py",
+                    "content": "print('ok')\n",
+                    "encoding": "utf-8",
+                }
+            ],
+        },
+    )
+    delete_response = client.delete("/api/system/configs/clawhub/skills/demo-skill")
+
+    assert save_response.status_code == 200
+    assert save_response.json()["skill_id"] == "demo-skill"
+    assert save_response.json()["runtime_name"] == "demo-skill"
+    assert delete_response.status_code == 200
+    assert delete_response.json() == {"status": "ok"}
+
+
 def test_save_orchestration_config() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.put(
+        "/api/system/configs/orchestration",
+        json={
+            "default_orchestration_preset_id": "shipping",
+            "presets": [
+                {
+                    "preset_id": "shipping",
+                    "name": "Shipping",
+                    "description": "Release work.",
+                    "role_ids": ["writer"],
+                    "orchestration_prompt": "Use writer for outward-facing updates.",
+                    "policy": {
+                        "max_orchestration_cycles": 16,
+                        "max_parallel_delegated_tasks": 8,
+                    },
+                    "graph": {
+                        "nodes": [
+                            {
+                                "node_id": "ship",
+                                "role_id": "writer",
+                                "objective": "Write the release update.",
+                            }
+                        ]
+                    },
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert service.saved_orchestration_config is not None
+    assert service.saved_orchestration_config["default_orchestration_preset_id"] == (
+        "shipping"
+    )
+    saved_presets = cast(
+        list[dict[str, JsonValue]], service.saved_orchestration_config["presets"]
+    )
+    saved_graph = cast(dict[str, JsonValue], saved_presets[0]["graph"])
+    saved_policy = cast(dict[str, JsonValue], saved_presets[0]["policy"])
+    saved_nodes = cast(list[dict[str, JsonValue]], saved_graph["nodes"])
+    assert saved_policy["max_orchestration_cycles"] == 16
+    assert saved_policy["max_parallel_delegated_tasks"] == 8
+    assert saved_nodes[0]["node_id"] == "ship"
+
+
+def test_save_orchestration_config_accepts_legacy_wrapper_payload() -> None:
     service = _FakeSystemService()
     client = _create_test_client(service)
 
@@ -531,6 +3106,122 @@ def test_get_provider_models() -> None:
     payload = response.json()
     assert len(payload) == 3
     assert payload[0]["profile"] == "default"
+    assert payload[0]["input_modalities"] == ["image"]
+    assert payload[0]["capabilities"]["input"]["image"] is True
+
+
+def test_get_model_config() -> None:
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.get("/api/system/configs/model")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "default": {
+            "provider": "openai_compatible",
+            "model": "gpt-4o-mini",
+            "base_url": "https://example.test/v1",
+            "api_key": "secret",
+            "headers": [],
+            "temperature": 0.2,
+            "top_p": 1.0,
+            "max_tokens": 2048,
+            "context_window": 128000,
+            "connect_timeout_seconds": 25.0,
+            "is_default": True,
+            "maas_auth": None,
+            "ssl_verify": None,
+        }
+    }
+
+
+def test_save_model_config() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.put(
+        "/api/system/configs/model",
+        json={
+            "default": {
+                "provider": "openai_compatible",
+                "model": "gpt-4o-mini",
+                "base_url": "https://example.test/v1",
+                "api_key": "secret",
+                "headers": [],
+                "temperature": 0.2,
+                "top_p": 1.0,
+                "max_tokens": 2048,
+                "context_window": 128000,
+                "connect_timeout_seconds": 25.0,
+                "is_default": True,
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert service.saved_model_config is not None
+    saved_default = cast(dict[str, object], service.saved_model_config["default"])
+    assert saved_default["provider"] == "openai_compatible"
+    assert saved_default["model"] == "gpt-4o-mini"
+    assert saved_default["base_url"] == "https://example.test/v1"
+    assert saved_default["api_key"] == "secret"
+    assert saved_default["headers"] == []
+    assert saved_default["temperature"] == 0.2
+    assert saved_default["top_p"] == 1.0
+    assert saved_default["max_tokens"] == 2048
+    assert saved_default["context_window"] == 128000
+    assert saved_default["connect_timeout_seconds"] == 25.0
+    assert saved_default["is_default"] is True
+    assert saved_default["fallback_policy_id"] is None
+    assert saved_default["fallback_priority"] == 0
+    assert saved_default["maas_auth"] is None
+    assert saved_default["ssl_verify"] is None
+
+
+def test_save_model_config_accepts_legacy_wrapper_payload() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+    response = client.put(
+        "/api/system/configs/model",
+        json={
+            "config": {
+                "default": {
+                    "provider": "openai_compatible",
+                    "model": "gpt-4o-mini",
+                    "base_url": "https://example.test/v1",
+                    "api_key": "secret",
+                }
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert service.saved_model_config is not None
+    saved_default = cast(dict[str, object], service.saved_model_config["default"])
+    assert saved_default["model"] == "gpt-4o-mini"
+
+
+def test_save_model_config_rejects_unknown_profile_field() -> None:
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.put(
+        "/api/system/configs/model",
+        json={
+            "default": {
+                "provider": "openai_compatible",
+                "model": "gpt-4o-mini",
+                "base_url": "https://example.test/v1",
+                "api_key": "secret",
+                "temperature": 0.2,
+                "top_p": 1.0,
+                "unexpected": True,
+            }
+        },
+    )
+
+    assert response.status_code == 422
 
 
 def test_get_model_profiles_returns_api_key() -> None:
@@ -544,6 +3235,61 @@ def test_get_model_profiles_returns_api_key() -> None:
     assert payload["default"]["has_api_key"] is True
     assert payload["default"]["is_default"] is True
     assert payload["default"]["context_window"] == 128000
+    assert payload["default"]["fallback_policy_id"] == (
+        "same_provider_then_other_provider"
+    )
+    assert payload["default"]["fallback_priority"] == 3
+    assert payload["default"]["input_modalities"] == ["image"]
+    assert payload["default"]["capabilities"]["input"]["image"] is True
+
+
+def test_get_model_profiles_returns_masked_maas_password() -> None:
+    class _FakeMaaSSystemService(_FakeSystemService):
+        def get_model_profiles(self) -> dict[str, object]:
+            return {
+                "maas": {
+                    "provider": ProviderType.MAAS.value,
+                    "model": "maas-chat",
+                    "base_url": DEFAULT_MAAS_BASE_URL,
+                    "api_key": "",
+                    "has_api_key": False,
+                    "headers": [],
+                    "maas_auth": {
+                        "username": "relay-user",
+                        "password": MASKED_MODEL_PASSWORD,
+                        "has_password": True,
+                    },
+                    "is_default": True,
+                    "capabilities": {
+                        "input": {
+                            "text": True,
+                            "image": None,
+                            "audio": None,
+                            "video": None,
+                            "pdf": None,
+                        },
+                        "output": {
+                            "text": True,
+                            "image": None,
+                            "audio": None,
+                            "video": None,
+                            "pdf": None,
+                        },
+                    },
+                    "input_modalities": [],
+                }
+            }
+
+    client = _create_test_client(_FakeMaaSSystemService())
+
+    response = client.get("/api/system/configs/model/profiles")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["maas"]["maas_auth"]["username"] == "relay-user"
+    assert payload["maas"]["maas_auth"]["password"] == MASKED_MODEL_PASSWORD
+    assert payload["maas"]["maas_auth"]["has_password"] is True
+    assert payload["maas"]["capabilities"]["input"]["image"] is None
 
 
 def test_get_provider_models_with_filter() -> None:
@@ -575,6 +3321,42 @@ def test_probe_model_connectivity() -> None:
     assert payload["token_usage"]["total_tokens"] == 9
 
 
+def test_probe_model_connectivity_runs_service_call_in_network_probe_wrapper(
+    monkeypatch,
+) -> None:
+    calls: list[ModelConnectivityProbeRequest] = []
+
+    async def fake_network_probe(
+        operation: str,
+        func: Callable[
+            [ModelConnectivityProbeRequest],
+            Awaitable[ModelConnectivityProbeResult],
+        ],
+        request: ModelConnectivityProbeRequest,
+    ) -> ModelConnectivityProbeResult:
+        assert operation == "model.probe_connectivity"
+        calls.append(request)
+        return await func(request)
+
+    monkeypatch.setattr(
+        system,
+        "call_maybe_async_in_network_probe_thread",
+        fake_network_probe,
+    )
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.post(
+        "/api/system/configs/model:probe",
+        json={"profile_name": "default"},
+    )
+
+    assert response.status_code == 200
+    assert [call.profile_name for call in calls] == ["default"]
+    assert service.last_model_probe_request is not None
+    assert service.last_model_probe_request.profile_name == "default"
+
+
 def test_discover_model_catalog() -> None:
     client = _create_test_client(_FakeSystemService())
 
@@ -593,6 +3375,50 @@ def test_discover_model_catalog() -> None:
     assert payload["ok"] is True
     assert payload["latency_ms"] == 37
     assert payload["models"] == ["fake-chat-model", "reasoning-model"]
+
+
+def test_discover_model_catalog_runs_service_call_in_network_probe_wrapper(
+    monkeypatch,
+) -> None:
+    calls: list[ModelDiscoveryRequest] = []
+
+    async def fake_network_probe(
+        operation: str,
+        func: Callable[[ModelDiscoveryRequest], Awaitable[ModelDiscoveryResult]],
+        request: ModelDiscoveryRequest,
+    ) -> ModelDiscoveryResult:
+        assert operation == "model.discover_models"
+        calls.append(request)
+        return await func(request)
+
+    monkeypatch.setattr(
+        system,
+        "call_maybe_async_in_network_probe_thread",
+        fake_network_probe,
+    )
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.post(
+        "/api/system/configs/model:discover",
+        json={"profile_name": "default"},
+    )
+
+    assert response.status_code == 200
+    assert [call.profile_name for call in calls] == ["default"]
+    assert service.last_model_discovery_request is not None
+    assert service.last_model_discovery_request.profile_name == "default"
+
+
+def test_reload_model_config_returns_bad_request_for_invalid_config() -> None:
+    service = _FakeSystemService()
+    service.model_reload_error = ValueError("Invalid model config")
+    client = _create_test_client(service)
+
+    response = client.post("/api/system/configs/model:reload")
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Invalid model config"}
 
 
 def test_reload_proxy_config() -> None:
@@ -629,7 +3455,10 @@ def test_get_web_config() -> None:
     assert response.status_code == 200
     assert response.json() == {
         "provider": "exa",
-        "api_key": None,
+        "exa_api_key": None,
+        "fallback_provider": "searxng",
+        "searxng_instance_url": DEFAULT_SEARXNG_INSTANCE_URL,
+        "searxng_instance_seeds": list(DEFAULT_SEARXNG_INSTANCE_SEEDS),
     }
 
 
@@ -671,7 +3500,9 @@ def test_save_web_config() -> None:
         "/api/system/configs/web",
         json={
             "provider": "exa",
-            "api_key": "secret",
+            "exa_api_key": "secret",
+            "fallback_provider": "searxng",
+            "searxng_instance_url": "https://search.example.test/",
         },
     )
 
@@ -679,14 +3510,56 @@ def test_save_web_config() -> None:
     assert response.json() == {"status": "ok"}
     assert service.saved_web_config == {
         "provider": "exa",
-        "api_key": "secret",
+        "exa_api_key": "secret",
+        "fallback_provider": "searxng",
+        "searxng_instance_url": "https://search.example.test/",
     }
 
 
-def test_list_external_agents() -> None:
+def test_save_web_config_rejects_searxng_primary_provider() -> None:
     client = _create_test_client(_FakeSystemService())
 
-    response = client.get("/api/system/configs/agents")
+    response = client.put(
+        "/api/system/configs/web",
+        json={
+            "provider": "searxng",
+            "exa_api_key": None,
+            "fallback_provider": "searxng",
+            "searxng_instance_url": "https://search.example.test/",
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_save_web_config_accepts_disabled_fallback_provider() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.put(
+        "/api/system/configs/web",
+        json={
+            "provider": "exa",
+            "exa_api_key": "secret",
+            "fallback_provider": "disabled",
+            "searxng_instance_url": DEFAULT_SEARXNG_INSTANCE_URL,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert service.saved_web_config == {
+        "provider": "exa",
+        "exa_api_key": "secret",
+        "fallback_provider": "disabled",
+        "searxng_instance_url": DEFAULT_SEARXNG_INSTANCE_URL,
+    }
+
+
+def test_list_agent_runtimes() -> None:
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.get("/api/system/configs/agent-runtimes")
 
     assert response.status_code == 200
     assert response.json() == [
@@ -694,21 +3567,165 @@ def test_list_external_agents() -> None:
             "agent_id": "codex_local",
             "name": "Codex Local",
             "description": "Runs Codex via stdio",
+            "protocol": "acp",
             "transport": "stdio",
         }
     ]
 
 
-def test_get_external_agent_omits_stdio_working_directory() -> None:
+def test_agent_runtime_registry_list_and_refresh() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    list_response = client.get("/api/system/configs/agent-runtime-registry")
+    refresh_response = client.post("/api/system/configs/agent-runtime-registry:refresh")
+
+    assert list_response.status_code == 200
+    assert (
+        list_response.json()["source_url"]
+        == "https://registry.example.test/registry.json"
+    )
+    assert list_response.json()["agents"][0]["registry_id"] == "vendor/runtime"
+    assert refresh_response.status_code == 200
+    assert service.registry_refresh_count == 1
+
+
+def test_agent_runtime_registry_list_maps_registry_errors_to_bad_request() -> None:
+    service = _FakeSystemService()
+    service.registry_catalog_error = AcpRegistryError("registry unavailable")
+    client = _create_test_client(service)
+
+    response = client.get("/api/system/configs/agent-runtime-registry")
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "registry unavailable"
+
+
+def test_agent_runtime_registry_install_saves_registry_transport() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.post(
+        "/api/system/configs/agent-runtime-registry/vendor%2Fruntime:install",
+        json={"agent_id": "vendor_runtime", "distribution": "npx", "env": {}},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["agent"]["agent_id"] == "vendor_runtime"
+    assert payload["agent"]["transport"] == {
+        "transport": "registry",
+        "registry_id": "vendor/runtime",
+        "distribution": "npx",
+        "registry_version": "2.0.0",
+        "env": [],
+        "registry_entry": None,
+    }
+    assert service.registry_install_requests[0][0] == "vendor/runtime"
+    assert service.registry_install_current_agents == [None]
+
+
+def test_agent_runtime_registry_update_passes_existing_agent_for_env_preserve() -> None:
+    service = _FakeSystemService()
+    service.external_agents["vendor_runtime"] = ExternalAgentConfig(
+        agent_id="vendor_runtime",
+        name="Vendor Runtime",
+        description="Official runtime",
+        protocol=ExternalAgentProtocol.ACP,
+        transport=RegistryTransportConfig(
+            registry_id="vendor/runtime",
+            distribution="npx",
+            registry_version="1.0.0",
+            env=(
+                ExternalAgentSecretBinding(
+                    name="VENDOR_TOKEN",
+                    secret=True,
+                    configured=True,
+                ),
+            ),
+        ),
+    )
+    client = _create_test_client(service)
+
+    response = client.post(
+        "/api/system/configs/agent-runtime-registry/vendor%2Fruntime:install",
+        json={"agent_id": "vendor_runtime", "distribution": "npx"},
+    )
+
+    assert response.status_code == 200
+    assert service.registry_install_requests[0][1].env is None
+    current_agent = service.registry_install_current_agents[0]
+    assert current_agent is not None
+    assert current_agent.agent_id == "vendor_runtime"
+
+
+def test_agent_runtime_registry_update_loads_default_agent_for_env_preserve() -> None:
+    service = _FakeSystemService()
+    service.external_agents["vendor-runtime"] = ExternalAgentConfig(
+        agent_id="vendor-runtime",
+        name="Vendor Runtime",
+        description="Official runtime",
+        protocol=ExternalAgentProtocol.ACP,
+        transport=RegistryTransportConfig(
+            registry_id="vendor/runtime",
+            distribution="npx",
+            registry_version="1.0.0",
+            env=(
+                ExternalAgentSecretBinding(
+                    name="VENDOR_TOKEN",
+                    secret=True,
+                    configured=True,
+                ),
+            ),
+        ),
+    )
+    client = _create_test_client(service)
+
+    response = client.post(
+        "/api/system/configs/agent-runtime-registry/vendor%2Fruntime:install",
+        json={},
+    )
+
+    assert response.status_code == 200
+    request = service.registry_install_requests[0][1]
+    assert request.agent_id is None
+    assert request.distribution is None
+    assert request.env is None
+    current_agent = service.registry_install_current_agents[0]
+    assert current_agent is not None
+    assert current_agent.agent_id == "vendor-runtime"
+
+
+def test_agent_runtime_registry_install_maps_unknown_registry_id_to_not_found() -> None:
+    service = _FakeSystemService()
+    service.registry_install_error = KeyError("missing/runtime")
+    client = _create_test_client(service)
+
+    response = client.post(
+        "/api/system/configs/agent-runtime-registry/missing%2Fruntime:install",
+        json={"distribution": "npx", "env": {}},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "'missing/runtime'"
+
+
+def test_get_agent_runtime_omits_stdio_working_directory() -> None:
     client = _create_test_client(_FakeSystemService())
 
-    response = client.get("/api/system/configs/agents/codex_local")
+    response = client.get("/api/system/configs/agent-runtimes/codex_local")
 
     assert response.status_code == 200
     assert response.json() == {
         "agent_id": "codex_local",
         "name": "Codex Local",
         "description": "Runs Codex via stdio",
+        "protocol": "acp",
+        "native_config_enabled": False,
+        "native_config_provider": "",
+        "skill_bridge_enabled": False,
+        "skill_bridge_mode": "inline",
+        "skill_bridge_skills": [],
         "transport": {
             "transport": "stdio",
             "command": "codex",
@@ -718,12 +3735,12 @@ def test_get_external_agent_omits_stdio_working_directory() -> None:
     }
 
 
-def test_save_external_agent() -> None:
+def test_save_agent_runtime() -> None:
     service = _FakeSystemService()
     client = _create_test_client(service)
 
     response = client.put(
-        "/api/system/configs/agents/claude_http",
+        "/api/system/configs/agent-runtimes/claude_http",
         json={
             "agent_id": "claude_http",
             "name": "Claude HTTP",
@@ -744,29 +3761,125 @@ def test_save_external_agent() -> None:
     )
 
 
-def test_test_external_agent(monkeypatch) -> None:
-    async def fake_probe(_config: ExternalAgentConfig) -> ExternalAgentTestResult:
+def test_test_agent_runtime(monkeypatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_probe(
+        _config: ExternalAgentConfig,
+        *,
+        runtime_cwd: Path | None = None,
+    ) -> ExternalAgentTestResult:
+        captured["runtime_cwd"] = runtime_cwd
         return ExternalAgentTestResult(
             ok=True,
             message="Connected",
+            protocol=ExternalAgentProtocol.CLI,
             agent_name="Codex",
             agent_version="1.0.0",
             protocol_version=1,
         )
 
-    monkeypatch.setattr(system, "probe_acp_agent", fake_probe)
-    client = _create_test_client(_FakeSystemService())
+    monkeypatch.setattr(test_job_service_module, "probe_agent_runtime", fake_probe)
+    service = _FakeSystemService()
+    service.external_agents["codex_local"] = service.external_agents[
+        "codex_local"
+    ].model_copy(update={"protocol": ExternalAgentProtocol.CLI})
+    workspace_manager = _FakeWorkspaceManager(tmp_path)
+    client = _create_test_client(
+        service,
+        workspace_manager=workspace_manager,
+    )
 
-    response = client.post("/api/system/configs/agents/codex_local:test")
+    response = client.post("/api/system/configs/agent-runtimes/codex_local:test")
 
     assert response.status_code == 200
+    assert captured["runtime_cwd"] == tmp_path
+    assert workspace_manager.resolve_calls[-1]["workspace_id"] == "default"
     assert response.json() == {
         "ok": True,
         "message": "Connected",
+        "protocol": "cli",
         "agent_name": "Codex",
         "agent_version": "1.0.0",
         "protocol_version": 1,
+        "protocol_version_text": None,
     }
+
+
+def test_test_agent_runtime_returns_bad_request_for_registry_resolution_error() -> None:
+    service = _FakeSystemService()
+    service.runtime_resolve_error = AcpRegistryError("Registry runtime is unavailable")
+    client = _create_test_client(service)
+
+    response = client.post("/api/system/configs/agent-runtimes/codex_local:test")
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Registry runtime is unavailable"}
+
+
+def test_agent_runtime_test_job_endpoints_return_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_probe(
+        config: ExternalAgentConfig,
+        *,
+        runtime_cwd: Path | None = None,
+    ) -> ExternalAgentTestResult:
+        _ = (config, runtime_cwd)
+        return ExternalAgentTestResult(
+            ok=True,
+            message="Connected",
+            protocol=ExternalAgentProtocol.ACP,
+        )
+
+    monkeypatch.setattr(test_job_service_module, "probe_agent_runtime", fake_probe)
+    client = _create_test_client(_FakeSystemService())
+
+    start_response = client.post(
+        "/api/system/configs/agent-runtimes/codex_local:test-job"
+    )
+
+    assert start_response.status_code == 200
+    started = start_response.json()
+    assert started["status"] == "succeeded"
+    assert started["phase"] == "completed"
+    assert started["result"]["ok"] is True
+
+    get_response = client.get(
+        f"/api/system/configs/agent-runtime-test-jobs/{started['job_id']}"
+    )
+
+    assert get_response.status_code == 200
+    assert get_response.json()["job_id"] == started["job_id"]
+
+
+def test_agent_runtime_test_job_start_returns_not_found_for_unknown_agent() -> None:
+    service = _FakeSystemService()
+    service.external_agents.pop("codex_local")
+    client = _create_test_client(service)
+
+    response = client.post("/api/system/configs/agent-runtimes/codex_local:test-job")
+
+    assert response.status_code == 404
+    assert "codex_local" in response.json()["detail"]
+
+
+def test_agent_runtime_test_job_get_returns_not_found_for_unknown_job() -> None:
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.get("/api/system/configs/agent-runtime-test-jobs/missing-job")
+
+    assert response.status_code == 404
+    assert "missing-job" in response.json()["detail"]
+
+
+def test_agent_runtime_test_job_start_returns_bad_request_for_invalid_runtime() -> None:
+    client = _create_test_client(_FailingAgentRuntimeTestJobService())
+
+    response = client.post("/api/system/configs/agent-runtimes/codex_local:test-job")
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Invalid runtime"}
 
 
 def test_save_proxy_config_returns_user_error_for_missing_keyring() -> None:
@@ -787,6 +3900,39 @@ def test_save_proxy_config_returns_user_error_for_missing_keyring() -> None:
 
     assert response.status_code == 400
     assert "system keyring backend" in response.json()["detail"]
+
+
+def test_reload_proxy_config_returns_bad_request_for_invalid_config() -> None:
+    service = _FakeSystemService()
+    service.proxy_reload_error = RuntimeError("Invalid proxy config")
+    client = _create_test_client(service)
+
+    response = client.post("/api/system/configs/proxy:reload")
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Invalid proxy config"}
+
+
+def test_reload_mcp_config_returns_bad_request_for_invalid_config() -> None:
+    service = _FakeSystemService()
+    service.mcp_reload_error = ValueError("Invalid MCP config")
+    client = _create_test_client(service)
+
+    response = client.post("/api/system/configs/mcp:reload")
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Invalid MCP config"}
+
+
+def test_reload_skills_config_returns_bad_request_for_invalid_config() -> None:
+    service = _FakeSystemService()
+    service.skills_reload_error = RuntimeError("Invalid skills config")
+    client = _create_test_client(service)
+
+    response = client.post("/api/system/configs/skills:reload")
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Invalid skills config"}
 
 
 def test_probe_web_connectivity() -> None:
@@ -825,6 +3971,84 @@ def test_probe_web_connectivity_accepts_proxy_override() -> None:
     assert payload["ok"] is True
 
 
+def test_save_model_profile_returns_not_found_for_missing_source_name() -> None:
+    service = _FakeSystemService()
+    service.model_profile_error = KeyError("Model profile not found: default")
+    client = _create_test_client(service)
+
+    response = client.put(
+        "/api/system/configs/model/profiles/renamed",
+        json={
+            "source_name": "default",
+            "provider": ProviderType.OPENAI_COMPATIBLE.value,
+            "model": "kimi-k2.5",
+            "base_url": "https://api.moonshot.cn/v1",
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "max_tokens": 4096,
+        },
+    )
+
+    assert response.status_code == 404
+    assert "Model profile not found" in response.json()["detail"]
+
+
+def test_save_model_profile_returns_bad_request_for_service_validation_error() -> None:
+    service = _FakeSystemService()
+    service.model_profile_error = ValueError("Header 'Authorization' requires a value.")
+    client = _create_test_client(service)
+
+    response = client.put(
+        "/api/system/configs/model/profiles/default",
+        json={
+            "provider": ProviderType.OPENAI_COMPATIBLE.value,
+            "model": "kimi-k2.5",
+            "base_url": "https://api.moonshot.cn/v1",
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "max_tokens": 4096,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "requires a value" in response.json()["detail"]
+
+
+def test_delete_model_profile_returns_not_found_when_missing() -> None:
+    service = _FakeSystemService()
+    service.model_profile_delete_error = KeyError("Model profile not found: default")
+    client = _create_test_client(service)
+
+    response = client.delete("/api/system/configs/model/profiles/default")
+
+    assert response.status_code == 404
+    assert "Model profile not found" in response.json()["detail"]
+
+
+def test_save_model_config_returns_bad_request_for_service_validation_error() -> None:
+    service = _FakeSystemService()
+    service.model_config_error = ValueError(
+        "MAAS model profile requires maas_auth configuration."
+    )
+    client = _create_test_client(service)
+
+    response = client.put(
+        "/api/system/configs/model",
+        json={
+            "maas": {
+                "provider": "maas",
+                "model": "maas-chat",
+                "base_url": "https://maas.example/api/v2",
+                "temperature": 0.2,
+                "top_p": 1.0,
+            }
+        },
+    )
+
+    assert response.status_code == 400
+    assert "maas_auth" in response.json()["detail"]
+
+
 def test_save_model_profile_allows_missing_api_key_for_edit() -> None:
     service = _FakeSystemService()
     client = _create_test_client(service)
@@ -851,6 +4075,80 @@ def test_save_model_profile_allows_missing_api_key_for_edit() -> None:
     assert source_name is None
 
 
+def test_save_model_profile_omits_max_tokens_when_not_provided() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.put(
+        "/api/system/configs/model/profiles/default",
+        json={
+            "provider": ProviderType.OPENAI_COMPATIBLE.value,
+            "model": "kimi-k2.5",
+            "base_url": "https://api.moonshot.cn/v1",
+            "temperature": 1.0,
+            "top_p": 0.95,
+        },
+    )
+
+    assert response.status_code == 200
+    assert service.saved_model_profile is not None
+    _, saved_profile, _ = service.saved_model_profile
+    assert "max_tokens" not in saved_profile
+
+
+def test_save_model_profile_allows_clearing_max_tokens_with_null() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.put(
+        "/api/system/configs/model/profiles/default",
+        json={
+            "provider": ProviderType.OPENAI_COMPATIBLE.value,
+            "model": "kimi-k2.5",
+            "base_url": "https://api.moonshot.cn/v1",
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "max_tokens": None,
+        },
+    )
+
+    assert response.status_code == 200
+    assert service.saved_model_profile is not None
+    _, saved_profile, _ = service.saved_model_profile
+    assert "max_tokens" in saved_profile
+    assert saved_profile["max_tokens"] is None
+
+
+def test_save_model_profile_forwards_speech_realtime_config() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.put(
+        "/api/system/configs/model/profiles/stt",
+        json={
+            "provider": ProviderType.OPENAI_COMPATIBLE.value,
+            "model": "qwen3-omni-flash",
+            "base_url": "https://api.example.test/v1",
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "speech_realtime": {
+                "model": "qwen3-asr-flash-realtime",
+                "send_model_in_session_update": False,
+                "stop_event_type": "session.finish",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert service.saved_model_profile is not None
+    _, saved_profile, _ = service.saved_model_profile
+    assert saved_profile["speech_realtime"] == {
+        "model": "qwen3-asr-flash-realtime",
+        "send_model_in_session_update": False,
+        "stop_event_type": "session.finish",
+    }
+
+
 def test_save_model_profile_accepts_bigmodel_provider() -> None:
     service = _FakeSystemService()
     client = _create_test_client(service)
@@ -860,7 +4158,7 @@ def test_save_model_profile_accepts_bigmodel_provider() -> None:
         json={
             "provider": ProviderType.BIGMODEL.value,
             "model": "glm-4.5",
-            "base_url": "https://open.bigmodel.cn/api/paas/v4",
+            "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
             "api_key": "secret",
             "temperature": 0.2,
             "top_p": 0.9,
@@ -895,6 +4193,402 @@ def test_save_model_profile_accepts_minimax_provider() -> None:
     assert service.saved_model_profile is not None
     _, saved_profile, _ = service.saved_model_profile
     assert saved_profile["provider"] == ProviderType.MINIMAX.value
+
+
+def test_save_model_profile_defaults_blank_anthropic_base_url() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.put(
+        "/api/system/configs/model/profiles/anthropic",
+        json={
+            "provider": ProviderType.ANTHROPIC.value,
+            "model": "claude-sonnet-4-5",
+            "base_url": "",
+            "api_key": "secret",
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "max_tokens": 4096,
+        },
+    )
+
+    assert response.status_code == 200
+    assert service.saved_model_profile is not None
+    _, saved_profile, _ = service.saved_model_profile
+    assert saved_profile["provider"] == ProviderType.ANTHROPIC.value
+    assert saved_profile["base_url"] == DEFAULT_ANTHROPIC_BASE_URL
+
+
+def test_save_model_profile_rejects_blank_openai_compatible_base_url() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.put(
+        "/api/system/configs/model/profiles/openai",
+        json={
+            "provider": ProviderType.OPENAI_COMPATIBLE.value,
+            "model": "gpt-4o-mini",
+            "base_url": "",
+            "api_key": "secret",
+        },
+    )
+
+    assert response.status_code == 422
+    assert service.saved_model_profile is None
+
+
+def test_save_model_profile_accepts_maas_provider() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.put(
+        "/api/system/configs/model/profiles/maas",
+        json={
+            "provider": ProviderType.MAAS.value,
+            "model": "maas-chat",
+            "base_url": "https://maas.example/api/v2",
+            "maas_auth": {
+                "username": "relay-user",
+                "password": "relay-password",
+            },
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "max_tokens": 4096,
+        },
+    )
+
+    assert response.status_code == 200
+    assert service.saved_model_profile is not None
+    _, saved_profile, _ = service.saved_model_profile
+    assert saved_profile["provider"] == ProviderType.MAAS.value
+    assert saved_profile["base_url"] == DEFAULT_MAAS_BASE_URL
+    assert saved_profile["maas_auth"] == {
+        "auth_source": "profile",
+        "username": "relay-user",
+        "password": "relay-password",
+    }
+
+
+def test_save_model_profile_sets_default_codeagent_base_url() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.put(
+        "/api/system/configs/model/profiles/codeagent",
+        json={
+            "provider": ProviderType.CODEAGENT.value,
+            "model": "codeagent-chat",
+            "base_url": "https://custom.example/codeAgentPro",
+            "codeagent_auth": {
+                "has_access_token": True,
+                "has_refresh_token": True,
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert service.saved_model_profile is not None
+    _, saved_profile, _ = service.saved_model_profile
+    assert saved_profile["provider"] == ProviderType.CODEAGENT.value
+    assert saved_profile["base_url"] == DEFAULT_CODEAGENT_BASE_URL
+
+
+def test_codeagent_oauth_start_uses_hardcoded_sso_url() -> None:
+    clear_codeagent_oauth_session_store()
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.post(
+        "/api/system/configs/model/codeagent/oauth:start",
+        json={},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["authorization_url"].startswith(
+        "https://ssoproxysvr.cd-cloud-ssoproxysvr.szv.dragon.tools.huawei.com"
+        "/ssoproxysvr/oauth2/authorize?"
+    )
+    query = parse_qs(urlparse(payload["authorization_url"]).query)
+    assert query["scope"] == ["1000:1002"]
+    assert query["redirect_uri"][0].startswith(
+        f"{DEFAULT_CODEAGENT_BASE_URL}/codeAgent/oauth/callback?client_code="
+    )
+    assert payload["codeagent_auth"]["client_id"] == DEFAULT_CODEAGENT_CLIENT_ID
+    assert payload["codeagent_auth"]["oauth_session_id"] == payload["auth_session_id"]
+    clear_codeagent_oauth_session_store()
+
+
+def test_codeagent_oauth_start_rejects_user_config_values() -> None:
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.post(
+        "/api/system/configs/model/codeagent/oauth:start",
+        json={
+            "base_url": "https://codeagent.example/codeAgentPro",
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_codeagent_oauth_local_callback_route_is_not_supported() -> None:
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.get(
+        "/api/system/configs/model/codeagent/oauth/callback",
+        params={"code": "unused-code", "state": "unused-state"},
+    )
+
+    assert response.status_code == 404
+
+
+def test_codeagent_oauth_status_polls_until_token_available(monkeypatch) -> None:
+    clear_codeagent_oauth_session_store()
+    client = _create_test_client(_FakeSystemService())
+    start_response = client.post(
+        "/api/system/configs/model/codeagent/oauth:start",
+        json={},
+    )
+    payload = start_response.json()
+
+    class _FakeCodeAgentTokenService:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def poll_token(
+            self,
+            *,
+            session: object,
+            ssl_verify: bool | None,
+            connect_timeout_seconds: float,
+        ) -> CodeAgentOAuthTokenResult | None:
+            self.calls += 1
+            assert getattr(session, "base_url") == DEFAULT_CODEAGENT_BASE_URL
+            assert getattr(session, "client_code")
+            assert str(getattr(session, "callback_url")).startswith(
+                f"{DEFAULT_CODEAGENT_BASE_URL}/codeAgent/oauth/callback?client_code="
+            )
+            _ = ssl_verify
+            _ = connect_timeout_seconds
+            if self.calls == 1:
+                return None
+            return CodeAgentOAuthTokenResult(
+                access_token="codeagent-access-token",
+                refresh_token="codeagent-refresh-token",
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+            )
+
+    token_service = _FakeCodeAgentTokenService()
+    monkeypatch.setattr(
+        system,
+        "get_codeagent_token_service",
+        lambda: token_service,
+    )
+
+    pending_response = client.get(
+        f"/api/system/configs/model/codeagent/oauth/{payload['auth_session_id']}"
+    )
+    status_response = client.get(
+        f"/api/system/configs/model/codeagent/oauth/{payload['auth_session_id']}"
+    )
+
+    assert pending_response.status_code == 200
+    assert pending_response.json()["completed"] is False
+    assert status_response.status_code == 200
+    status_payload = status_response.json()
+    assert status_payload["completed"] is True
+    assert status_payload["codeagent_auth"]["has_refresh_token"] is True
+    clear_codeagent_oauth_session_store()
+
+
+def test_codeagent_oauth_status_hides_consumed_completed_session() -> None:
+    clear_codeagent_oauth_session_store()
+    client = _create_test_client(_FakeSystemService())
+    start_response = client.post(
+        "/api/system/configs/model/codeagent/oauth:start",
+        json={},
+    )
+    payload = start_response.json()
+    save_codeagent_oauth_tokens_for_session(
+        auth_session_id=payload["auth_session_id"],
+        token_result=CodeAgentOAuthTokenResult(
+            access_token="codeagent-access-token",
+            refresh_token="codeagent-refresh-token",
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+        ),
+    )
+
+    completed_response = client.get(
+        f"/api/system/configs/model/codeagent/oauth/{payload['auth_session_id']}"
+    )
+    consumed_tokens = consume_codeagent_oauth_tokens(payload["auth_session_id"])
+    consumed_response = client.get(
+        f"/api/system/configs/model/codeagent/oauth/{payload['auth_session_id']}"
+    )
+
+    assert completed_response.status_code == 200
+    assert completed_response.json()["completed"] is True
+    assert consumed_tokens is not None
+    assert consumed_response.status_code == 200
+    assert consumed_response.json()["completed"] is False
+    assert consumed_response.json()["codeagent_auth"] is None
+    clear_codeagent_oauth_session_store()
+
+
+def test_codeagent_oauth_status_returns_bad_gateway_for_transport_errors(
+    monkeypatch,
+) -> None:
+    clear_codeagent_oauth_session_store()
+    client = _create_test_client(_FakeSystemService())
+    start_response = client.post(
+        "/api/system/configs/model/codeagent/oauth:start",
+        json={},
+    )
+    payload = start_response.json()
+    request = httpx.Request("POST", "https://codeagent.example/codeAgentPro")
+
+    class _FakeCodeAgentTokenService:
+        async def poll_token(
+            self,
+            *,
+            session: object,
+            ssl_verify: bool | None,
+            connect_timeout_seconds: float,
+        ) -> CodeAgentOAuthTokenResult | None:
+            _ = (session, ssl_verify, connect_timeout_seconds)
+            raise httpx.ConnectError("connection reset", request=request)
+
+    monkeypatch.setattr(
+        system,
+        "get_codeagent_token_service",
+        lambda: _FakeCodeAgentTokenService(),
+    )
+
+    response = client.get(
+        f"/api/system/configs/model/codeagent/oauth/{payload['auth_session_id']}"
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "connection reset"
+    clear_codeagent_oauth_session_store()
+
+
+def test_codeagent_oauth_status_returns_gateway_timeout_for_poll_timeouts(
+    monkeypatch,
+) -> None:
+    clear_codeagent_oauth_session_store()
+    client = _create_test_client(_FakeSystemService())
+    start_response = client.post(
+        "/api/system/configs/model/codeagent/oauth:start",
+        json={},
+    )
+    payload = start_response.json()
+    request = httpx.Request("POST", "https://codeagent.example/codeAgentPro")
+
+    class _FakeCodeAgentTokenService:
+        async def poll_token(
+            self,
+            *,
+            session: object,
+            ssl_verify: bool | None,
+            connect_timeout_seconds: float,
+        ) -> CodeAgentOAuthTokenResult | None:
+            _ = (session, ssl_verify, connect_timeout_seconds)
+            raise httpx.ReadTimeout("timed out", request=request)
+
+    monkeypatch.setattr(
+        system,
+        "get_codeagent_token_service",
+        lambda: _FakeCodeAgentTokenService(),
+    )
+
+    response = client.get(
+        f"/api/system/configs/model/codeagent/oauth/{payload['auth_session_id']}"
+    )
+
+    assert response.status_code == 504
+    assert response.json()["detail"] == "timed out"
+    clear_codeagent_oauth_session_store()
+
+
+def test_codeagent_oauth_status_preserves_explicit_oauth_error_status(
+    monkeypatch,
+) -> None:
+    clear_codeagent_oauth_session_store()
+    client = _create_test_client(_FakeSystemService())
+    start_response = client.post(
+        "/api/system/configs/model/codeagent/oauth:start",
+        json={},
+    )
+    payload = start_response.json()
+
+    class _FakeCodeAgentTokenService:
+        async def poll_token(
+            self,
+            *,
+            session: object,
+            ssl_verify: bool | None,
+            connect_timeout_seconds: float,
+        ) -> CodeAgentOAuthTokenResult | None:
+            _ = (session, ssl_verify, connect_timeout_seconds)
+            raise CodeAgentOAuthError("session denied", status_code=409)
+
+    monkeypatch.setattr(
+        system,
+        "get_codeagent_token_service",
+        lambda: _FakeCodeAgentTokenService(),
+    )
+
+    response = client.get(
+        f"/api/system/configs/model/codeagent/oauth/{payload['auth_session_id']}"
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "session denied"
+    clear_codeagent_oauth_session_store()
+
+
+def test_verify_codeagent_auth_returns_service_result() -> None:
+    service = _FakeSystemService()
+    service.codeagent_auth_verify_result = CodeAgentAuthVerifyResult(
+        status="reauth_required",
+        checked_at=datetime(2026, 4, 27, 2, 0, tzinfo=UTC),
+        detail="未识别到用户认证信息",
+    )
+    client = _create_test_client(service)
+
+    response = client.post(
+        "/api/system/configs/model/codeagent/auth:verify",
+        json={"profile_name": "codeagent-profile"},
+    )
+
+    assert response.status_code == 200
+    assert service.last_verified_codeagent_profile_name == "codeagent-profile"
+    assert response.json() == {
+        "status": "reauth_required",
+        "checked_at": "2026-04-27T02:00:00Z",
+        "detail": "未识别到用户认证信息",
+    }
+
+
+def test_verify_codeagent_auth_returns_bad_request_for_validation_errors() -> None:
+    class _InvalidCodeAgentService(_FakeSystemService):
+        async def verify_codeagent_auth_async(
+            self,
+            *,
+            profile_name: str,
+        ) -> CodeAgentAuthVerifyResult:
+            raise ValueError(f"Unknown CodeAgent profile: {profile_name}")
+
+    client = _create_test_client(_InvalidCodeAgentService())
+
+    response = client.post(
+        "/api/system/configs/model/codeagent/auth:verify",
+        json={"profile_name": "missing"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Unknown CodeAgent profile: missing"
 
 
 def test_save_model_profile_accepts_source_name_for_rename() -> None:
@@ -945,6 +4639,40 @@ def test_save_model_profile_includes_default_flag_when_present() -> None:
     assert service.saved_model_profile is not None
     _, saved_profile, _ = service.saved_model_profile
     assert saved_profile["is_default"] is True
+
+
+def test_save_model_profile_forwards_headers() -> None:
+    service = _FakeSystemService()
+    client = _create_test_client(service)
+
+    response = client.put(
+        "/api/system/configs/model/profiles/default",
+        json={
+            "provider": ProviderType.OPENAI_COMPATIBLE.value,
+            "model": "claude-proxy",
+            "base_url": "https://example.test/v1",
+            "headers": [
+                {
+                    "name": "Authorization",
+                    "value": "Bearer from-header",
+                    "secret": True,
+                }
+            ],
+            "temperature": 0.2,
+            "top_p": 1.0,
+            "max_tokens": 2048,
+        },
+    )
+
+    assert response.status_code == 200
+    assert service.saved_model_profile is not None
+    _, saved_profile, _ = service.saved_model_profile
+    saved_headers = saved_profile["headers"]
+    assert isinstance(saved_headers, list)
+    first_header = saved_headers[0]
+    assert isinstance(first_header, dict)
+    first_header_payload = first_header
+    assert cast(dict[str, JsonValue], first_header_payload)["name"] == "Authorization"
 
 
 class _FakeEnvironmentVariableService:
@@ -1021,6 +4749,43 @@ def test_get_environment_variables() -> None:
     assert payload["app"][0]["scope"] == "app"
 
 
+def test_environment_variable_routes_run_service_calls_in_threadpool(
+    monkeypatch,
+) -> None:
+    calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+    async def fake_to_thread(
+        func: Callable[..., object],
+        /,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        calls.append((func.__name__, args, kwargs))
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(system.asyncio, "to_thread", fake_to_thread)
+    client = _create_env_test_client(_FakeEnvironmentVariableService())
+
+    responses = [
+        client.get("/api/system/configs/environment-variables"),
+        client.put(
+            "/api/system/configs/environment-variables/app/OPENAI_API_KEY",
+            json={
+                "source_key": "OPENAI_KEY",
+                "value": "updated-secret",
+            },
+        ),
+        client.delete("/api/system/configs/environment-variables/app/OPENAI_API_KEY"),
+    ]
+
+    assert [response.status_code for response in responses] == [200] * len(responses)
+    assert [call[0] for call in calls] == [
+        "list_environment_variables",
+        "save_environment_variable",
+        "delete_environment_variable",
+    ]
+
+
 def test_save_environment_variable() -> None:
     service = _FakeEnvironmentVariableService()
     client = _create_env_test_client(service)
@@ -1061,3 +4826,86 @@ def test_delete_environment_variable_returns_forbidden_on_permission_error() -> 
 
     assert response.status_code == 403
     assert "access denied" in response.json()["detail"].lower()
+
+
+def test_save_notification_config_rejects_unknown_top_level_field() -> None:
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.put(
+        "/api/system/configs/notifications",
+        json={
+            "tool_approval_requested": {
+                "enabled": True,
+                "channels": ["browser", "toast"],
+                "feishu_format": "text",
+            },
+            "run_completed": {
+                "enabled": True,
+                "channels": ["toast", "feishu"],
+                "feishu_format": "card",
+            },
+            "run_failed": {
+                "enabled": True,
+                "channels": ["browser", "toast"],
+                "feishu_format": "text",
+            },
+            "run_stopped": {
+                "enabled": True,
+                "channels": ["toast"],
+                "feishu_format": "text",
+            },
+            "unexpected": {},
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_save_orchestration_config_rejects_unknown_top_level_field() -> None:
+    client = _create_test_client(_FakeSystemService())
+
+    response = client.put(
+        "/api/system/configs/orchestration",
+        json={
+            "default_orchestration_preset_id": "shipping",
+            "presets": [
+                {
+                    "preset_id": "shipping",
+                    "name": "Shipping",
+                    "description": "Release work.",
+                    "role_ids": ["writer"],
+                    "orchestration_prompt": "Use writer for outward-facing updates.",
+                }
+            ],
+            "unexpected": True,
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_get_model_config_preserves_omitted_sparse_fields() -> None:
+    class _SparseSystemService(_FakeSystemService):
+        def get_model_config(self) -> dict[str, object]:
+            return {
+                "default": {
+                    "provider": "openai_compatible",
+                    "model": "gpt-4o-mini",
+                    "base_url": "https://example.test/v1",
+                    "api_key": "secret",
+                }
+            }
+
+    client = _create_test_client(_SparseSystemService())
+
+    response = client.get("/api/system/configs/model")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "default": {
+            "provider": "openai_compatible",
+            "model": "gpt-4o-mini",
+            "base_url": "https://example.test/v1",
+            "api_key": "secret",
+        }
+    }

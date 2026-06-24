@@ -5,10 +5,12 @@ from datetime import UTC, datetime
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from agent_teams.automation import (
+from relay_teams.automation import (
+    AutomationDeliveryBindingCandidate,
     AutomationDeliveryEvent,
     AutomationFeishuBinding,
     AutomationFeishuBindingCandidate,
+    AutomationIntervalUnit,
     AutomationProjectCreateInput,
     AutomationProjectNameConflictError,
     AutomationProjectRecord,
@@ -16,9 +18,10 @@ from agent_teams.automation import (
     AutomationProjectUpdateInput,
     AutomationRunConfig,
     AutomationScheduleMode,
+    AutomationXiaolubanBindingCandidate,
 )
-from agent_teams.interfaces.server.deps import get_automation_service
-from agent_teams.interfaces.server.routers import automation
+from relay_teams.interfaces.server.deps import get_automation_service
+from relay_teams.interfaces.server.routers import automation
 
 
 class _FakeAutomationService:
@@ -26,8 +29,12 @@ class _FakeAutomationService:
         self.created_payloads: list[AutomationProjectCreateInput] = []
         self.run_calls: list[str] = []
         self.status_calls: list[tuple[str, AutomationProjectStatus]] = []
-        self.deleted_project_ids: list[str] = []
+        self.deleted_calls: list[tuple[str, bool, bool]] = []
+        self.updated_payloads: list[tuple[str, AutomationProjectUpdateInput]] = []
+        self.delete_error: Exception | None = None
         self.list_feishu_bindings_calls = 0
+        self.list_delivery_bindings_calls = 0
+        self.async_calls: list[str] = []
 
     def create_project(
         self, req: AutomationProjectCreateInput
@@ -36,6 +43,10 @@ class _FakeAutomationService:
         if req.name == "duplicate-project":
             raise AutomationProjectNameConflictError(
                 f"Automation project name already exists: {req.name}"
+            )
+        if req.name == "invalid-binding":
+            raise ValueError(
+                "delivery_binding must reference an existing Xiaoluban account"
             )
         return AutomationProjectRecord(
             automation_project_id="aut_created",
@@ -50,6 +61,8 @@ class _FakeAutomationService:
             prompt=req.prompt,
             schedule_mode=req.schedule_mode,
             cron_expression=req.cron_expression,
+            interval_every=req.interval_every,
+            interval_unit=req.interval_unit,
             run_at=req.run_at,
             timezone=req.timezone,
             run_config=req.run_config,
@@ -61,8 +74,18 @@ class _FakeAutomationService:
             else None,
         )
 
+    async def create_project_async(
+        self, req: AutomationProjectCreateInput
+    ) -> AutomationProjectRecord:
+        self.async_calls.append("create_project_async")
+        return self.create_project(req)
+
     def list_projects(self) -> tuple[AutomationProjectRecord, ...]:
         return (self.get_project("aut_1"),)
+
+    async def list_projects_async(self) -> tuple[AutomationProjectRecord, ...]:
+        self.async_calls.append("list_projects_async")
+        return self.list_projects()
 
     def get_project(self, automation_project_id: str) -> AutomationProjectRecord:
         if automation_project_id != "aut_1":
@@ -82,6 +105,7 @@ class _FakeAutomationService:
                 trigger_id="trg_feishu",
                 tenant_key="tenant-1",
                 chat_id="oc_123",
+                session_id="session-im-1",
                 chat_type="group",
                 source_label="Release Updates",
             ),
@@ -93,6 +117,12 @@ class _FakeAutomationService:
             trigger_id="trg_1",
             next_run_at=datetime(2026, 3, 23, 9, 0, tzinfo=UTC),
         )
+
+    async def get_project_async(
+        self, automation_project_id: str
+    ) -> AutomationProjectRecord:
+        self.async_calls.append("get_project_async")
+        return self.get_project(automation_project_id)
 
     def list_feishu_bindings(self) -> tuple[AutomationFeishuBindingCandidate, ...]:
         self.list_feishu_bindings_calls += 1
@@ -110,34 +140,114 @@ class _FakeAutomationService:
             ),
         )
 
-    def update_project(
-        self, automation_project_id: str, _req: AutomationProjectUpdateInput
-    ) -> AutomationProjectRecord:  # pragma: no cover
-        raise AssertionError(f"not used: {automation_project_id}")
+    async def list_feishu_bindings_async(
+        self,
+    ) -> tuple[AutomationFeishuBindingCandidate, ...]:
+        self.async_calls.append("list_feishu_bindings_async")
+        return self.list_feishu_bindings()
 
-    def delete_project(self, automation_project_id: str) -> None:
+    def list_delivery_bindings(
+        self,
+    ) -> tuple[AutomationDeliveryBindingCandidate, ...]:
+        self.list_delivery_bindings_calls += 1
+        return (
+            *self.list_feishu_bindings(),
+            AutomationXiaolubanBindingCandidate(
+                account_id="xlb_1",
+                display_name="小鲁班主账号",
+                derived_uid="uid_self",
+                source_label="发送给自己（uid_self）",
+                updated_at=datetime(2026, 3, 23, 8, 30, tzinfo=UTC),
+            ),
+        )
+
+    async def list_delivery_bindings_async(
+        self,
+    ) -> tuple[AutomationDeliveryBindingCandidate, ...]:
+        self.async_calls.append("list_delivery_bindings_async")
+        return self.list_delivery_bindings()
+
+    def update_project(
+        self, automation_project_id: str, req: AutomationProjectUpdateInput
+    ) -> AutomationProjectRecord:
+        self.updated_payloads.append((automation_project_id, req))
+        return self.get_project(automation_project_id).model_copy(
+            update={
+                "name": req.name or "daily-briefing",
+                "display_name": req.display_name or "Daily Briefing",
+            }
+        )
+
+    async def update_project_async(
+        self, automation_project_id: str, req: AutomationProjectUpdateInput
+    ) -> AutomationProjectRecord:
+        self.async_calls.append("update_project_async")
+        return self.update_project(automation_project_id, req)
+
+    def delete_project(
+        self,
+        automation_project_id: str,
+        *,
+        force: bool = False,
+        cascade: bool = False,
+    ) -> None:
+        if self.delete_error is not None:
+            raise self.delete_error
         if automation_project_id != "aut_1":
             raise KeyError(f"Unknown automation_project_id: {automation_project_id}")
-        self.deleted_project_ids.append(automation_project_id)
+        self.deleted_calls.append((automation_project_id, force, cascade))
 
-    def run_now(self, automation_project_id: str) -> dict[str, str]:
+    async def delete_project_async(
+        self,
+        automation_project_id: str,
+        *,
+        force: bool = False,
+        cascade: bool = False,
+    ) -> None:
+        self.async_calls.append("delete_project_async")
+        self.delete_project(
+            automation_project_id,
+            force=force,
+            cascade=cascade,
+        )
+
+    def run_now(self, automation_project_id: str) -> dict[str, str | bool | None]:
         self.run_calls.append(automation_project_id)
         return {
             "automation_project_id": automation_project_id,
             "session_id": "session-automation-1",
+            "run_id": "run-automation-1",
+            "queued": False,
+            "reused_bound_session": False,
         }
+
+    async def run_now_async(
+        self, automation_project_id: str
+    ) -> dict[str, str | bool | None]:
+        self.async_calls.append("run_now_async")
+        return self.run_now(automation_project_id)
 
     def set_project_status(
         self,
         automation_project_id: str,
         status: AutomationProjectStatus,
     ) -> AutomationProjectRecord:
+        if automation_project_id == "invalid":
+            raise ValueError("Unknown workspace: missing-workspace")
         if automation_project_id != "aut_1":
             raise KeyError(f"Unknown automation_project_id: {automation_project_id}")
         self.status_calls.append((automation_project_id, status))
         return self.get_project(automation_project_id).model_copy(
             update={"status": status}
         )
+
+    async def set_project_status_async(
+        self,
+        automation_project_id: str,
+        status: AutomationProjectStatus,
+    ) -> AutomationProjectRecord:
+        self.async_calls.append("set_project_status_async")
+        return self.set_project_status(automation_project_id, status)
 
     def list_project_sessions(
         self, automation_project_id: str
@@ -162,6 +272,12 @@ class _FakeAutomationService:
                 "updated_at": "2026-03-23T00:00:00+00:00",
             },
         )
+
+    async def list_project_sessions_async(
+        self, automation_project_id: str
+    ) -> tuple[dict[str, object], ...]:
+        self.async_calls.append("list_project_sessions_async")
+        return self.list_project_sessions(automation_project_id)
 
 
 def _client(fake_service: _FakeAutomationService) -> TestClient:
@@ -196,6 +312,40 @@ def test_create_project_route_returns_created_record() -> None:
     assert fake_service.created_payloads[0].name == "daily-briefing"
 
 
+def test_create_project_route_accepts_full_run_config() -> None:
+    fake_service = _FakeAutomationService()
+    client = _client(fake_service)
+
+    response = client.post(
+        "/api/automation/projects",
+        json={
+            "name": "daily-briefing",
+            "display_name": "Daily Briefing",
+            "workspace_id": "default",
+            "prompt": "Summarize the day.",
+            "schedule_mode": "cron",
+            "cron_expression": "0 9 * * *",
+            "timezone": "UTC",
+            "run_config": {
+                "session_mode": "normal",
+                "normal_root_role_id": "Writer",
+                "orchestration_preset_id": None,
+                "execution_mode": "ai",
+                "yolo": True,
+                "thinking": {"enabled": False, "effort": None},
+            },
+            "enabled": True,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["run_config"]["session_mode"] == "normal"
+    assert payload["run_config"]["normal_root_role_id"] == "Writer"
+    assert payload["run_config"]["orchestration_preset_id"] is None
+    assert fake_service.created_payloads[0].run_config.normal_root_role_id == "Writer"
+
+
 def test_create_project_route_maps_name_conflict_to_409() -> None:
     client = _client(_FakeAutomationService())
 
@@ -215,6 +365,72 @@ def test_create_project_route_maps_name_conflict_to_409() -> None:
     assert "already exists" in response.json()["detail"]
 
 
+def test_create_project_route_accepts_interval_schedule() -> None:
+    fake_service = _FakeAutomationService()
+    client = _client(fake_service)
+
+    response = client.post(
+        "/api/automation/projects",
+        json={
+            "name": "interval-briefing",
+            "workspace_id": "default",
+            "prompt": "Summarize every interval.",
+            "schedule_mode": "interval",
+            "interval_every": 2,
+            "interval_unit": "hours",
+            "timezone": "UTC",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["schedule_mode"] == "interval"
+    assert payload["interval_every"] == 2
+    assert payload["interval_unit"] == "hours"
+    assert (
+        fake_service.created_payloads[0].interval_unit == AutomationIntervalUnit.HOURS
+    )
+
+
+def test_create_project_route_maps_invalid_binding_to_422() -> None:
+    client = _client(_FakeAutomationService())
+
+    response = client.post(
+        "/api/automation/projects",
+        json={
+            "name": "invalid-binding",
+            "workspace_id": "default",
+            "prompt": "Summarize the day.",
+            "schedule_mode": "cron",
+            "cron_expression": "0 9 * * *",
+            "timezone": "UTC",
+        },
+    )
+
+    assert response.status_code == 422
+    assert "existing Xiaoluban account" in response.json()["detail"]
+
+
+def test_create_project_route_rejects_none_like_workspace_id() -> None:
+    fake_service = _FakeAutomationService()
+    client = _client(fake_service)
+
+    response = client.post(
+        "/api/automation/projects",
+        json={
+            "name": "daily-briefing",
+            "workspace_id": "None",
+            "prompt": "Summarize the day.",
+            "schedule_mode": "cron",
+            "cron_expression": "0 9 * * *",
+            "timezone": "UTC",
+        },
+    )
+
+    assert response.status_code == 422
+    assert fake_service.created_payloads == []
+
+
 def test_list_projects_route_returns_records() -> None:
     client = _client(_FakeAutomationService())
 
@@ -225,6 +441,7 @@ def test_list_projects_route_returns_records() -> None:
     assert payload[0]["automation_project_id"] == "aut_1"
     assert payload[0]["schedule_mode"] == "cron"
     assert payload[0]["delivery_binding"]["chat_id"] == "oc_123"
+    assert payload[0]["delivery_binding"]["session_id"] == "session-im-1"
     assert payload[0]["delivery_events"] == ["started", "completed", "failed"]
 
 
@@ -241,6 +458,67 @@ def test_list_feishu_bindings_route_returns_candidates() -> None:
     assert fake_service.list_feishu_bindings_calls == 1
 
 
+def test_list_delivery_bindings_route_returns_mixed_candidates() -> None:
+    fake_service = _FakeAutomationService()
+    client = _client(fake_service)
+
+    response = client.get("/api/automation/delivery-bindings")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload[0]["provider"] == "feishu"
+    assert payload[1]["provider"] == "xiaoluban"
+    assert payload[1]["account_id"] == "xlb_1"
+    assert fake_service.list_delivery_bindings_calls == 1
+
+
+def test_automation_routes_call_async_service_methods() -> None:
+    fake_service = _FakeAutomationService()
+    client = _client(fake_service)
+
+    requests = [
+        client.get("/api/automation/delivery-bindings"),
+        client.get("/api/automation/feishu-bindings"),
+        client.post(
+            "/api/automation/projects",
+            json={
+                "name": "daily-briefing",
+                "workspace_id": "default",
+                "prompt": "Summarize the day.",
+                "schedule_mode": "cron",
+                "cron_expression": "0 9 * * *",
+                "timezone": "UTC",
+            },
+        ),
+        client.get("/api/automation/projects"),
+        client.get("/api/automation/projects/aut_1"),
+        client.patch(
+            "/api/automation/projects/aut_1",
+            json={"display_name": "Updated Briefing"},
+        ),
+        client.delete("/api/automation/projects/aut_1"),
+        client.post("/api/automation/projects/aut_1:run"),
+        client.post("/api/automation/projects/aut_1:enable"),
+        client.post("/api/automation/projects/aut_1:disable"),
+        client.get("/api/automation/projects/aut_1/sessions"),
+    ]
+
+    assert [response.status_code for response in requests] == [200] * len(requests)
+    assert fake_service.async_calls == [
+        "list_delivery_bindings_async",
+        "list_feishu_bindings_async",
+        "create_project_async",
+        "list_projects_async",
+        "get_project_async",
+        "update_project_async",
+        "delete_project_async",
+        "run_now_async",
+        "set_project_status_async",
+        "set_project_status_async",
+        "list_project_sessions_async",
+    ]
+
+
 def test_get_project_route_returns_record() -> None:
     client = _client(_FakeAutomationService())
 
@@ -248,6 +526,14 @@ def test_get_project_route_returns_record() -> None:
 
     assert response.status_code == 200
     assert response.json()["automation_project_id"] == "aut_1"
+
+
+def test_get_project_route_rejects_none_like_path_identifier() -> None:
+    client = _client(_FakeAutomationService())
+
+    response = client.get("/api/automation/projects/None")
+
+    assert response.status_code == 422
 
 
 def test_run_project_route_returns_session_id() -> None:
@@ -260,6 +546,9 @@ def test_run_project_route_returns_session_id() -> None:
     assert response.json() == {
         "automation_project_id": "aut_1",
         "session_id": "session-automation-1",
+        "run_id": "run-automation-1",
+        "queued": False,
+        "reused_bound_session": False,
     }
     assert fake_service.run_calls == ["aut_1"]
 
@@ -286,6 +575,15 @@ def test_enable_project_route_returns_enabled_record() -> None:
     assert fake_service.status_calls == [("aut_1", AutomationProjectStatus.ENABLED)]
 
 
+def test_enable_project_route_maps_validation_error_to_422() -> None:
+    client = _client(_FakeAutomationService())
+
+    response = client.post("/api/automation/projects/invalid:enable")
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Unknown workspace: missing-workspace"
+
+
 def test_disable_project_route_returns_disabled_record() -> None:
     fake_service = _FakeAutomationService()
     client = _client(fake_service)
@@ -305,4 +603,32 @@ def test_delete_project_route_returns_ok() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
-    assert fake_service.deleted_project_ids == ["aut_1"]
+    assert fake_service.deleted_calls == [("aut_1", False, False)]
+
+
+def test_delete_project_route_forwards_force_and_cascade() -> None:
+    fake_service = _FakeAutomationService()
+    client = _client(fake_service)
+
+    response = client.request(
+        "DELETE",
+        "/api/automation/projects/aut_1",
+        json={"force": True, "cascade": True},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert fake_service.deleted_calls == [("aut_1", True, True)]
+
+
+def test_delete_project_route_returns_conflict_for_missing_cascade() -> None:
+    fake_service = _FakeAutomationService()
+    fake_service.delete_error = RuntimeError(
+        "Cannot delete automation project without cascade while deliveries or queue records exist"
+    )
+    client = _client(fake_service)
+
+    response = client.delete("/api/automation/projects/aut_1")
+
+    assert response.status_code == 409
+    assert "without cascade" in response.json()["detail"]

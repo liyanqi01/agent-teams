@@ -1,4 +1,4 @@
-/**
+﻿/**
  * core/api/runs.js
  * Run, gate, and tool-approval related API wrappers.
  */
@@ -10,19 +10,30 @@ export async function sendUserPrompt(
     yolo = false,
     thinking = null,
     targetRoleId = null,
+    inputParts = null,
+    skills = null,
+    displayInputParts = null,
 ) {
+    const resolvedInput = Array.isArray(inputParts) && inputParts.length > 0
+        ? inputParts
+        : [{ kind: 'text', text: prompt }];
     return requestJson(
         '/api/runs',
         {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                intent: prompt,
                 session_id: sessionId,
+                input: resolvedInput,
+                run_kind: 'conversation',
                 execution_mode: 'ai',
                 yolo: yolo === true,
                 thinking: thinking || { enabled: false, effort: null },
                 target_role_id: targetRoleId || null,
+                skills: Array.isArray(skills) && skills.length > 0 ? skills : null,
+                display_input: Array.isArray(displayInputParts) && displayInputParts.length > 0
+                    ? displayInputParts
+                    : [],
             }),
         },
         'Failed to create run',
@@ -41,15 +52,35 @@ export async function resolveGate(runId, taskId, action, feedback = '') {
     );
 }
 
-export async function resolveToolApproval(runId, toolCallId, action, feedback = '') {
+export async function resolveToolApproval(runId, toolCallId, action, feedback = '', optionId = '') {
     return requestJson(
         `/api/runs/${runId}/tool-approvals/${toolCallId}/resolve`,
         {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ action, feedback }),
+            body: JSON.stringify({ action, feedback, option_id: optionId }),
         },
         'Failed to resolve tool approval',
+    );
+}
+
+export async function listUserQuestions(runId) {
+    return requestJson(
+        `/api/runs/${runId}/questions`,
+        undefined,
+        'Failed to fetch user questions',
+    );
+}
+
+export async function answerUserQuestion(runId, questionId, answers) {
+    return requestJson(
+        `/api/runs/${runId}/questions/${questionId}:answer`,
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ answers }),
+        },
+        'Failed to answer user question',
     );
 }
 
@@ -64,16 +95,27 @@ export async function dispatchHumanTask(sessionId, runId, taskId) {
         'Failed to dispatch task',
     );
 }
-
-export async function injectMessage(runId, content) {
+export async function injectMessage(runId, content, { mode = 'queued', clientMessageId = '' } = {}) {
+    const payload = { content, mode };
+    if (clientMessageId) {
+        payload.client_message_id = clientMessageId;
+    }
     return requestJson(
         `/api/runs/${runId}/inject`,
         {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ content }),
+            body: JSON.stringify(payload),
         },
         'Failed to inject message',
+    );
+}
+
+export async function forceQueuedInject(runId) {
+    return requestJson(
+        `/api/runs/${runId}/inject:force`,
+        { method: 'POST' },
+        'Failed to force queued inject',
     );
 }
 
@@ -99,6 +141,30 @@ export async function resumeRun(runId) {
             method: 'POST',
         },
         'Failed to resume run',
+    );
+}
+
+export async function fetchRunBackgroundTasks(runId) {
+    return requestJson(
+        `/api/runs/${runId}/background-tasks`,
+        undefined,
+        'Failed to fetch background tasks',
+    );
+}
+
+export async function fetchRunBackgroundTask(runId, backgroundTaskId) {
+    return requestJson(
+        `/api/runs/${runId}/background-tasks/${backgroundTaskId}`,
+        undefined,
+        'Failed to fetch background task',
+    );
+}
+
+export async function stopBackgroundTask(runId, backgroundTaskId) {
+    return requestJson(
+        `/api/runs/${runId}/background-tasks/${backgroundTaskId}:stop`,
+        { method: 'POST' },
+        'Failed to stop background task',
     );
 }
 

@@ -10,10 +10,12 @@ import zipfile
 
 import pytest
 
+from relay_teams.binary_tools import BinaryToolId
+
 
 class TestRipgrepFilepath:
     def test_platform_detection(self) -> None:
-        from agent_teams.tools.workspace_tools import ripgrep
+        from relay_teams.tools.workspace_tools import ripgrep
 
         key = ripgrep._get_platform_key()
         assert key in ripgrep.PLATFORM_MAP
@@ -28,8 +30,8 @@ class TestRipgrepFilepath:
         rg.write_bytes(b"fake")
 
         with patch("shutil.which", return_value=None):
-            with patch("agent_teams.tools.workspace_tools.ripgrep.BIN_DIR", cache_dir):
-                from agent_teams.tools.workspace_tools import ripgrep
+            with patch("relay_teams.tools.workspace_tools.ripgrep.BIN_DIR", cache_dir):
+                from relay_teams.tools.workspace_tools import ripgrep
 
                 ripgrep.clear_rg_path_cache()
                 path = await ripgrep.get_rg_path()
@@ -47,8 +49,8 @@ class TestRipgrepFilepath:
         rg.write_bytes(b"fake")
 
         with patch("shutil.which", return_value=None):
-            with patch("agent_teams.tools.workspace_tools.ripgrep.BIN_DIR", cache_dir):
-                from agent_teams.tools.workspace_tools import ripgrep
+            with patch("relay_teams.tools.workspace_tools.ripgrep.BIN_DIR", cache_dir):
+                from relay_teams.tools.workspace_tools import ripgrep
 
                 ripgrep.clear_rg_path_cache()
                 first = await ripgrep.get_rg_path()
@@ -68,8 +70,8 @@ class TestRipgrepFilepath:
         rg = cache_dir / rg_name
 
         with patch("shutil.which", return_value=None):
-            with patch("agent_teams.tools.workspace_tools.ripgrep.BIN_DIR", cache_dir):
-                from agent_teams.tools.workspace_tools import ripgrep
+            with patch("relay_teams.tools.workspace_tools.ripgrep.BIN_DIR", cache_dir):
+                from relay_teams.tools.workspace_tools import ripgrep
 
                 async def fake_download(target: Path) -> None:
                     await asyncio.sleep(0.01)
@@ -77,7 +79,7 @@ class TestRipgrepFilepath:
 
                 ripgrep.clear_rg_path_cache()
                 with patch(
-                    "agent_teams.tools.workspace_tools.ripgrep._download_rg",
+                    "relay_teams.tools.workspace_tools.ripgrep._download_rg",
                     new=AsyncMock(side_effect=fake_download),
                 ) as mock_download:
                     first, second = await asyncio.gather(
@@ -100,8 +102,8 @@ class TestRipgrepFilepath:
         rg.write_bytes(b"bundled")
 
         with patch("shutil.which", return_value="/usr/bin/rg"):
-            with patch("agent_teams.tools.workspace_tools.ripgrep.BIN_DIR", cache_dir):
-                from agent_teams.tools.workspace_tools import ripgrep
+            with patch("relay_teams.tools.workspace_tools.ripgrep.BIN_DIR", cache_dir):
+                from relay_teams.tools.workspace_tools import ripgrep
 
                 ripgrep.clear_rg_path_cache()
                 path = await ripgrep.get_rg_path()
@@ -118,12 +120,12 @@ class TestRipgrepFilepath:
         system_rg.write_bytes(b"system")
 
         with patch("shutil.which", return_value=str(system_rg)):
-            with patch("agent_teams.tools.workspace_tools.ripgrep.BIN_DIR", cache_dir):
-                from agent_teams.tools.workspace_tools import ripgrep
+            with patch("relay_teams.tools.workspace_tools.ripgrep.BIN_DIR", cache_dir):
+                from relay_teams.tools.workspace_tools import ripgrep
 
                 ripgrep.clear_rg_path_cache()
                 with patch(
-                    "agent_teams.tools.workspace_tools.ripgrep._download_rg",
+                    "relay_teams.tools.workspace_tools.ripgrep._download_rg",
                     new=AsyncMock(side_effect=RuntimeError("no network")),
                 ):
                     path = await ripgrep.get_rg_path()
@@ -133,7 +135,7 @@ class TestRipgrepFilepath:
     async def test_raises_not_found_when_nothing_available(
         self, tmp_path: Path
     ) -> None:
-        from agent_teams.tools.workspace_tools.ripgrep_errors import (
+        from relay_teams.tools.workspace_tools.ripgrep_errors import (
             RipgrepNotFoundError,
         )
 
@@ -141,12 +143,12 @@ class TestRipgrepFilepath:
         cache_dir.mkdir()
 
         with patch("shutil.which", return_value=None):
-            with patch("agent_teams.tools.workspace_tools.ripgrep.BIN_DIR", cache_dir):
-                from agent_teams.tools.workspace_tools import ripgrep
+            with patch("relay_teams.tools.workspace_tools.ripgrep.BIN_DIR", cache_dir):
+                from relay_teams.tools.workspace_tools import ripgrep
 
                 ripgrep.clear_rg_path_cache()
                 with patch(
-                    "agent_teams.tools.workspace_tools.ripgrep._download_rg",
+                    "relay_teams.tools.workspace_tools.ripgrep._download_rg",
                     new=AsyncMock(side_effect=RuntimeError("no network")),
                 ):
                     with pytest.raises(RipgrepNotFoundError):
@@ -155,63 +157,45 @@ class TestRipgrepFilepath:
 
 class TestRipgrepDownload:
     @pytest.mark.asyncio
-    async def test_download_enables_redirect_following(self, tmp_path: Path) -> None:
-        from agent_teams.tools.workspace_tools import ripgrep
+    async def test_download_delegates_to_binary_tool_service(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from relay_teams.tools.workspace_tools import ripgrep
 
         target = tmp_path / "rg.exe"
-        response = MagicMock(status_code=200, content=b"fake-zip")
-        client = AsyncMock()
-        client.get = AsyncMock(return_value=response)
-        client_cm = AsyncMock()
-        client_cm.__aenter__.return_value = client
-        client_cm.__aexit__.return_value = None
 
+        service = _FakeDownloadService()
         with patch(
-            "agent_teams.tools.workspace_tools.ripgrep.create_async_http_client",
-            return_value=client_cm,
-        ) as mock_client_cls:
-            with patch(
-                "agent_teams.tools.workspace_tools.ripgrep._get_platform_key",
-                return_value="x64-windows",
-            ):
-                with patch(
-                    "agent_teams.tools.workspace_tools.ripgrep._extract_zip"
-                ) as mock_extract_zip:
-                    with patch("agent_teams.tools.workspace_tools.ripgrep.os.chmod"):
-                        await ripgrep._download_rg(target)
+            "relay_teams.tools.workspace_tools.ripgrep._build_binary_tool_service",
+            return_value=service,
+        ):
+            await ripgrep._download_rg(target)
 
-        mock_client_cls.assert_called_once_with(follow_redirects=True)
-        client.get.assert_awaited_once()
-        mock_extract_zip.assert_called_once_with(b"fake-zip", target)
+        assert service.calls == [(BinaryToolId.RIPGREP, target)]
 
     @pytest.mark.asyncio
-    async def test_download_non_200_raises(self, tmp_path: Path) -> None:
-        from agent_teams.tools.workspace_tools import ripgrep
-        from agent_teams.tools.workspace_tools.ripgrep_errors import DownloadFailedError
+    async def test_download_propagates_binary_tool_service_failure(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from relay_teams.binary_tools import BinaryToolDownloadError
+        from relay_teams.tools.workspace_tools import ripgrep
 
         target = tmp_path / "rg.exe"
-        response = MagicMock(status_code=404, content=b"")
-        client = AsyncMock()
-        client.get = AsyncMock(return_value=response)
-        client_cm = AsyncMock()
-        client_cm.__aenter__.return_value = client
-        client_cm.__aexit__.return_value = None
+        service = _FakeDownloadService(error=BinaryToolDownloadError("HTTP 404"))
 
         with patch(
-            "agent_teams.tools.workspace_tools.ripgrep.create_async_http_client",
-            return_value=client_cm,
+            "relay_teams.tools.workspace_tools.ripgrep._build_binary_tool_service",
+            return_value=service,
         ):
-            with patch(
-                "agent_teams.tools.workspace_tools.ripgrep._get_platform_key",
-                return_value="x64-windows",
-            ):
-                with pytest.raises(DownloadFailedError) as exc:
-                    await ripgrep._download_rg(target)
+            with pytest.raises(BinaryToolDownloadError):
+                await ripgrep._download_rg(target)
 
-        assert exc.value.status == 404
+        assert service.calls == [(BinaryToolId.RIPGREP, target)]
 
     def test_extract_zip_replaces_existing_target(self, tmp_path: Path) -> None:
-        from agent_teams.tools.workspace_tools import ripgrep
+        from relay_teams.tools.workspace_tools import ripgrep
 
         target = tmp_path / "rg.exe"
         target.write_bytes(b"old")
@@ -225,9 +209,20 @@ class TestRipgrepDownload:
         assert target.read_bytes() == b"new"
 
 
+class _FakeDownloadService:
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self.calls: list[tuple[BinaryToolId, Path]] = []
+        self._error = error
+
+    async def download_tool_to_path(self, tool_id: BinaryToolId, target: Path) -> None:
+        self.calls.append((tool_id, target))
+        if self._error is not None:
+            raise self._error
+
+
 class TestGrepSearch:
     def test_grep_result_parsing(self) -> None:
-        from agent_teams.tools.workspace_tools.ripgrep_types import GrepMatch
+        from relay_teams.tools.workspace_tools.ripgrep_types import GrepMatch
 
         stdout = "file1.py|1|def foo\nfile2.py|5|if a | b:\n"
         matches: list[GrepMatch] = []
@@ -302,8 +297,8 @@ class TestGrepSearch:
 class TestEnumerateFilesErrorHandling:
     @pytest.mark.asyncio
     async def test_enumerate_files_raises_on_ripgrep_error(self) -> None:
-        from agent_teams.tools.workspace_tools import ripgrep
-        from agent_teams.tools.workspace_tools.ripgrep_errors import (
+        from relay_teams.tools.workspace_tools import ripgrep
+        from relay_teams.tools.workspace_tools.ripgrep_errors import (
             RipgrepExecutionError,
         )
 
@@ -315,11 +310,11 @@ class TestEnumerateFilesErrorHandling:
         proc.returncode = 2
 
         with patch(
-            "agent_teams.tools.workspace_tools.ripgrep.get_rg_path",
+            "relay_teams.tools.workspace_tools.ripgrep.get_rg_path",
             new=AsyncMock(return_value=Path("rg")),
         ):
             with patch(
-                "agent_teams.tools.workspace_tools.ripgrep.subprocess.Popen",
+                "relay_teams.tools.workspace_tools.ripgrep.subprocess.Popen",
                 return_value=proc,
             ):
                 with pytest.raises(RipgrepExecutionError) as exc:
@@ -331,7 +326,7 @@ class TestEnumerateFilesErrorHandling:
     @pytest.mark.asyncio
     async def test_enumerate_files_no_error_on_exit_code_1(self) -> None:
         """Exit code 1 means no files matched -- not an error."""
-        from agent_teams.tools.workspace_tools import ripgrep
+        from relay_teams.tools.workspace_tools import ripgrep
 
         proc = MagicMock()
         proc.stdout = iter([])
@@ -341,11 +336,11 @@ class TestEnumerateFilesErrorHandling:
         proc.returncode = 1
 
         with patch(
-            "agent_teams.tools.workspace_tools.ripgrep.get_rg_path",
+            "relay_teams.tools.workspace_tools.ripgrep.get_rg_path",
             new=AsyncMock(return_value=Path("rg")),
         ):
             with patch(
-                "agent_teams.tools.workspace_tools.ripgrep.subprocess.Popen",
+                "relay_teams.tools.workspace_tools.ripgrep.subprocess.Popen",
                 return_value=proc,
             ):
                 files, truncated = await ripgrep.enumerate_files(Path("."), "*.py")
@@ -384,13 +379,13 @@ class TestEnumerateFiles:
 
 class TestGrepResultFormat:
     def test_format_empty(self) -> None:
-        from agent_teams.tools.workspace_tools.ripgrep_types import GrepResult
+        from relay_teams.tools.workspace_tools.ripgrep_types import GrepResult
 
         result = GrepResult(matches=[], truncated=False, total=0)
         assert result.format() == "No matches found"
 
     def test_format_with_matches(self) -> None:
-        from agent_teams.tools.workspace_tools.ripgrep_types import (
+        from relay_teams.tools.workspace_tools.ripgrep_types import (
             GrepMatch,
             GrepResult,
         )
@@ -407,7 +402,7 @@ class TestGrepResultFormat:
         assert "Line 1: def foo" in formatted
 
     def test_format_truncated(self) -> None:
-        from agent_teams.tools.workspace_tools.ripgrep_types import (
+        from relay_teams.tools.workspace_tools.ripgrep_types import (
             GrepMatch,
             GrepResult,
         )
@@ -422,7 +417,7 @@ class TestGrepResultFormat:
         assert "Results truncated" in formatted
 
     def test_format_multiple_files(self) -> None:
-        from agent_teams.tools.workspace_tools.ripgrep_types import (
+        from relay_teams.tools.workspace_tools.ripgrep_types import (
             GrepMatch,
             GrepResult,
         )
@@ -442,8 +437,8 @@ class TestGrepResultFormat:
 class TestGrepSearchErrorHandling:
     @pytest.mark.asyncio
     async def test_grep_search_raises_on_ripgrep_error(self) -> None:
-        from agent_teams.tools.workspace_tools import ripgrep
-        from agent_teams.tools.workspace_tools.ripgrep_errors import (
+        from relay_teams.tools.workspace_tools import ripgrep
+        from relay_teams.tools.workspace_tools.ripgrep_errors import (
             RipgrepExecutionError,
         )
 
@@ -453,11 +448,11 @@ class TestGrepSearchErrorHandling:
             returncode=2,
         )
         with patch(
-            "agent_teams.tools.workspace_tools.ripgrep.get_rg_path",
+            "relay_teams.tools.workspace_tools.ripgrep.get_rg_path",
             new=AsyncMock(return_value=Path("rg")),
         ):
             with patch(
-                "agent_teams.tools.workspace_tools.ripgrep.subprocess.run",
+                "relay_teams.tools.workspace_tools.ripgrep.subprocess.run",
                 return_value=mock_result,
             ):
                 with pytest.raises(RipgrepExecutionError) as exc:
@@ -469,15 +464,15 @@ class TestGrepSearchErrorHandling:
     @pytest.mark.asyncio
     async def test_grep_search_returns_empty_on_exit_code_1(self) -> None:
         """Exit code 1 means no matches -- not an error."""
-        from agent_teams.tools.workspace_tools import ripgrep
+        from relay_teams.tools.workspace_tools import ripgrep
 
         mock_result = MagicMock(stdout="", stderr="", returncode=1)
         with patch(
-            "agent_teams.tools.workspace_tools.ripgrep.get_rg_path",
+            "relay_teams.tools.workspace_tools.ripgrep.get_rg_path",
             new=AsyncMock(return_value=Path("rg")),
         ):
             with patch(
-                "agent_teams.tools.workspace_tools.ripgrep.subprocess.run",
+                "relay_teams.tools.workspace_tools.ripgrep.subprocess.run",
                 return_value=mock_result,
             ):
                 result = await ripgrep.grep_search(Path("."), "pattern")
@@ -488,15 +483,15 @@ class TestGrepSearchErrorHandling:
 class TestRipgrepSubprocessEncoding:
     @pytest.mark.asyncio
     async def test_grep_search_uses_utf8_replace(self) -> None:
-        from agent_teams.tools.workspace_tools import ripgrep
+        from relay_teams.tools.workspace_tools import ripgrep
 
         mock_result = MagicMock(stdout="", returncode=0)
         with patch(
-            "agent_teams.tools.workspace_tools.ripgrep.get_rg_path",
+            "relay_teams.tools.workspace_tools.ripgrep.get_rg_path",
             new=AsyncMock(return_value=Path("rg.exe")),
         ):
             with patch(
-                "agent_teams.tools.workspace_tools.ripgrep.subprocess.run",
+                "relay_teams.tools.workspace_tools.ripgrep.subprocess.run",
                 return_value=mock_result,
             ) as mock_run:
                 await ripgrep.grep_search(Path("."), "tasks")
@@ -508,7 +503,7 @@ class TestRipgrepSubprocessEncoding:
 
     @pytest.mark.asyncio
     async def test_enumerate_files_uses_utf8_replace(self) -> None:
-        from agent_teams.tools.workspace_tools import ripgrep
+        from relay_teams.tools.workspace_tools import ripgrep
 
         proc = MagicMock()
         proc.stdout = ["a.py\n", "b.py\n"]
@@ -516,11 +511,11 @@ class TestRipgrepSubprocessEncoding:
         proc.returncode = 0
 
         with patch(
-            "agent_teams.tools.workspace_tools.ripgrep.get_rg_path",
+            "relay_teams.tools.workspace_tools.ripgrep.get_rg_path",
             new=AsyncMock(return_value=Path("rg.exe")),
         ):
             with patch(
-                "agent_teams.tools.workspace_tools.ripgrep.subprocess.Popen",
+                "relay_teams.tools.workspace_tools.ripgrep.subprocess.Popen",
                 return_value=proc,
             ) as mock_popen:
                 files, truncated = await ripgrep.enumerate_files(Path("."), "*.py")
@@ -534,7 +529,7 @@ class TestRipgrepSubprocessEncoding:
 
 
 def test_project_glob_result_keeps_output_first_shape() -> None:
-    from agent_teams.tools.workspace_tools.glob import _project_glob_result
+    from relay_teams.tools.workspace_tools.glob import _project_glob_result
 
     projected = _project_glob_result(
         output="a.py\nb.py",
@@ -555,7 +550,7 @@ def test_project_glob_result_keeps_output_first_shape() -> None:
 
 
 def test_project_grep_result_keeps_output_first_shape() -> None:
-    from agent_teams.tools.workspace_tools.grep import _project_grep_result
+    from relay_teams.tools.workspace_tools.grep import _project_grep_result
 
     projected = _project_grep_result(
         output="Found 2 matches",

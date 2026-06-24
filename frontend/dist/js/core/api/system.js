@@ -2,14 +2,84 @@
  * core/api/system.js
  * System configuration related API wrappers.
  */
-import { requestJson } from './request.js';
+import { invalidateManagedRequests, requestJson, requestJsonManaged } from './request.js';
 
-export async function fetchConfigStatus() {
-    return requestJson('/api/system/configs', undefined, 'Failed to fetch config status');
+function invalidateRoleOptionDependencies() {
+    invalidateManagedRequests('roles:');
+}
+
+export async function fetchConfigStatus(options = {}) {
+    return requestJson('/api/system/configs', { signal: options.signal }, 'Failed to fetch config status');
+}
+
+export async function fetchSshProfiles() {
+    return requestJson(
+        '/api/system/configs/workspace/ssh-profiles',
+        undefined,
+        'Failed to fetch SSH profiles',
+    );
+}
+
+export async function saveSshProfile(sshProfileId, config) {
+    return requestJson(
+        `/api/system/configs/workspace/ssh-profiles/${encodeURIComponent(sshProfileId)}`,
+        {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ config }),
+        },
+        'Failed to save SSH profile',
+    );
+}
+
+export async function revealSshProfilePassword(sshProfileId) {
+    return requestJson(
+        `/api/system/configs/workspace/ssh-profiles/${encodeURIComponent(sshProfileId)}:reveal-password`,
+        { method: 'POST' },
+        'Failed to reveal SSH profile password',
+    );
+}
+
+export async function probeSshProfileConnection(payload) {
+    return requestJson(
+        '/api/system/configs/workspace/ssh-profiles:probe',
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        'Failed to test SSH profile',
+    );
+}
+
+export async function deleteSshProfile(sshProfileId) {
+    return requestJson(
+        `/api/system/configs/workspace/ssh-profiles/${encodeURIComponent(sshProfileId)}`,
+        {
+            method: 'DELETE',
+        },
+        'Failed to delete SSH profile',
+    );
 }
 
 export async function fetchUiLanguageSettings() {
     return requestJson('/api/system/configs/ui-language', undefined, 'Failed to fetch UI language');
+}
+
+export async function fetchGeneralConfig() {
+    return requestJson('/api/system/configs/general', undefined, 'Failed to fetch general config');
+}
+
+export async function saveGeneralConfig(config) {
+    return requestJson(
+        '/api/system/configs/general',
+        {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ config }),
+        },
+        'Failed to save general config',
+    );
 }
 
 export async function saveUiLanguageSettings(payload) {
@@ -29,6 +99,257 @@ export async function fetchEnvironmentVariables() {
         '/api/system/configs/environment-variables',
         undefined,
         'Failed to fetch environment variables',
+    );
+}
+
+export async function fetchHookRuntimeView() {
+    return requestJson(
+        '/api/system/configs/hooks/runtime',
+        undefined,
+        'Failed to fetch loaded hooks',
+    );
+}
+
+export async function fetchHooksConfig() {
+    return requestJson(
+        '/api/system/configs/hooks',
+        undefined,
+        'Failed to fetch hooks config',
+    );
+}
+
+export async function saveHooksConfig(payload) {
+    return requestJson(
+        '/api/system/configs/hooks',
+        {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        'Failed to save hooks config',
+    );
+}
+
+export async function validateHooksConfig(payload) {
+    return requestJson(
+        '/api/system/configs/hooks:validate',
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        'Failed to validate hooks config',
+    );
+}
+
+export async function fetchPluginsConfig() {
+    return requestJson(
+        '/api/system/configs/plugins',
+        undefined,
+        'Failed to fetch plugins config',
+    );
+}
+
+export async function fetchPluginsRuntime() {
+    return requestJson(
+        '/api/system/configs/plugins/runtime',
+        undefined,
+        'Failed to fetch plugins runtime',
+    );
+}
+
+export async function validatePlugin(path) {
+    return requestJson(
+        '/api/system/configs/plugins:validate',
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path }),
+        },
+        'Failed to validate plugin',
+    );
+}
+
+export async function fetchPluginMarketplace(marketplace, options = {}) {
+    return requestJson(
+        '/api/system/configs/plugins/marketplace',
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ marketplace, ...options }),
+        },
+        'Failed to fetch plugin marketplace',
+    );
+}
+
+export async function searchPluginMarketplace(marketplace, query, options = {}) {
+    return requestJson(
+        '/api/system/configs/plugins/marketplace:search',
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ marketplace, query, ...options }),
+        },
+        'Failed to search plugin marketplace',
+    );
+}
+
+export async function inspectPluginMarketplace(marketplace, options = {}) {
+    return requestJson(
+        '/api/system/configs/plugins/marketplace:inspect',
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ marketplace, ...options }),
+        },
+        'Failed to inspect plugin marketplace',
+    );
+}
+
+export async function installPlugin(payload) {
+    const result = await requestJson(
+        '/api/system/configs/plugins:install',
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        'Failed to install plugin',
+    );
+    invalidateRoleOptionDependencies();
+    return result;
+}
+
+export async function configurePlugin(name, payload) {
+    const result = await requestJson(
+        `/api/system/configs/plugins/${encodeURIComponent(name)}:configure`,
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        `Failed to configure plugin ${name}`,
+    );
+    invalidateRoleOptionDependencies();
+    return result;
+}
+
+export async function enablePlugin(name, scope) {
+    const result = await requestJson(
+        `/api/system/configs/plugins/${encodeURIComponent(name)}:enable`,
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ scope }),
+        },
+        `Failed to enable plugin ${name}`,
+    );
+    invalidateRoleOptionDependencies();
+    return result;
+}
+
+export async function disablePlugin(name, scope) {
+    const result = await requestJson(
+        `/api/system/configs/plugins/${encodeURIComponent(name)}:disable`,
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ scope }),
+        },
+        `Failed to disable plugin ${name}`,
+    );
+    invalidateRoleOptionDependencies();
+    return result;
+}
+
+export async function updatePlugin(name, payload) {
+    const result = await requestJson(
+        `/api/system/configs/plugins/${encodeURIComponent(name)}:update`,
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        `Failed to update plugin ${name}`,
+    );
+    invalidateRoleOptionDependencies();
+    return result;
+}
+
+export async function deletePlugin(name, scope, prune = false) {
+    const query = new URLSearchParams({
+        scope: String(scope || ''),
+        prune: prune ? 'true' : 'false',
+    });
+    const result = await requestJson(
+        `/api/system/configs/plugins/${encodeURIComponent(name)}?${query.toString()}`,
+        { method: 'DELETE' },
+        `Failed to delete plugin ${name}`,
+    );
+    invalidateRoleOptionDependencies();
+    return result;
+}
+
+export async function fetchCommands(workspaceId) {
+    const safeWorkspaceId = encodeURIComponent(String(workspaceId || '').trim());
+    return requestJson(
+        `/api/system/commands?workspace_id=${safeWorkspaceId}`,
+        undefined,
+        'Failed to fetch commands',
+    );
+}
+
+export async function fetchCommandCatalog() {
+    return requestJson(
+        '/api/system/commands:catalog',
+        undefined,
+        'Failed to fetch command catalog',
+    );
+}
+
+export async function createCommand(payload) {
+    return requestJson(
+        '/api/system/commands',
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        'Failed to create command',
+    );
+}
+
+export async function updateCommand(payload) {
+    return requestJson(
+        '/api/system/commands',
+        {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        'Failed to update command',
+    );
+}
+
+export async function fetchCommand(name, workspaceId) {
+    const safeName = encodeURIComponent(String(name || '').trim());
+    const safeWorkspaceId = encodeURIComponent(String(workspaceId || '').trim());
+    return requestJson(
+        `/api/system/commands/${safeName}?workspace_id=${safeWorkspaceId}`,
+        undefined,
+        'Failed to fetch command',
+    );
+}
+
+export async function resolveCommandPrompt(payload) {
+    return requestJson(
+        '/api/system/commands:resolve',
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        'Failed to resolve command',
     );
 }
 
@@ -56,43 +377,94 @@ export async function fetchProxyConfig() {
     return requestJson('/api/system/configs/proxy', undefined, 'Failed to fetch proxy config');
 }
 
-export async function fetchExternalAgents() {
-    return requestJson('/api/system/configs/agents', undefined, 'Failed to fetch agents');
+export async function fetchAgentRuntimes() {
+    return requestJson('/api/system/configs/agent-runtimes', undefined, 'Failed to fetch agent runtimes');
 }
 
-export async function fetchExternalAgent(agentId) {
+export async function fetchAgentRuntimeRegistry(refresh = false) {
+    const suffix = refresh ? '?refresh=true' : '';
     return requestJson(
-        `/api/system/configs/agents/${encodeURIComponent(agentId)}`,
+        `/api/system/configs/agent-runtime-registry${suffix}`,
         undefined,
-        'Failed to fetch agent config',
+        'Failed to fetch ACP registry',
     );
 }
 
-export async function saveExternalAgent(agentId, payload) {
+export async function refreshAgentRuntimeRegistry() {
     return requestJson(
-        `/api/system/configs/agents/${encodeURIComponent(agentId)}`,
+        '/api/system/configs/agent-runtime-registry:refresh',
+        { method: 'POST' },
+        'Failed to refresh ACP registry',
+    );
+}
+
+export async function installAgentRuntimeFromRegistry(registryId, payload = {}) {
+    const result = await requestJson(
+        `/api/system/configs/agent-runtime-registry/${encodeURIComponent(registryId)}:install`,
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        'Failed to install ACP registry runtime',
+    );
+    invalidateRoleOptionDependencies();
+    return result;
+}
+
+export async function fetchAgentRuntime(agentId) {
+    return requestJson(
+        `/api/system/configs/agent-runtimes/${encodeURIComponent(agentId)}`,
+        undefined,
+        'Failed to fetch agent runtime config',
+    );
+}
+
+export async function saveAgentRuntime(agentId, payload) {
+    const result = await requestJson(
+        `/api/system/configs/agent-runtimes/${encodeURIComponent(agentId)}`,
         {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload),
         },
-        'Failed to save agent config',
+        'Failed to save agent runtime config',
     );
+    invalidateRoleOptionDependencies();
+    return result;
 }
 
-export async function deleteExternalAgent(agentId) {
-    return requestJson(
-        `/api/system/configs/agents/${encodeURIComponent(agentId)}`,
+export async function deleteAgentRuntime(agentId) {
+    const result = await requestJson(
+        `/api/system/configs/agent-runtimes/${encodeURIComponent(agentId)}`,
         { method: 'DELETE' },
-        'Failed to delete agent config',
+        'Failed to delete agent runtime config',
+    );
+    invalidateRoleOptionDependencies();
+    return result;
+}
+
+export async function testAgentRuntime(agentId) {
+    return requestJson(
+        `/api/system/configs/agent-runtimes/${encodeURIComponent(agentId)}:test`,
+        { method: 'POST' },
+        'Failed to test agent runtime config',
     );
 }
 
-export async function testExternalAgent(agentId) {
+export async function startAgentRuntimeTestJob(agentId) {
     return requestJson(
-        `/api/system/configs/agents/${encodeURIComponent(agentId)}:test`,
+        `/api/system/configs/agent-runtimes/${encodeURIComponent(agentId)}:test-job`,
         { method: 'POST' },
-        'Failed to test agent config',
+        'Failed to start agent runtime test',
+    );
+}
+
+export async function fetchAgentRuntimeTestJob(jobId) {
+    return requestJson(
+        `/api/system/configs/agent-runtime-test-jobs/${encodeURIComponent(jobId)}`,
+        undefined,
+        'Failed to fetch agent runtime test progress',
     );
 }
 
@@ -104,6 +476,166 @@ export async function fetchGitHubConfig() {
     return requestJson('/api/system/configs/github', undefined, 'Failed to fetch GitHub config');
 }
 
+export async function revealGitHubToken() {
+    return requestJson(
+        '/api/system/configs/github:reveal',
+        { method: 'POST' },
+        'Failed to reveal GitHub token',
+    );
+}
+
+export async function fetchGitHubWebhookTunnelStatus() {
+    return requestJson(
+        '/api/system/configs/github/webhook/tunnel',
+        undefined,
+        'Failed to fetch GitHub webhook tunnel status',
+    );
+}
+
+export async function fetchClawHubConfig() {
+    return requestJson('/api/system/configs/clawhub', undefined, 'Failed to fetch ClawHub config');
+}
+
+export async function saveClawHubConfig(config) {
+    return requestJson(
+        '/api/system/configs/clawhub',
+        {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(config),
+        },
+        'Failed to save ClawHub config',
+    );
+}
+
+export async function fetchClawHubSkills() {
+    return requestJson('/api/system/configs/clawhub/skills', undefined, 'Failed to fetch ClawHub skills');
+}
+
+export async function fetchClawHubSkillMarket(options = {}) {
+    const params = new URLSearchParams();
+    const limit = Number(options.limit || 24);
+    if (Number.isFinite(limit) && limit > 0) {
+        params.set('limit', String(Math.floor(limit)));
+    }
+    const cursor = String(options.cursor || '').trim();
+    if (cursor) {
+        params.set('cursor', cursor);
+    }
+    const sort = String(options.sort || 'popular').trim();
+    if (sort) {
+        params.set('sort', sort);
+    }
+    return requestJson(
+        `/api/system/skills/market/clawhub?${params.toString()}`,
+        { signal: options.signal },
+        'Failed to fetch ClawHub skill market',
+    );
+}
+
+export async function searchClawHubSkillMarket(query, options = {}) {
+    const params = new URLSearchParams();
+    params.set('query', String(query || '').trim());
+    const limit = Number(options.limit || 20);
+    if (Number.isFinite(limit) && limit > 0) {
+        params.set('limit', String(Math.floor(limit)));
+    }
+    return requestJson(
+        `/api/system/skills/market/clawhub/search?${params.toString()}`,
+        { signal: options.signal },
+        'Failed to search ClawHub skills',
+    );
+}
+
+export async function fetchClawHubSkillMarketDetail(slug, options = {}) {
+    const normalizedSlug = String(slug || '').trim();
+    const params = new URLSearchParams();
+    const version = String(options.version || '').trim();
+    if (version) {
+        params.set('version', version);
+    }
+    const query = params.toString();
+    return requestJson(
+        `/api/system/skills/market/clawhub/${encodeURIComponent(normalizedSlug)}${query ? `?${query}` : ''}`,
+        { signal: options.signal },
+        'Failed to fetch ClawHub skill detail',
+    );
+}
+
+export async function installClawHubMarketSkill(payload) {
+    const result = await requestJson(
+        '/api/system/skills/market/clawhub/install',
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        'Failed to install ClawHub skill',
+    );
+    invalidateRoleOptionDependencies();
+    return result;
+}
+
+export async function uninstallClawHubMarketSkill(slug) {
+    const result = await requestJson(
+        `/api/system/skills/market/clawhub/${encodeURIComponent(String(slug || '').trim())}`,
+        { method: 'DELETE' },
+        'Failed to uninstall ClawHub skill',
+    );
+    invalidateRoleOptionDependencies();
+    return result;
+}
+
+export async function fetchRuntimeSkillDetail(skillRef) {
+    return requestJson(
+        `/api/system/skills/${encodeURIComponent(String(skillRef || '').trim())}`,
+        undefined,
+        'Failed to fetch skill detail',
+    );
+}
+
+export async function uninstallRuntimeSkill(skillRef) {
+    const result = await requestJson(
+        `/api/system/skills/${encodeURIComponent(String(skillRef || '').trim())}`,
+        { method: 'DELETE' },
+        'Failed to uninstall skill',
+    );
+    invalidateRoleOptionDependencies();
+    return result;
+}
+
+export async function fetchClawHubSkill(skillId) {
+    return requestJson(
+        `/api/system/configs/clawhub/skills/${encodeURIComponent(skillId)}`,
+        undefined,
+        'Failed to fetch ClawHub skill',
+    );
+}
+
+export async function saveClawHubSkill(skillId, payload) {
+    const result = await requestJson(
+        `/api/system/configs/clawhub/skills/${encodeURIComponent(skillId)}`,
+        {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        'Failed to save ClawHub skill',
+    );
+    invalidateRoleOptionDependencies();
+    return result;
+}
+
+export async function deleteClawHubSkill(skillId) {
+    const result = await requestJson(
+        `/api/system/configs/clawhub/skills/${encodeURIComponent(skillId)}`,
+        { method: 'DELETE' },
+        'Failed to delete ClawHub skill',
+    );
+    invalidateRoleOptionDependencies();
+    return result;
+}
+
 export async function fetchSystemHealth() {
     return requestJson('/api/system/health', undefined, 'Failed to fetch system health');
 }
@@ -113,13 +645,67 @@ export async function fetchModelConfig() {
 }
 
 export async function fetchModelProfiles(options = {}) {
-    return requestJson(
+    return requestJsonManaged(
+        'system:model-profiles',
         '/api/system/configs/model/profiles',
         {
             signal: options.signal,
         },
         'Failed to fetch model profiles',
+        { ttlMs: 10000 },
     );
+}
+
+export async function fetchModelFallbackConfig() {
+    return requestJson(
+        '/api/system/configs/model-fallback',
+        undefined,
+        'Failed to fetch model fallback config',
+    );
+}
+
+export async function fetchSpeechConfig() {
+    return requestJson('/api/speech/config', undefined, 'Failed to fetch speech config');
+}
+
+export async function saveSpeechConfig(config) {
+    return requestJson(
+        '/api/speech/config',
+        {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(config),
+        },
+        'Failed to save speech config',
+    );
+}
+
+export function createSpeechSttWebSocketUrl() {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${protocol}//${window.location.host}/api/speech/stt/stream`;
+}
+
+export async function fetchModelCatalog(options = {}) {
+    const refresh = options.refresh === true ? '?refresh=true' : '';
+    return requestJsonManaged(
+        `system:model-catalog:${options.refresh === true ? 'refresh' : 'cached'}`,
+        `/api/system/configs/model/catalog${refresh}`,
+        {
+            signal: options.signal,
+        },
+        'Failed to fetch model catalog',
+        { ttlMs: options.refresh === true ? 0 : 3000, lane: 'heavy' },
+    );
+}
+
+export async function refreshModelCatalog() {
+    const result = await requestJson(
+        '/api/system/configs/model/catalog:refresh',
+        { method: 'POST' },
+        'Failed to refresh model catalog',
+    );
+    invalidateManagedRequests('system:model-catalog:');
+    return result;
 }
 
 export async function probeModelConnection(payload) {
@@ -146,8 +732,40 @@ export async function discoverModelCatalog(payload) {
     );
 }
 
-export async function saveModelProfile(name, profile) {
+export async function startCodeAgentOAuth(payload) {
     return requestJson(
+        '/api/system/configs/model/codeagent/oauth:start',
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        'Failed to start CodeAgent SSO',
+    );
+}
+
+export async function fetchCodeAgentOAuthSession(authSessionId) {
+    return requestJson(
+        `/api/system/configs/model/codeagent/oauth/${encodeURIComponent(authSessionId)}`,
+        undefined,
+        'Failed to fetch CodeAgent SSO status',
+    );
+}
+
+export async function verifyCodeAgentAuth(profileName) {
+    return requestJson(
+        '/api/system/configs/model/codeagent/auth:verify',
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ profile_name: profileName }),
+        },
+        'Failed to verify CodeAgent auth status',
+    );
+}
+
+export async function saveModelProfile(name, profile) {
+    const result = await requestJson(
         `/api/system/configs/model/profiles/${name}`,
         {
             method: 'PUT',
@@ -156,18 +774,24 @@ export async function saveModelProfile(name, profile) {
         },
         'Failed to save model profile',
     );
+    invalidateManagedRequests('system:model-profiles');
+    invalidateRoleOptionDependencies();
+    return result;
 }
 
 export async function deleteModelProfile(name) {
-    return requestJson(
+    const result = await requestJson(
         `/api/system/configs/model/profiles/${name}`,
         { method: 'DELETE' },
         'Failed to delete model profile',
     );
+    invalidateManagedRequests('system:model-profiles');
+    invalidateRoleOptionDependencies();
+    return result;
 }
 
 export async function saveModelConfig(config) {
-    return requestJson(
+    const result = await requestJson(
         '/api/system/configs/model',
         {
             method: 'PUT',
@@ -176,6 +800,8 @@ export async function saveModelConfig(config) {
         },
         'Failed to save model config',
     );
+    invalidateManagedRequests('system:model-');
+    return result;
 }
 
 export async function reloadModelConfig() {
@@ -231,11 +857,85 @@ export async function saveGitHubConfig(config) {
 }
 
 export async function reloadMcpConfig() {
-    return requestJson(
+    const result = await requestJson(
         '/api/system/configs/mcp:reload',
         { method: 'POST' },
         'Failed to reload MCP config',
     );
+    invalidateRoleOptionDependencies();
+    return result;
+}
+
+export async function fetchMcpServers() {
+    return requestJson('/api/mcp/servers', undefined, 'Failed to fetch MCP servers');
+}
+
+export async function addMcpServer(payload) {
+    const result = await requestJson(
+        '/api/mcp/servers',
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        'Failed to add MCP server',
+    );
+    invalidateRoleOptionDependencies();
+    return result;
+}
+
+export async function fetchMcpServer(serverName) {
+    return requestJson(
+        `/api/mcp/servers/${encodeURIComponent(serverName)}`,
+        undefined,
+        `Failed to fetch MCP server ${serverName}`,
+    );
+}
+
+export async function updateMcpServer(serverName, payload) {
+    const result = await requestJson(
+        `/api/mcp/servers/${encodeURIComponent(serverName)}`,
+        {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        `Failed to update MCP server ${serverName}`,
+    );
+    invalidateRoleOptionDependencies();
+    return result;
+}
+
+export async function deleteMcpServer(serverName) {
+    const result = await requestJson(
+        `/api/mcp/servers/${encodeURIComponent(serverName)}`,
+        { method: 'DELETE' },
+        `Failed to delete MCP server ${serverName}`,
+    );
+    invalidateRoleOptionDependencies();
+    return result;
+}
+
+export async function testMcpServerConnection(serverName) {
+    return requestJson(
+        `/api/mcp/servers/${encodeURIComponent(serverName)}/test`,
+        { method: 'POST' },
+        `Failed to test MCP server ${serverName}`,
+    );
+}
+
+export async function setMcpServerEnabled(serverName, enabled) {
+    const result = await requestJson(
+        `/api/mcp/servers/${encodeURIComponent(serverName)}/enabled`,
+        {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled }),
+        },
+        `Failed to update MCP server ${serverName}`,
+    );
+    invalidateRoleOptionDependencies();
+    return result;
 }
 
 export async function fetchMcpServerTools(serverName) {
@@ -246,20 +946,36 @@ export async function fetchMcpServerTools(serverName) {
     );
 }
 
-export async function reloadSkillsConfig() {
+export async function refreshMcpServerTools(serverName) {
     return requestJson(
+        `/api/mcp/servers/${encodeURIComponent(serverName)}/tools:refresh`,
+        { method: 'POST' },
+        `Failed to refresh MCP tools for ${serverName}`,
+    );
+}
+
+export async function reloadSkillsConfig() {
+    const result = await requestJson(
         '/api/system/configs/skills:reload',
         { method: 'POST' },
         'Failed to reload skills config',
     );
+    invalidateRoleOptionDependencies();
+    return result;
 }
 
 export async function fetchNotificationConfig() {
     return requestJson('/api/system/configs/notifications', undefined, 'Failed to fetch notification config');
 }
 
-export async function fetchOrchestrationConfig() {
-    return requestJson('/api/system/configs/orchestration', undefined, 'Failed to fetch orchestration config');
+export async function fetchOrchestrationConfig(options = {}) {
+    return requestJsonManaged(
+        'system:orchestration-config',
+        '/api/system/configs/orchestration',
+        { signal: options.signal },
+        'Failed to fetch orchestration config',
+        { ttlMs: 30000 },
+    );
 }
 
 export async function saveNotificationConfig(config) {
@@ -275,7 +991,7 @@ export async function saveNotificationConfig(config) {
 }
 
 export async function saveOrchestrationConfig(config) {
-    return requestJson(
+    const result = await requestJson(
         '/api/system/configs/orchestration',
         {
             method: 'PUT',
@@ -284,6 +1000,8 @@ export async function saveOrchestrationConfig(config) {
         },
         'Failed to save orchestration config',
     );
+    invalidateManagedRequests('system:orchestration-config');
+    return result;
 }
 
 export async function probeWebConnectivity(payload) {
@@ -307,5 +1025,53 @@ export async function probeGitHubConnectivity(payload) {
             body: JSON.stringify(payload),
         },
         'Failed to probe GitHub connectivity',
+    );
+}
+
+export async function probeGitHubWebhookConnectivity(payload) {
+    return requestJson(
+        '/api/system/configs/github/webhook:probe',
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        'Failed to probe GitHub webhook connectivity',
+    );
+}
+
+export async function startGitHubWebhookTunnel(payload = {}) {
+    return requestJson(
+        '/api/system/configs/github/webhook/tunnel:start',
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        'Failed to start GitHub webhook tunnel',
+    );
+}
+
+export async function stopGitHubWebhookTunnel(payload = {}) {
+    return requestJson(
+        '/api/system/configs/github/webhook/tunnel:stop',
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        'Failed to stop GitHub webhook tunnel',
+    );
+}
+
+export async function probeClawHubConnectivity(payload) {
+    return requestJson(
+        '/api/system/configs/clawhub:probe',
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        },
+        'Failed to probe ClawHub connectivity',
     );
 }

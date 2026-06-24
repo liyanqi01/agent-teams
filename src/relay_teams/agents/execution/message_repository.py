@@ -1,0 +1,2373 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import asyncio
+
+from pydantic import JsonValue
+
+import json
+import logging
+import sqlite3
+from collections.abc import Sequence
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import aiosqlite
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelResponse,
+    RetryPromptPart,
+    SystemPromptPart,
+    ToolCallPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
+
+from relay_teams.persistence.db import run_sqlite_write_with_retry
+from relay_teams.persistence.sqlite_repository import (
+    SharedSqliteRepository,
+    async_fetchall,
+    async_fetchone,
+)
+from relay_teams.agents.execution.tool_args_repair import repair_tool_args
+from relay_teams.agents.execution.tool_call_history import (
+    collect_safe_row_ids,
+    normalize_replayed_messages_to_safe_boundary,
+)
+from relay_teams.media import (
+    UserPromptContent,
+    user_prompt_content_key,
+    user_prompt_content_to_text,
+)
+from relay_teams.agents.tasks.task_status_sanitizer import sanitize_task_status_payload
+from relay_teams.sessions.session_history_marker_models import SessionHistoryMarkerType
+from relay_teams.sessions.session_history_marker_repository import (
+    SessionHistoryMarkerRepository,
+)
+from relay_teams.logger import get_logger, log_event
+from relay_teams.reminders.text import is_rendered_system_reminder_text
+
+_SQLITE_SAFE_VARIABLE_LIMIT = 900
+
+
+LOGGER = get_logger(__name__)
+
+
+class MessageRepository(SharedSqliteRepository):
+    """Persists conversation-safe LLM message history."""
+
+    def __init__(
+        self,
+        db_path: Path,
+        *,
+        session_history_marker_repo: SessionHistoryMarkerRepository | None = None,
+    ) -> None:
+        super().__init__(db_path)
+        self._session_history_marker_repo = session_history_marker_repo
+        self._latest_created_at_by_session: dict[str, datetime] = {}
+        self._init_tables()
+
+    def _init_tables(self) -> None:
+        def operation() -> None:
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS messages (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id      TEXT NOT NULL DEFAULT '',
+                    workspace_id    TEXT NOT NULL DEFAULT '',
+                    conversation_id TEXT NOT NULL DEFAULT '',
+                    agent_role_id   TEXT NOT NULL DEFAULT '',
+                    instance_id     TEXT NOT NULL,
+                    task_id         TEXT NOT NULL,
+                    trace_id        TEXT NOT NULL,
+                    role            TEXT NOT NULL,
+                    message_json    TEXT NOT NULL,
+                    created_at      TEXT NOT NULL,
+                    hidden_from_context INTEGER NOT NULL DEFAULT 0,
+                    hidden_reason   TEXT NOT NULL DEFAULT '',
+                    hidden_at       TEXT NOT NULL DEFAULT '',
+                    hidden_marker_id TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            columns = [
+                str(row["name"])
+                for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
+            ]
+            if "session_id" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE messages ADD COLUMN session_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "workspace_id" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE messages ADD COLUMN workspace_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "conversation_id" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE messages ADD COLUMN conversation_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "agent_role_id" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE messages ADD COLUMN agent_role_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "hidden_from_context" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE messages ADD COLUMN hidden_from_context INTEGER NOT NULL DEFAULT 0"
+                )
+            if "hidden_reason" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE messages ADD COLUMN hidden_reason TEXT NOT NULL DEFAULT ''"
+                )
+            if "hidden_at" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE messages ADD COLUMN hidden_at TEXT NOT NULL DEFAULT ''"
+                )
+            if "hidden_marker_id" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE messages ADD COLUMN hidden_marker_id TEXT NOT NULL DEFAULT ''"
+                )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_session_role_id ON messages(session_id, role, id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_session_trace_id ON messages(session_id, trace_id, id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_instance ON messages(instance_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_conversation_visibility ON messages(conversation_id, hidden_from_context, created_at)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_task ON messages(task_id)"
+            )
+
+        run_sqlite_write_with_retry(
+            conn=self._conn,
+            db_path=self._db_path,
+            operation=operation,
+            lock=self._lock,
+            repository_name="MessageRepository",
+            operation_name="init_tables",
+        )
+
+    def append(
+        self,
+        *,
+        session_id: str,
+        instance_id: str,
+        task_id: str,
+        trace_id: str,
+        messages: Sequence[ModelMessage],
+        workspace_id: str,
+        conversation_id: str | None = None,
+        agent_role_id: str | None = None,
+    ) -> None:
+        if not messages:
+            return
+        resolved_conversation_id = conversation_id or instance_id
+        run_sqlite_write_with_retry(
+            conn=self._conn,
+            db_path=self._db_path,
+            operation=lambda: self._append_rows(
+                session_id=session_id,
+                workspace_id=workspace_id,
+                resolved_conversation_id=resolved_conversation_id,
+                agent_role_id=agent_role_id or "",
+                instance_id=instance_id,
+                task_id=task_id,
+                trace_id=trace_id,
+                messages=messages,
+            ),
+            lock=self._lock,
+            repository_name="MessageRepository",
+            operation_name="append",
+        )
+
+    async def append_async(
+        self,
+        *,
+        session_id: str,
+        instance_id: str,
+        task_id: str,
+        trace_id: str,
+        messages: Sequence[ModelMessage],
+        workspace_id: str,
+        conversation_id: str | None = None,
+        agent_role_id: str | None = None,
+    ) -> None:
+        if not messages:
+            return
+        resolved_conversation_id = conversation_id or instance_id
+
+        async def operation(conn: aiosqlite.Connection) -> None:
+            await self._append_rows_async(
+                conn=conn,
+                session_id=session_id,
+                workspace_id=workspace_id,
+                resolved_conversation_id=resolved_conversation_id,
+                agent_role_id=agent_role_id or "",
+                instance_id=instance_id,
+                task_id=task_id,
+                trace_id=trace_id,
+                messages=messages,
+            )
+
+        await self._run_async_write(
+            operation_name="append_async",
+            operation=operation,
+        )
+
+    def get_history(self, instance_id: str) -> list[ModelMessage]:
+        return self._read_history(
+            "SELECT id, session_id, message_json, created_at, hidden_from_context FROM messages WHERE instance_id=? ORDER BY id ASC",
+            (instance_id,),
+        )
+
+    async def get_history_async(self, instance_id: str) -> list[ModelMessage]:
+        return await self._read_history_async(
+            "SELECT id, session_id, message_json, created_at, hidden_from_context FROM messages WHERE instance_id=? ORDER BY id ASC",
+            (instance_id,),
+        )
+
+    def get_history_for_conversation(self, conversation_id: str) -> list[ModelMessage]:
+        return self._read_history(
+            "SELECT id, session_id, message_json, created_at, hidden_from_context FROM messages WHERE conversation_id=? ORDER BY id ASC",
+            (conversation_id,),
+        )
+
+    async def get_history_for_conversation_async(
+        self, conversation_id: str
+    ) -> list[ModelMessage]:
+        return await self._read_history_async(
+            "SELECT id, session_id, message_json, created_at, hidden_from_context FROM messages WHERE conversation_id=? ORDER BY id ASC",
+            (conversation_id,),
+        )
+
+    def get_messages_by_session(
+        self,
+        session_id: str,
+        *,
+        include_cleared: bool = False,
+        include_hidden_from_context: bool = False,
+    ) -> list[dict[str, JsonValue]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, session_id, conversation_id, agent_role_id, instance_id, task_id, trace_id, role, message_json, created_at, hidden_from_context, hidden_reason, hidden_at, hidden_marker_id "
+                "FROM messages WHERE session_id=? ORDER BY id ASC",
+                (session_id,),
+            ).fetchall()
+        rows = self._filter_rows_for_read(
+            rows,
+            include_cleared=include_cleared,
+            include_hidden_from_context=include_hidden_from_context,
+        )
+        if not include_hidden_from_context:
+            rows = _truncate_message_rows_to_safe_boundary(rows)
+
+        results: list[dict[str, JsonValue]] = []
+        for row in rows:
+            msg_list = _load_message_list(str(row["message_json"]))
+            msg = msg_list[0] if msg_list and isinstance(msg_list[0], dict) else {}
+            if _is_system_reminder_projection_message(msg):
+                continue
+            results.append(
+                {
+                    "conversation_id": str(row["conversation_id"] or ""),
+                    "agent_role_id": str(row["agent_role_id"] or ""),
+                    "instance_id": str(row["instance_id"]),
+                    "task_id": str(row["task_id"]),
+                    "trace_id": str(row["trace_id"]),
+                    "role": str(row["role"]),
+                    "created_at": str(row["created_at"]),
+                    "hidden_from_context": bool(int(row["hidden_from_context"] or 0)),
+                    "hidden_reason": str(row["hidden_reason"] or ""),
+                    "hidden_at": str(row["hidden_at"] or ""),
+                    "hidden_marker_id": str(row["hidden_marker_id"] or ""),
+                    "message": msg,
+                }
+            )
+        return _dedupe_duplicate_objective_messages(results)
+
+    def get_messages_by_session_run_ids(
+        self,
+        session_id: str,
+        run_ids: tuple[str, ...],
+        *,
+        include_cleared: bool = False,
+        include_hidden_from_context: bool = False,
+    ) -> list[dict[str, JsonValue]]:
+        normalized_run_ids = tuple(
+            dict.fromkeys(run_id.strip() for run_id in run_ids if run_id.strip())
+        )
+        if not normalized_run_ids:
+            return []
+        rows: list[sqlite3.Row] = []
+        chunk_size = _SQLITE_SAFE_VARIABLE_LIMIT - 1
+        with self._lock:
+            for index in range(0, len(normalized_run_ids), chunk_size):
+                run_id_chunk = normalized_run_ids[index : index + chunk_size]
+                placeholders = ", ".join("?" for _ in run_id_chunk)
+                rows.extend(
+                    self._conn.execute(
+                        "SELECT id, session_id, conversation_id, agent_role_id, instance_id, task_id, trace_id, role, message_json, created_at, hidden_from_context, hidden_reason, hidden_at, hidden_marker_id "
+                        f"FROM messages WHERE session_id=? AND trace_id IN ({placeholders}) ORDER BY id ASC",
+                        (session_id, *run_id_chunk),
+                    ).fetchall()
+                )
+        rows.sort(key=lambda row: int(row["id"]) if isinstance(row["id"], int) else 0)
+        return self._project_message_rows(
+            rows,
+            include_cleared=include_cleared,
+            include_hidden_from_context=include_hidden_from_context,
+        )
+
+    async def get_messages_by_session_run_ids_async(
+        self,
+        session_id: str,
+        run_ids: tuple[str, ...],
+        *,
+        include_cleared: bool = False,
+        include_hidden_from_context: bool = False,
+    ) -> list[dict[str, JsonValue]]:
+        normalized_run_ids = tuple(
+            dict.fromkeys(run_id.strip() for run_id in run_ids if run_id.strip())
+        )
+        if not normalized_run_ids:
+            return []
+        rows: list[sqlite3.Row] = []
+        chunk_size = _SQLITE_SAFE_VARIABLE_LIMIT - 1
+
+        async def operation(conn: aiosqlite.Connection) -> list[sqlite3.Row]:
+            for index in range(0, len(normalized_run_ids), chunk_size):
+                run_id_chunk = normalized_run_ids[index : index + chunk_size]
+                placeholders = ", ".join("?" for _ in run_id_chunk)
+                rows.extend(
+                    await async_fetchall(
+                        conn,
+                        "SELECT id, session_id, conversation_id, agent_role_id, instance_id, task_id, trace_id, role, message_json, created_at, hidden_from_context, hidden_reason, hidden_at, hidden_marker_id "
+                        f"FROM messages WHERE session_id=? AND trace_id IN ({placeholders}) ORDER BY id ASC",
+                        (session_id, *run_id_chunk),
+                    )
+                )
+            return rows
+
+        rows = await self._run_async_read(operation)
+        rows.sort(key=lambda row: int(row["id"]) if isinstance(row["id"], int) else 0)
+        return await self._project_message_rows_async(
+            rows,
+            include_cleared=include_cleared,
+            include_hidden_from_context=include_hidden_from_context,
+        )
+
+    def first_user_messages_by_session_ids(
+        self,
+        session_ids: tuple[str, ...],
+    ) -> dict[str, dict[str, JsonValue]]:
+        if not session_ids:
+            return {}
+        results: dict[str, dict[str, JsonValue]] = {}
+        with self._lock:
+            for index in range(0, len(session_ids), _SQLITE_SAFE_VARIABLE_LIMIT):
+                session_id_chunk = session_ids[
+                    index : index + _SQLITE_SAFE_VARIABLE_LIMIT
+                ]
+                placeholders = ", ".join("?" for _ in session_id_chunk)
+                rows = self._conn.execute(
+                    f"""
+                    SELECT
+                        id,
+                        session_id,
+                        conversation_id,
+                        agent_role_id,
+                        instance_id,
+                        task_id,
+                        trace_id,
+                        role,
+                        message_json,
+                        created_at,
+                        hidden_from_context,
+                        hidden_reason,
+                        hidden_at,
+                        hidden_marker_id
+                    FROM messages
+                    WHERE session_id IN ({placeholders})
+                      AND role='user'
+                    ORDER BY session_id ASC, id ASC
+                    """,
+                    session_id_chunk,
+                ).fetchall()
+                for row in rows:
+                    session_id = str(row["session_id"] or "").strip()
+                    if not session_id or session_id in results:
+                        continue
+                    msg_list = _load_message_list(str(row["message_json"]))
+                    msg = (
+                        msg_list[0]
+                        if msg_list and isinstance(msg_list[0], dict)
+                        else {}
+                    )
+                    if _is_system_reminder_projection_message(msg):
+                        continue
+                    if not _message_has_user_prompt_text(msg):
+                        continue
+                    results[session_id] = {
+                        "conversation_id": str(row["conversation_id"] or ""),
+                        "agent_role_id": str(row["agent_role_id"] or ""),
+                        "instance_id": str(row["instance_id"]),
+                        "task_id": str(row["task_id"]),
+                        "trace_id": str(row["trace_id"]),
+                        "role": str(row["role"]),
+                        "created_at": str(row["created_at"]),
+                        "hidden_from_context": bool(
+                            int(row["hidden_from_context"] or 0)
+                        ),
+                        "hidden_reason": str(row["hidden_reason"] or ""),
+                        "hidden_at": str(row["hidden_at"] or ""),
+                        "hidden_marker_id": str(row["hidden_marker_id"] or ""),
+                        "message": msg,
+                    }
+        return results
+
+    async def first_user_messages_by_session_ids_async(
+        self,
+        session_ids: tuple[str, ...],
+    ) -> dict[str, dict[str, JsonValue]]:
+        if not session_ids:
+            return {}
+        results: dict[str, dict[str, JsonValue]] = {}
+
+        async def operation(
+            conn: aiosqlite.Connection,
+        ) -> dict[str, dict[str, JsonValue]]:
+            for index in range(0, len(session_ids), _SQLITE_SAFE_VARIABLE_LIMIT):
+                session_id_chunk = session_ids[
+                    index : index + _SQLITE_SAFE_VARIABLE_LIMIT
+                ]
+                placeholders = ", ".join("?" for _ in session_id_chunk)
+                rows = await async_fetchall(
+                    conn,
+                    f"""
+                    SELECT
+                        id,
+                        session_id,
+                        conversation_id,
+                        agent_role_id,
+                        instance_id,
+                        task_id,
+                        trace_id,
+                        role,
+                        message_json,
+                        created_at,
+                        hidden_from_context,
+                        hidden_reason,
+                        hidden_at,
+                        hidden_marker_id
+                    FROM messages
+                    WHERE session_id IN ({placeholders})
+                      AND role='user'
+                    ORDER BY session_id ASC, id ASC
+                    """,
+                    session_id_chunk,
+                )
+                for row in rows:
+                    session_id = str(row["session_id"] or "").strip()
+                    if not session_id or session_id in results:
+                        continue
+                    msg_list = _load_message_list(str(row["message_json"]))
+                    msg = (
+                        msg_list[0]
+                        if msg_list and isinstance(msg_list[0], dict)
+                        else {}
+                    )
+                    if _is_system_reminder_projection_message(msg):
+                        continue
+                    if not _message_has_user_prompt_text(msg):
+                        continue
+                    results[session_id] = _project_single_message_row(row, msg)
+            return results
+
+        return await self._run_async_read(operation)
+
+    def get_user_messages_by_session(
+        self,
+        session_id: str,
+        *,
+        include_cleared: bool = False,
+        include_hidden_from_context: bool = False,
+    ) -> list[dict[str, JsonValue]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, session_id, conversation_id, agent_role_id, instance_id, task_id, trace_id, role, message_json, created_at, hidden_from_context, hidden_reason, hidden_at, hidden_marker_id "
+                "FROM messages WHERE session_id=? AND role='user' ORDER BY id ASC",
+                (session_id,),
+            ).fetchall()
+        rows = self._filter_rows_for_read(
+            rows,
+            include_cleared=include_cleared,
+            include_hidden_from_context=include_hidden_from_context,
+        )
+        if not include_hidden_from_context:
+            rows = _truncate_message_rows_to_safe_boundary(rows)
+
+        results: list[dict[str, JsonValue]] = []
+        for row in rows:
+            msg_list = _load_message_list(str(row["message_json"]))
+            msg = msg_list[0] if msg_list and isinstance(msg_list[0], dict) else {}
+            if _is_system_reminder_projection_message(msg):
+                continue
+            results.append(
+                {
+                    "conversation_id": str(row["conversation_id"] or ""),
+                    "agent_role_id": str(row["agent_role_id"] or ""),
+                    "instance_id": str(row["instance_id"]),
+                    "task_id": str(row["task_id"]),
+                    "trace_id": str(row["trace_id"]),
+                    "role": str(row["role"]),
+                    "created_at": str(row["created_at"]),
+                    "hidden_from_context": bool(int(row["hidden_from_context"] or 0)),
+                    "hidden_reason": str(row["hidden_reason"] or ""),
+                    "hidden_at": str(row["hidden_at"] or ""),
+                    "hidden_marker_id": str(row["hidden_marker_id"] or ""),
+                    "message": msg,
+                }
+            )
+        return _dedupe_duplicate_objective_messages(results)
+
+    def _project_message_rows(
+        self,
+        rows: Sequence[sqlite3.Row],
+        *,
+        include_cleared: bool,
+        include_hidden_from_context: bool,
+    ) -> list[dict[str, JsonValue]]:
+        filtered_rows = self._filter_rows_for_read(
+            rows,
+            include_cleared=include_cleared,
+            include_hidden_from_context=include_hidden_from_context,
+        )
+        if not include_hidden_from_context:
+            filtered_rows = _truncate_message_rows_to_safe_boundary(filtered_rows)
+
+        results: list[dict[str, JsonValue]] = []
+        for row in filtered_rows:
+            msg_list = _load_message_list(str(row["message_json"]))
+            msg = msg_list[0] if msg_list and isinstance(msg_list[0], dict) else {}
+            if _is_system_reminder_projection_message(msg):
+                continue
+            results.append(
+                {
+                    "conversation_id": str(row["conversation_id"] or ""),
+                    "agent_role_id": str(row["agent_role_id"] or ""),
+                    "instance_id": str(row["instance_id"]),
+                    "task_id": str(row["task_id"]),
+                    "trace_id": str(row["trace_id"]),
+                    "role": str(row["role"]),
+                    "created_at": str(row["created_at"]),
+                    "hidden_from_context": bool(int(row["hidden_from_context"] or 0)),
+                    "hidden_reason": str(row["hidden_reason"] or ""),
+                    "hidden_at": str(row["hidden_at"] or ""),
+                    "hidden_marker_id": str(row["hidden_marker_id"] or ""),
+                    "message": msg,
+                }
+            )
+        return _dedupe_duplicate_objective_messages(results)
+
+    async def _project_message_rows_async(
+        self,
+        rows: Sequence[sqlite3.Row],
+        *,
+        include_cleared: bool,
+        include_hidden_from_context: bool,
+    ) -> list[dict[str, JsonValue]]:
+        filtered_rows = await self._filter_rows_for_read_async(
+            rows,
+            include_cleared=include_cleared,
+            include_hidden_from_context=include_hidden_from_context,
+        )
+        if not include_hidden_from_context:
+            filtered_rows = _truncate_message_rows_to_safe_boundary(filtered_rows)
+
+        results: list[dict[str, JsonValue]] = []
+        for row in filtered_rows:
+            msg_list = _load_message_list(str(row["message_json"]))
+            msg = msg_list[0] if msg_list and isinstance(msg_list[0], dict) else {}
+            if _is_system_reminder_projection_message(msg):
+                continue
+            results.append(_project_single_message_row(row, msg))
+        return _dedupe_duplicate_objective_messages(results)
+
+    async def get_user_messages_by_session_async(
+        self,
+        session_id: str,
+        *,
+        include_cleared: bool = False,
+        include_hidden_from_context: bool = False,
+    ) -> list[dict[str, JsonValue]]:
+        rows = await self._run_async_read(
+            lambda conn: async_fetchall(
+                conn,
+                "SELECT id, session_id, conversation_id, agent_role_id, instance_id, task_id, trace_id, role, message_json, created_at, hidden_from_context, hidden_reason, hidden_at, hidden_marker_id "
+                "FROM messages WHERE session_id=? AND role='user' ORDER BY id ASC",
+                (session_id,),
+            )
+        )
+        return await self._project_message_rows_async(
+            rows,
+            include_cleared=include_cleared,
+            include_hidden_from_context=include_hidden_from_context,
+        )
+
+    async def get_messages_by_session_async(
+        self,
+        session_id: str,
+        *,
+        include_cleared: bool = False,
+        include_hidden_from_context: bool = False,
+    ) -> list[dict[str, JsonValue]]:
+        rows = await self._run_async_read(
+            lambda conn: async_fetchall(
+                conn,
+                "SELECT id, session_id, conversation_id, agent_role_id, instance_id, task_id, trace_id, role, message_json, created_at, hidden_from_context, hidden_reason, hidden_at, hidden_marker_id "
+                "FROM messages WHERE session_id=? ORDER BY id ASC",
+                (session_id,),
+            )
+        )
+        return await self._project_message_rows_async(
+            rows,
+            include_cleared=include_cleared,
+            include_hidden_from_context=include_hidden_from_context,
+        )
+
+    def get_messages_for_instance(
+        self,
+        session_id: str,
+        instance_id: str,
+        *,
+        include_cleared: bool = False,
+        include_hidden_from_context: bool = False,
+    ) -> list[dict[str, JsonValue]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, session_id, conversation_id, agent_role_id, instance_id, task_id, trace_id, role, message_json, created_at, hidden_from_context, hidden_reason, hidden_at, hidden_marker_id "
+                "FROM messages WHERE session_id=? AND instance_id=? ORDER BY id ASC",
+                (session_id, instance_id),
+            ).fetchall()
+        rows = self._filter_rows_for_read(
+            rows,
+            include_cleared=include_cleared,
+            include_hidden_from_context=include_hidden_from_context,
+        )
+        if not include_hidden_from_context:
+            rows = _truncate_message_rows_to_safe_boundary(rows)
+
+        results: list[dict[str, JsonValue]] = []
+        for row in rows:
+            msg_list = _load_message_list(str(row["message_json"]))
+            msg = msg_list[0] if msg_list and isinstance(msg_list[0], dict) else {}
+            if _is_system_reminder_projection_message(msg):
+                continue
+            results.append(
+                {
+                    "conversation_id": str(row["conversation_id"] or ""),
+                    "agent_role_id": str(row["agent_role_id"] or ""),
+                    "instance_id": str(row["instance_id"]),
+                    "task_id": str(row["task_id"]),
+                    "trace_id": str(row["trace_id"]),
+                    "role": str(row["role"]),
+                    "created_at": str(row["created_at"]),
+                    "hidden_from_context": bool(int(row["hidden_from_context"] or 0)),
+                    "hidden_reason": str(row["hidden_reason"] or ""),
+                    "hidden_at": str(row["hidden_at"] or ""),
+                    "hidden_marker_id": str(row["hidden_marker_id"] or ""),
+                    "message": msg,
+                }
+            )
+        return _dedupe_duplicate_objective_messages(results)
+
+    async def get_messages_for_instance_async(
+        self,
+        session_id: str,
+        instance_id: str,
+        *,
+        include_cleared: bool = False,
+        include_hidden_from_context: bool = False,
+    ) -> list[dict[str, JsonValue]]:
+        rows = await self._run_async_read(
+            lambda conn: async_fetchall(
+                conn,
+                "SELECT id, session_id, conversation_id, agent_role_id, instance_id, task_id, trace_id, role, message_json, created_at, hidden_from_context, hidden_reason, hidden_at, hidden_marker_id "
+                "FROM messages WHERE session_id=? AND instance_id=? ORDER BY id ASC",
+                (session_id, instance_id),
+            )
+        )
+        return await self._project_message_rows_async(
+            rows,
+            include_cleared=include_cleared,
+            include_hidden_from_context=include_hidden_from_context,
+        )
+
+    def get_latest_task_message_id(
+        self,
+        *,
+        task_id: str,
+        instance_id: str | None = None,
+    ) -> int:
+        with self._lock:
+            if instance_id is None:
+                row = self._conn.execute(
+                    "SELECT COALESCE(MAX(id), 0) AS latest_id "
+                    "FROM messages WHERE task_id=?",
+                    (task_id,),
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT COALESCE(MAX(id), 0) AS latest_id "
+                    "FROM messages WHERE task_id=? AND instance_id=?",
+                    (task_id, instance_id),
+                ).fetchone()
+        if row is None:
+            return 0
+        return int(row["latest_id"] or 0)
+
+    async def get_latest_task_message_id_async(
+        self,
+        *,
+        task_id: str,
+        instance_id: str | None = None,
+    ) -> int:
+        async def operation(conn: aiosqlite.Connection) -> int:
+            if instance_id is None:
+                row = await async_fetchone(
+                    conn,
+                    "SELECT COALESCE(MAX(id), 0) AS latest_id "
+                    "FROM messages WHERE task_id=?",
+                    (task_id,),
+                )
+            else:
+                row = await async_fetchone(
+                    conn,
+                    "SELECT COALESCE(MAX(id), 0) AS latest_id "
+                    "FROM messages WHERE task_id=? AND instance_id=?",
+                    (task_id, instance_id),
+                )
+            if row is None:
+                return 0
+            return int(row["latest_id"] or 0)
+
+        return await self._run_async_read(operation)
+
+    def delete_by_session(self, session_id: str) -> None:
+        run_sqlite_write_with_retry(
+            conn=self._conn,
+            db_path=self._db_path,
+            operation=lambda: self._conn.execute(
+                "DELETE FROM messages WHERE session_id=?", (session_id,)
+            ),
+            lock=self._lock,
+            repository_name="MessageRepository",
+            operation_name="delete_by_session",
+        )
+
+    async def delete_by_session_async(self, session_id: str) -> None:
+        async def operation(conn: aiosqlite.Connection) -> None:
+            cursor = await conn.execute(
+                "DELETE FROM messages WHERE session_id=?",
+                (session_id,),
+            )
+            await cursor.close()
+
+        await self._run_async_write(
+            operation_name="delete_by_session_async",
+            operation=operation,
+        )
+
+    def delete_by_instance(self, instance_id: str) -> None:
+        run_sqlite_write_with_retry(
+            conn=self._conn,
+            db_path=self._db_path,
+            operation=lambda: self._conn.execute(
+                "DELETE FROM messages WHERE instance_id=?",
+                (instance_id,),
+            ),
+            lock=self._lock,
+            repository_name="MessageRepository",
+            operation_name="delete_by_instance",
+        )
+
+    async def delete_by_instance_async(self, instance_id: str) -> None:
+        async def operation(conn: aiosqlite.Connection) -> None:
+            cursor = await conn.execute(
+                "DELETE FROM messages WHERE instance_id=?",
+                (instance_id,),
+            )
+            await cursor.close()
+
+        await self._run_async_write(
+            operation_name="delete_by_instance_async",
+            operation=operation,
+        )
+
+    def prune_history_to_safe_boundary(self, instance_id: str) -> None:
+        self._prune_to_safe_boundary(
+            "SELECT id, session_id, message_json, created_at, hidden_from_context FROM messages WHERE instance_id=? ORDER BY id ASC",
+            (instance_id,),
+        )
+
+    async def prune_history_to_safe_boundary_async(self, instance_id: str) -> None:
+        await self._prune_to_safe_boundary_async(
+            "SELECT id, session_id, message_json, created_at, hidden_from_context FROM messages WHERE instance_id=? ORDER BY id ASC",
+            (instance_id,),
+        )
+
+    def prune_conversation_history_to_safe_boundary(self, conversation_id: str) -> None:
+        self._prune_to_safe_boundary(
+            "SELECT id, session_id, message_json, created_at, hidden_from_context FROM messages WHERE conversation_id=? ORDER BY id ASC",
+            (conversation_id,),
+        )
+
+    async def prune_conversation_history_to_safe_boundary_async(
+        self, conversation_id: str
+    ) -> None:
+        await self._prune_to_safe_boundary_async(
+            "SELECT id, session_id, message_json, created_at, hidden_from_context FROM messages WHERE conversation_id=? ORDER BY id ASC",
+            (conversation_id,),
+        )
+
+    def compact_conversation_history(
+        self,
+        conversation_id: str,
+        *,
+        keep_message_count: int,
+        hidden_reason: str = "compaction",
+        hidden_marker_id: str = "",
+    ) -> None:
+        now = datetime.now(tz=timezone.utc).isoformat()
+        safe_keep_count = max(1, int(keep_message_count))
+
+        def operation() -> None:
+            rows = self._conn.execute(
+                "SELECT id, session_id, created_at, hidden_from_context FROM messages WHERE conversation_id=? ORDER BY id ASC",
+                (conversation_id,),
+            ).fetchall()
+            active_rows = self._filter_rows_for_read(
+                rows,
+                include_cleared=False,
+                include_hidden_from_context=False,
+            )
+            if len(active_rows) <= safe_keep_count:
+                return
+            stale_ids = [
+                int(row["id"])
+                for row in active_rows[:-safe_keep_count]
+                if isinstance(row["id"], int)
+            ]
+            if not stale_ids:
+                return
+            placeholders = ",".join("?" for _ in stale_ids)
+            self._conn.execute(
+                f"UPDATE messages SET hidden_from_context=1, hidden_reason=?, hidden_at=?, hidden_marker_id=? WHERE id IN ({placeholders})",
+                [hidden_reason, now, hidden_marker_id, *stale_ids],
+            )
+
+        run_sqlite_write_with_retry(
+            conn=self._conn,
+            db_path=self._db_path,
+            operation=operation,
+            lock=self._lock,
+            repository_name="MessageRepository",
+            operation_name="compact_conversation_history",
+        )
+
+    async def compact_conversation_history_async(
+        self,
+        conversation_id: str,
+        *,
+        keep_message_count: int,
+        hidden_reason: str = "compaction",
+        hidden_marker_id: str = "",
+    ) -> None:
+        now = datetime.now(tz=timezone.utc).isoformat()
+        safe_keep_count = max(1, int(keep_message_count))
+
+        async def operation(conn: aiosqlite.Connection) -> None:
+            rows = await async_fetchall(
+                conn,
+                "SELECT id, session_id, created_at, hidden_from_context FROM messages WHERE conversation_id=? ORDER BY id ASC",
+                (conversation_id,),
+            )
+            active_rows = await self._filter_rows_for_read_async(
+                rows,
+                include_cleared=False,
+                include_hidden_from_context=False,
+            )
+            if len(active_rows) <= safe_keep_count:
+                return
+            stale_ids = [
+                int(row["id"])
+                for row in active_rows[:-safe_keep_count]
+                if isinstance(row["id"], int)
+            ]
+            if not stale_ids:
+                return
+            placeholders = ",".join("?" for _ in stale_ids)
+            cursor = await conn.execute(
+                f"UPDATE messages SET hidden_from_context=1, hidden_reason=?, hidden_at=?, hidden_marker_id=? WHERE id IN ({placeholders})",
+                [hidden_reason, now, hidden_marker_id, *stale_ids],
+            )
+            await cursor.close()
+
+        await self._run_async_write(
+            operation_name="compact_conversation_history_async",
+            operation=operation,
+        )
+
+    def replace_pending_user_prompt(
+        self,
+        *,
+        session_id: str,
+        instance_id: str,
+        task_id: str,
+        trace_id: str,
+        content: UserPromptContent,
+        workspace_id: str,
+        conversation_id: str | None = None,
+        agent_role_id: str | None = None,
+    ) -> bool:
+
+        _ = (session_id, trace_id, workspace_id, agent_role_id)
+        target_key = user_prompt_content_key(content)
+        target_text = user_prompt_content_to_text(content)
+        if not target_key or not target_text:
+            return False
+        resolved_conversation_id = conversation_id or instance_id
+        message_json = _sanitize_message_json(
+            ModelMessagesTypeAdapter.dump_json(
+                [ModelRequest(parts=[UserPromptPart(content=content)])]
+            ).decode()
+        )
+
+        def operation() -> bool:
+            rows = self._conn.execute(
+                "SELECT id, session_id, role, message_json, created_at, hidden_from_context FROM messages WHERE conversation_id=? AND task_id=? ORDER BY id ASC",
+                (resolved_conversation_id, task_id),
+            ).fetchall()
+            active_rows = self._filter_rows_for_read(
+                rows,
+                include_cleared=False,
+                include_hidden_from_context=False,
+            )
+            if _task_history_has_response(active_rows):
+                return False
+            replacement_ids = [
+                int(row["id"])
+                for row in active_rows
+                if isinstance(row["id"], int)
+                and str(row["role"] or "") == "user"
+                and _row_is_user_prompt_only(row)
+            ]
+            if replacement_ids:
+                primary_id = replacement_ids[0]
+                self._conn.execute(
+                    "UPDATE messages SET message_json=? WHERE id=?",
+                    (message_json, primary_id),
+                )
+                stale_ids = replacement_ids[1:]
+                if stale_ids:
+                    placeholders = ",".join("?" for _ in stale_ids)
+                    self._conn.execute(
+                        f"DELETE FROM messages WHERE id IN ({placeholders})",
+                        stale_ids,
+                    )
+                return True
+            history = self.get_history_for_conversation_task(
+                resolved_conversation_id,
+                task_id,
+            )
+            if _history_ends_with_user_prompt(history, target_key):
+                return False
+            return False
+
+        return run_sqlite_write_with_retry(
+            conn=self._conn,
+            db_path=self._db_path,
+            operation=operation,
+            lock=self._lock,
+            repository_name="MessageRepository",
+            operation_name="replace_pending_user_prompt",
+        )
+
+    async def replace_pending_user_prompt_async(
+        self,
+        *,
+        session_id: str,
+        instance_id: str,
+        task_id: str,
+        trace_id: str,
+        content: UserPromptContent,
+        workspace_id: str,
+        conversation_id: str | None = None,
+        agent_role_id: str | None = None,
+    ) -> bool:
+        _ = (session_id, trace_id, workspace_id, agent_role_id)
+        target_key = user_prompt_content_key(content)
+        target_text = user_prompt_content_to_text(content)
+        if not target_key or not target_text:
+            return False
+        resolved_conversation_id = conversation_id or instance_id
+        message_json = _sanitize_message_json(
+            ModelMessagesTypeAdapter.dump_json(
+                [ModelRequest(parts=[UserPromptPart(content=content)])]
+            ).decode()
+        )
+
+        async def operation(conn: aiosqlite.Connection) -> bool:
+            rows = await async_fetchall(
+                conn,
+                "SELECT id, session_id, role, message_json, created_at, hidden_from_context FROM messages WHERE conversation_id=? AND task_id=? ORDER BY id ASC",
+                (resolved_conversation_id, task_id),
+            )
+            active_rows = await self._filter_rows_for_read_async(
+                rows,
+                include_cleared=False,
+                include_hidden_from_context=False,
+            )
+            if _task_history_has_response(active_rows):
+                return False
+            replacement_ids = [
+                int(row["id"])
+                for row in active_rows
+                if isinstance(row["id"], int)
+                and str(row["role"] or "") == "user"
+                and _row_is_user_prompt_only(row)
+            ]
+            if replacement_ids:
+                primary_id = replacement_ids[0]
+                cursor = await conn.execute(
+                    "UPDATE messages SET message_json=? WHERE id=?",
+                    (message_json, primary_id),
+                )
+                await cursor.close()
+                stale_ids = replacement_ids[1:]
+                if stale_ids:
+                    placeholders = ",".join("?" for _ in stale_ids)
+                    cursor = await conn.execute(
+                        f"DELETE FROM messages WHERE id IN ({placeholders})",
+                        stale_ids,
+                    )
+                    await cursor.close()
+                return True
+            history = await self._read_history_from_conn_async(
+                conn,
+                "SELECT id, session_id, message_json, created_at, hidden_from_context FROM messages WHERE conversation_id=? AND task_id=? ORDER BY id ASC",
+                (resolved_conversation_id, task_id),
+            )
+            if _history_ends_with_user_prompt(history, target_key):
+                return False
+            return False
+
+        return await self._run_async_write(
+            operation_name="replace_pending_user_prompt_async",
+            operation=operation,
+        )
+
+    def append_user_prompt_if_missing(
+        self,
+        *,
+        session_id: str,
+        instance_id: str,
+        task_id: str,
+        trace_id: str,
+        content: UserPromptContent,
+        workspace_id: str,
+        conversation_id: str | None = None,
+        agent_role_id: str | None = None,
+    ) -> bool:
+
+        target_key = user_prompt_content_key(content)
+        target_text = user_prompt_content_to_text(content)
+        if not target_key or not target_text:
+            return False
+        resolved_conversation_id = conversation_id or instance_id
+        message_json = _sanitize_message_json(
+            ModelMessagesTypeAdapter.dump_json(
+                [ModelRequest(parts=[UserPromptPart(content=content)])]
+            ).decode()
+        )
+
+        def operation() -> bool:
+            rows = self._conn.execute(
+                "SELECT id, session_id, message_json, created_at, hidden_from_context FROM messages WHERE conversation_id=? ORDER BY id ASC",
+                (resolved_conversation_id,),
+            ).fetchall()
+            active_rows = self._filter_rows_for_read(
+                rows,
+                include_cleared=False,
+                include_hidden_from_context=False,
+            )
+            allowed_ids = _safe_row_ids(active_rows)
+            stale_ids = [
+                int(row["id"])
+                for row in active_rows
+                if isinstance(row["id"], int) and int(row["id"]) not in allowed_ids
+            ]
+            if stale_ids:
+                placeholders = ",".join("?" for _ in stale_ids)
+                self._conn.execute(
+                    f"DELETE FROM messages WHERE id IN ({placeholders})",
+                    stale_ids,
+                )
+            history = self.get_history_for_conversation_task(
+                resolved_conversation_id,
+                task_id,
+            )
+            if _history_ends_with_user_prompt(history, target_key):
+                return False
+            now = self._next_created_at(session_id=session_id)
+            self._conn.execute(
+                "INSERT INTO messages(session_id, workspace_id, conversation_id, agent_role_id, instance_id, task_id, trace_id, role, message_json, created_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    workspace_id,
+                    resolved_conversation_id,
+                    agent_role_id or "",
+                    instance_id,
+                    task_id,
+                    trace_id,
+                    "user",
+                    message_json,
+                    now,
+                ),
+            )
+            return True
+
+        return run_sqlite_write_with_retry(
+            conn=self._conn,
+            db_path=self._db_path,
+            operation=operation,
+            lock=self._lock,
+            repository_name="MessageRepository",
+            operation_name="append_user_prompt_if_missing",
+        )
+
+    async def append_user_prompt_if_missing_async(
+        self,
+        *,
+        session_id: str,
+        instance_id: str,
+        task_id: str,
+        trace_id: str,
+        content: UserPromptContent,
+        workspace_id: str,
+        conversation_id: str | None = None,
+        agent_role_id: str | None = None,
+    ) -> bool:
+        target_key = user_prompt_content_key(content)
+        target_text = user_prompt_content_to_text(content)
+        if not target_key or not target_text:
+            return False
+        resolved_conversation_id = conversation_id or instance_id
+        message_json = _sanitize_message_json(
+            ModelMessagesTypeAdapter.dump_json(
+                [ModelRequest(parts=[UserPromptPart(content=content)])]
+            ).decode()
+        )
+
+        async def operation(conn: aiosqlite.Connection) -> bool:
+            rows = await async_fetchall(
+                conn,
+                "SELECT id, session_id, message_json, created_at, hidden_from_context FROM messages WHERE conversation_id=? ORDER BY id ASC",
+                (resolved_conversation_id,),
+            )
+            active_rows = await self._filter_rows_for_read_async(
+                rows,
+                include_cleared=False,
+                include_hidden_from_context=False,
+            )
+            allowed_ids = _safe_row_ids(active_rows)
+            stale_ids = [
+                int(row["id"])
+                for row in active_rows
+                if isinstance(row["id"], int) and int(row["id"]) not in allowed_ids
+            ]
+            if stale_ids:
+                placeholders = ",".join("?" for _ in stale_ids)
+                cursor = await conn.execute(
+                    f"DELETE FROM messages WHERE id IN ({placeholders})",
+                    stale_ids,
+                )
+                await cursor.close()
+            history = await self._read_history_from_conn_async(
+                conn,
+                "SELECT id, session_id, message_json, created_at, hidden_from_context FROM messages WHERE conversation_id=? AND task_id=? ORDER BY id ASC",
+                (resolved_conversation_id, task_id),
+            )
+            if _history_ends_with_user_prompt(history, target_key):
+                return False
+            now = await self._next_created_at_async(
+                conn=conn,
+                session_id=session_id,
+            )
+            cursor = await conn.execute(
+                "INSERT INTO messages(session_id, workspace_id, conversation_id, agent_role_id, instance_id, task_id, trace_id, role, message_json, created_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    workspace_id,
+                    resolved_conversation_id,
+                    agent_role_id or "",
+                    instance_id,
+                    task_id,
+                    trace_id,
+                    "user",
+                    message_json,
+                    now,
+                ),
+            )
+            await cursor.close()
+            return True
+
+        return await self._run_async_write(
+            operation_name="append_user_prompt_if_missing_async",
+            operation=operation,
+        )
+
+    def append_system_prompt_if_missing(
+        self,
+        *,
+        session_id: str,
+        instance_id: str,
+        task_id: str,
+        trace_id: str,
+        content: str,
+        workspace_id: str,
+        conversation_id: str | None = None,
+        agent_role_id: str | None = None,
+    ) -> bool:
+
+        target = str(content or "").strip()
+        if not target:
+            return False
+        resolved_conversation_id = conversation_id or instance_id
+        message_json = _sanitize_message_json(
+            ModelMessagesTypeAdapter.dump_json(
+                [ModelRequest(parts=[SystemPromptPart(content=target)])]
+            ).decode()
+        )
+
+        def operation() -> bool:
+            history = self.get_history_for_conversation_task(
+                resolved_conversation_id,
+                task_id,
+            )
+            if _history_ends_with_system_prompt(history, target):
+                return False
+            now = self._next_created_at(session_id=session_id)
+            self._conn.execute(
+                "INSERT INTO messages(session_id, workspace_id, conversation_id, agent_role_id, instance_id, task_id, trace_id, role, message_json, created_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    workspace_id,
+                    resolved_conversation_id,
+                    agent_role_id or "",
+                    instance_id,
+                    task_id,
+                    trace_id,
+                    "system",
+                    message_json,
+                    now,
+                ),
+            )
+            return True
+
+        return run_sqlite_write_with_retry(
+            conn=self._conn,
+            db_path=self._db_path,
+            operation=operation,
+            lock=self._lock,
+            repository_name="MessageRepository",
+            operation_name="append_system_prompt_if_missing",
+        )
+
+    async def append_system_prompt_if_missing_async(
+        self,
+        *,
+        session_id: str,
+        instance_id: str,
+        task_id: str,
+        trace_id: str,
+        content: str,
+        workspace_id: str,
+        conversation_id: str | None = None,
+        agent_role_id: str | None = None,
+    ) -> bool:
+        target = str(content or "").strip()
+        if not target:
+            return False
+        resolved_conversation_id = conversation_id or instance_id
+        message_json = _sanitize_message_json(
+            ModelMessagesTypeAdapter.dump_json(
+                [ModelRequest(parts=[SystemPromptPart(content=target)])]
+            ).decode()
+        )
+
+        async def operation(conn: aiosqlite.Connection) -> bool:
+            history = await self._read_history_from_conn_async(
+                conn,
+                "SELECT id, session_id, message_json, created_at, hidden_from_context FROM messages WHERE conversation_id=? AND task_id=? ORDER BY id ASC",
+                (resolved_conversation_id, task_id),
+            )
+            if _history_ends_with_system_prompt(history, target):
+                return False
+            now = await self._next_created_at_async(
+                conn=conn,
+                session_id=session_id,
+            )
+            cursor = await conn.execute(
+                "INSERT INTO messages(session_id, workspace_id, conversation_id, agent_role_id, instance_id, task_id, trace_id, role, message_json, created_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    workspace_id,
+                    resolved_conversation_id,
+                    agent_role_id or "",
+                    instance_id,
+                    task_id,
+                    trace_id,
+                    "system",
+                    message_json,
+                    now,
+                ),
+            )
+            await cursor.close()
+            return True
+
+        return await self._run_async_write(
+            operation_name="append_system_prompt_if_missing_async",
+            operation=operation,
+        )
+
+    def get_history_for_task(
+        self, instance_id: str, task_id: str
+    ) -> list[ModelMessage]:
+        return self._read_history(
+            "SELECT id, session_id, message_json, created_at, hidden_from_context FROM messages WHERE instance_id=? AND task_id=? ORDER BY id ASC",
+            (instance_id, task_id),
+        )
+
+    async def get_history_for_task_async(
+        self, instance_id: str, task_id: str
+    ) -> list[ModelMessage]:
+        return await self._read_history_async(
+            "SELECT id, session_id, message_json, created_at, hidden_from_context FROM messages WHERE instance_id=? AND task_id=? ORDER BY id ASC",
+            (instance_id, task_id),
+        )
+
+    def get_history_for_conversation_task(
+        self, conversation_id: str, task_id: str
+    ) -> list[ModelMessage]:
+        return self._read_history(
+            "SELECT id, session_id, message_json, created_at, hidden_from_context FROM messages WHERE conversation_id=? AND task_id=? ORDER BY id ASC",
+            (conversation_id, task_id),
+        )
+
+    async def get_history_for_conversation_task_async(
+        self, conversation_id: str, task_id: str
+    ) -> list[ModelMessage]:
+        return await self._read_history_async(
+            "SELECT id, session_id, message_json, created_at, hidden_from_context FROM messages WHERE conversation_id=? AND task_id=? ORDER BY id ASC",
+            (conversation_id, task_id),
+        )
+
+    def _read_history(
+        self,
+        query: str,
+        params: tuple[str, ...],
+    ) -> list[ModelMessage]:
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        rows = self._filter_rows_for_read(
+            rows,
+            include_cleared=False,
+            include_hidden_from_context=False,
+        )
+        allowed_ids = _safe_row_ids(rows)
+        result: list[ModelMessage] = []
+        for row in rows:
+            row_id = row["id"]
+            if not isinstance(row_id, int) or row_id not in allowed_ids:
+                continue
+            msgs = _validate_message_row(row)
+            result.extend(msgs)
+        return _truncate_model_history_to_safe_boundary(result)
+
+    async def _read_history_async(
+        self,
+        query: str,
+        params: tuple[str, ...],
+    ) -> list[ModelMessage]:
+        rows = await self._run_async_read(
+            lambda conn: async_fetchall(conn, query, params)
+        )
+        return await self._rows_to_history_async(rows)
+
+    async def _read_history_from_conn_async(
+        self,
+        conn: aiosqlite.Connection,
+        query: str,
+        params: tuple[str, ...],
+    ) -> list[ModelMessage]:
+        rows = await async_fetchall(conn, query, params)
+        return await self._rows_to_history_async(rows)
+
+    async def _rows_to_history_async(
+        self,
+        rows: Sequence[sqlite3.Row],
+    ) -> list[ModelMessage]:
+        filtered_rows = await self._filter_rows_for_read_async(
+            rows,
+            include_cleared=False,
+            include_hidden_from_context=False,
+        )
+        return await asyncio.to_thread(
+            _validated_history_from_rows,
+            tuple(filtered_rows),
+        )
+
+    def _prune_to_safe_boundary(
+        self,
+        query: str,
+        params: tuple[str, ...],
+    ) -> None:
+        def operation() -> None:
+            rows = self._conn.execute(query, params).fetchall()
+            active_rows = self._filter_rows_for_read(
+                rows,
+                include_cleared=False,
+                include_hidden_from_context=False,
+            )
+            if not active_rows:
+                return
+            allowed_ids = _safe_row_ids(active_rows)
+            stale_ids = [
+                int(row["id"])
+                for row in active_rows
+                if isinstance(row["id"], int) and int(row["id"]) not in allowed_ids
+            ]
+            if not stale_ids:
+                return
+            placeholders = ",".join("?" for _ in stale_ids)
+            self._conn.execute(
+                f"DELETE FROM messages WHERE id IN ({placeholders})",
+                stale_ids,
+            )
+
+        run_sqlite_write_with_retry(
+            conn=self._conn,
+            db_path=self._db_path,
+            operation=operation,
+            lock=self._lock,
+            repository_name="MessageRepository",
+            operation_name="prune_to_safe_boundary",
+        )
+
+    async def _prune_to_safe_boundary_async(
+        self,
+        query: str,
+        params: tuple[str, ...],
+    ) -> None:
+        async def operation(conn: aiosqlite.Connection) -> None:
+            rows = await async_fetchall(conn, query, params)
+            active_rows = await self._filter_rows_for_read_async(
+                rows,
+                include_cleared=False,
+                include_hidden_from_context=False,
+            )
+            if not active_rows:
+                return
+            allowed_ids = _safe_row_ids(active_rows)
+            stale_ids = [
+                int(row["id"])
+                for row in active_rows
+                if isinstance(row["id"], int) and int(row["id"]) not in allowed_ids
+            ]
+            if not stale_ids:
+                return
+            placeholders = ",".join("?" for _ in stale_ids)
+            cursor = await conn.execute(
+                f"DELETE FROM messages WHERE id IN ({placeholders})",
+                stale_ids,
+            )
+            await cursor.close()
+
+        await self._run_async_write(
+            operation_name="prune_to_safe_boundary_async",
+            operation=operation,
+        )
+
+    def hide_conversation_messages_for_compaction(
+        self,
+        *,
+        conversation_id: str,
+        hide_message_count: int,
+        hidden_marker_id: str,
+    ) -> int:
+        safe_hide_count = max(0, int(hide_message_count))
+        if safe_hide_count <= 0:
+            return 0
+        now = datetime.now(tz=timezone.utc).isoformat()
+
+        def operation() -> int:
+            rows = self._conn.execute(
+                "SELECT id, session_id, created_at, hidden_from_context FROM messages WHERE conversation_id=? ORDER BY id ASC",
+                (conversation_id,),
+            ).fetchall()
+            active_rows = self._filter_rows_for_read(
+                rows,
+                include_cleared=False,
+                include_hidden_from_context=False,
+            )
+            if not active_rows:
+                return 0
+            row_ids = [
+                int(row["id"])
+                for row in active_rows[:safe_hide_count]
+                if isinstance(row["id"], int)
+            ]
+            if not row_ids:
+                return 0
+            placeholders = ",".join("?" for _ in row_ids)
+            self._conn.execute(
+                f"UPDATE messages SET hidden_from_context=1, hidden_reason='compaction', hidden_at=?, hidden_marker_id=? WHERE id IN ({placeholders})",
+                [now, hidden_marker_id, *row_ids],
+            )
+            return len(row_ids)
+
+        return run_sqlite_write_with_retry(
+            conn=self._conn,
+            db_path=self._db_path,
+            operation=operation,
+            lock=self._lock,
+            repository_name="MessageRepository",
+            operation_name="hide_conversation_messages_for_compaction",
+        )
+
+    async def hide_conversation_messages_for_compaction_async(
+        self, *, conversation_id: str, hide_message_count: int, hidden_marker_id: str
+    ) -> int:
+        safe_hide_count = max(0, int(hide_message_count))
+        if safe_hide_count <= 0:
+            return 0
+        now = datetime.now(tz=timezone.utc).isoformat()
+
+        async def operation(conn: aiosqlite.Connection) -> int:
+            rows = await async_fetchall(
+                conn,
+                "SELECT id, session_id, created_at, hidden_from_context FROM messages WHERE conversation_id=? ORDER BY id ASC",
+                (conversation_id,),
+            )
+            active_rows = await self._filter_rows_for_read_async(
+                rows,
+                include_cleared=False,
+                include_hidden_from_context=False,
+            )
+            if not active_rows:
+                return 0
+            row_ids = [
+                int(row["id"])
+                for row in active_rows[:safe_hide_count]
+                if isinstance(row["id"], int)
+            ]
+            if not row_ids:
+                return 0
+            placeholders = ",".join("?" for _ in row_ids)
+            cursor = await conn.execute(
+                f"UPDATE messages SET hidden_from_context=1, hidden_reason='compaction', hidden_at=?, hidden_marker_id=? WHERE id IN ({placeholders})",
+                [now, hidden_marker_id, *row_ids],
+            )
+            await cursor.close()
+            return len(row_ids)
+
+        return await self._run_async_write(
+            operation_name="hide_conversation_messages_for_compaction_async",
+            operation=operation,
+        )
+
+    def _append_rows(
+        self,
+        *,
+        session_id: str,
+        workspace_id: str,
+        resolved_conversation_id: str,
+        agent_role_id: str,
+        instance_id: str,
+        task_id: str,
+        trace_id: str,
+        messages: Sequence[ModelMessage],
+    ) -> None:
+        now = self._next_created_at(session_id=session_id)
+        rows = [
+            (
+                session_id,
+                workspace_id,
+                resolved_conversation_id,
+                agent_role_id,
+                instance_id,
+                task_id,
+                trace_id,
+                _role(normalized_message),
+                _sanitize_message_json(
+                    ModelMessagesTypeAdapter.dump_json([normalized_message]).decode()
+                ),
+                now,
+            )
+            for msg in messages
+            for normalized_message in [_normalize_message_for_persistence(msg)]
+        ]
+        self._conn.executemany(
+            "INSERT INTO messages(session_id, workspace_id, conversation_id, agent_role_id, instance_id, task_id, trace_id, role, message_json, created_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+
+    async def _append_rows_async(
+        self,
+        *,
+        conn: aiosqlite.Connection,
+        session_id: str,
+        workspace_id: str,
+        resolved_conversation_id: str,
+        agent_role_id: str,
+        instance_id: str,
+        task_id: str,
+        trace_id: str,
+        messages: Sequence[ModelMessage],
+    ) -> None:
+        now = await self._next_created_at_async(conn=conn, session_id=session_id)
+        rows = [
+            (
+                session_id,
+                workspace_id,
+                resolved_conversation_id,
+                agent_role_id,
+                instance_id,
+                task_id,
+                trace_id,
+                _role(normalized_message),
+                _sanitize_message_json(
+                    ModelMessagesTypeAdapter.dump_json([normalized_message]).decode()
+                ),
+                now,
+            )
+            for msg in messages
+            for normalized_message in [_normalize_message_for_persistence(msg)]
+        ]
+        cursor = await conn.executemany(
+            "INSERT INTO messages(session_id, workspace_id, conversation_id, agent_role_id, instance_id, task_id, trace_id, role, message_json, created_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        await cursor.close()
+
+    def _next_created_at(self, *, session_id: str) -> str:
+        candidate = datetime.now(tz=timezone.utc)
+        latest_created_at = self._latest_created_at_by_session.get(session_id)
+        if latest_created_at is not None:
+            candidate = _ensure_after_datetime(candidate, latest_created_at)
+        else:
+            latest_message_row = self._conn.execute(
+                "SELECT created_at FROM messages WHERE session_id=? ORDER BY id DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            candidate = _ensure_after_iso_value(
+                candidate,
+                None
+                if latest_message_row is None
+                else str(latest_message_row["created_at"]),
+            )
+        if self._session_history_marker_repo is not None:
+            latest_clear = self._session_history_marker_repo.get_latest(
+                session_id,
+                marker_type=SessionHistoryMarkerType.CLEAR,
+            )
+            if latest_clear is not None:
+                candidate = _ensure_after_datetime(candidate, latest_clear.created_at)
+        self._latest_created_at_by_session[session_id] = candidate
+        return candidate.isoformat()
+
+    async def _next_created_at_async(
+        self, *, conn: aiosqlite.Connection, session_id: str
+    ) -> str:
+        candidate = datetime.now(tz=timezone.utc)
+        latest_created_at = self._latest_created_at_by_session.get(session_id)
+        if latest_created_at is not None:
+            candidate = _ensure_after_datetime(candidate, latest_created_at)
+        else:
+            latest_message_row = await async_fetchone(
+                conn,
+                "SELECT created_at FROM messages WHERE session_id=? ORDER BY id DESC LIMIT 1",
+                (session_id,),
+            )
+            candidate = _ensure_after_iso_value(
+                candidate,
+                None
+                if latest_message_row is None
+                else str(latest_message_row["created_at"]),
+            )
+        if self._session_history_marker_repo is not None:
+            latest_clear = await self._session_history_marker_repo.get_latest_async(
+                session_id,
+                marker_type=SessionHistoryMarkerType.CLEAR,
+            )
+            if latest_clear is not None:
+                candidate = _ensure_after_datetime(candidate, latest_clear.created_at)
+        self._latest_created_at_by_session[session_id] = candidate
+        return candidate.isoformat()
+
+    def _filter_rows_for_read(
+        self,
+        rows: Sequence[sqlite3.Row],
+        *,
+        include_cleared: bool,
+        include_hidden_from_context: bool,
+    ) -> list[sqlite3.Row]:
+        filtered_rows = list(rows)
+        if not include_cleared:
+            filtered_rows = self._filter_rows_for_active_segments(filtered_rows)
+        filtered_rows = _drop_duplicate_tool_outcome_rows(filtered_rows)
+        if include_hidden_from_context:
+            return filtered_rows
+        return self._filter_rows_for_visible_context(filtered_rows)
+
+    async def _filter_rows_for_read_async(
+        self,
+        rows: Sequence[sqlite3.Row],
+        *,
+        include_cleared: bool,
+        include_hidden_from_context: bool,
+    ) -> list[sqlite3.Row]:
+        filtered_rows = list(rows)
+        if not include_cleared:
+            filtered_rows = await self._filter_rows_for_active_segments_async(
+                filtered_rows
+            )
+        filtered_rows = await asyncio.to_thread(
+            _drop_duplicate_tool_outcome_rows,
+            tuple(filtered_rows),
+        )
+        if include_hidden_from_context:
+            return filtered_rows
+        return self._filter_rows_for_visible_context(filtered_rows)
+
+    def _filter_rows_for_active_segments(
+        self,
+        rows: Sequence[sqlite3.Row],
+    ) -> list[sqlite3.Row]:
+        if self._session_history_marker_repo is None or not rows:
+            return list(rows)
+
+        cutoff_by_session = self._latest_clear_cutoff_by_session(rows)
+        if not cutoff_by_session:
+            return list(rows)
+
+        filtered: list[sqlite3.Row] = []
+        for row in rows:
+            session_id = str(row["session_id"] or "")
+            if not session_id:
+                filtered.append(row)
+                continue
+            cutoff = cutoff_by_session.get(session_id)
+            if cutoff is None:
+                filtered.append(row)
+                continue
+            created_at = str(row["created_at"] or "")
+            if created_at > cutoff:
+                filtered.append(row)
+        return filtered
+
+    async def _filter_rows_for_active_segments_async(
+        self,
+        rows: Sequence[sqlite3.Row],
+    ) -> list[sqlite3.Row]:
+        if self._session_history_marker_repo is None or not rows:
+            return list(rows)
+
+        cutoff_by_session = await self._latest_clear_cutoff_by_session_async(rows)
+        if not cutoff_by_session:
+            return list(rows)
+
+        filtered: list[sqlite3.Row] = []
+        for row in rows:
+            session_id = str(row["session_id"] or "")
+            if not session_id:
+                filtered.append(row)
+                continue
+            cutoff = cutoff_by_session.get(session_id)
+            if cutoff is None:
+                filtered.append(row)
+                continue
+            created_at = str(row["created_at"] or "")
+            if created_at > cutoff:
+                filtered.append(row)
+        return filtered
+
+    def _filter_rows_for_visible_context(
+        self,
+        rows: Sequence[sqlite3.Row],
+    ) -> list[sqlite3.Row]:
+        return [row for row in rows if not bool(int(row["hidden_from_context"] or 0))]
+
+    def _latest_clear_cutoff_by_session(
+        self,
+        rows: Sequence[sqlite3.Row],
+    ) -> dict[str, str]:
+        if self._session_history_marker_repo is None:
+            return {}
+        session_ids = {
+            str(row["session_id"] or "") for row in rows if str(row["session_id"] or "")
+        }
+        if not session_ids:
+            return {}
+        cutoffs: dict[str, str] = {}
+        for session_id in session_ids:
+            latest_clear = self._session_history_marker_repo.get_latest(
+                session_id,
+                marker_type=SessionHistoryMarkerType.CLEAR,
+            )
+            if latest_clear is None:
+                continue
+            cutoffs[session_id] = latest_clear.created_at.isoformat()
+        return cutoffs
+
+    async def _latest_clear_cutoff_by_session_async(
+        self,
+        rows: Sequence[sqlite3.Row],
+    ) -> dict[str, str]:
+        if self._session_history_marker_repo is None:
+            return {}
+        session_ids = {
+            str(row["session_id"] or "") for row in rows if str(row["session_id"] or "")
+        }
+        if not session_ids:
+            return {}
+        cutoffs: dict[str, str] = {}
+        for session_id in session_ids:
+            latest_clear = await self._session_history_marker_repo.get_latest_async(
+                session_id,
+                marker_type=SessionHistoryMarkerType.CLEAR,
+            )
+            if latest_clear is None:
+                continue
+            cutoffs[session_id] = latest_clear.created_at.isoformat()
+        return cutoffs
+
+
+def _project_single_message_row(
+    row: sqlite3.Row,
+    msg: JsonValue,
+) -> dict[str, JsonValue]:
+    return {
+        "conversation_id": str(row["conversation_id"] or ""),
+        "agent_role_id": str(row["agent_role_id"] or ""),
+        "instance_id": str(row["instance_id"]),
+        "task_id": str(row["task_id"]),
+        "trace_id": str(row["trace_id"]),
+        "role": str(row["role"]),
+        "created_at": str(row["created_at"]),
+        "hidden_from_context": bool(int(row["hidden_from_context"] or 0)),
+        "hidden_reason": str(row["hidden_reason"] or ""),
+        "hidden_at": str(row["hidden_at"] or ""),
+        "hidden_marker_id": str(row["hidden_marker_id"] or ""),
+        "message": msg,
+    }
+
+
+def _role(msg: ModelMessage) -> str:
+
+    if isinstance(msg, ModelRequest):
+        return "user"
+    if isinstance(msg, ModelResponse):
+        return "assistant"
+    return "unknown"
+
+
+def _sanitize_message_json(message_json: str) -> str:
+    try:
+        parsed = json.loads(message_json)
+    except ValueError:
+        return message_json
+    sanitized = sanitize_task_status_payload(parsed)
+    return json.dumps(sanitized, ensure_ascii=False)
+
+
+def _load_message_list(message_json: str) -> list[object]:
+    try:
+        parsed = json.loads(_sanitize_message_json(message_json))
+    except ValueError:
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _message_has_user_prompt_text(message: object) -> bool:
+    if not isinstance(message, dict):
+        return False
+    raw_parts = message.get("parts")
+    if not isinstance(raw_parts, list):
+        return False
+    for raw_part in raw_parts:
+        if not isinstance(raw_part, dict):
+            continue
+        part_kind = str(raw_part.get("part_kind") or "").strip()
+        if part_kind != "user-prompt":
+            continue
+        if user_prompt_content_to_text(raw_part.get("content")).strip():
+            return True
+    return False
+
+
+def _dedupe_duplicate_objective_messages(
+    messages: list[dict[str, JsonValue]],
+) -> list[dict[str, JsonValue]]:
+    seen_user_prompts: dict[tuple[str, str], set[str]] = {}
+    deduped: list[dict[str, JsonValue]] = []
+    for message in messages:
+        conversation_id = str(message.get("conversation_id") or "")
+        task_id = str(message.get("task_id") or "")
+        repeated_user_prompt = _extract_repeatable_user_prompt(message.get("message"))
+        if not repeated_user_prompt:
+            deduped.append(message)
+            continue
+        seen_for_task = seen_user_prompts.setdefault((conversation_id, task_id), set())
+        if repeated_user_prompt in seen_for_task:
+            continue
+        seen_for_task.add(repeated_user_prompt)
+        deduped.append(message)
+    return deduped
+
+
+def _extract_repeatable_user_prompt(message: object) -> str | None:
+    if not isinstance(message, dict):
+        return None
+    parts = message.get("parts")
+    if not isinstance(parts, list) or not parts:
+        return None
+
+    prompt_chunks: list[object] = []
+    for part in parts:
+        if not isinstance(part, dict):
+            return None
+        kind = str(part.get("part_kind") or "")
+        if kind == "system-prompt":
+            continue
+        if kind != "user-prompt":
+            return None
+        content = part.get("content")
+        if user_prompt_content_to_text(content) == "":
+            return None
+        prompt_chunks.append(content)
+
+    if not prompt_chunks:
+        return None
+    return user_prompt_content_key(
+        prompt_chunks[0] if len(prompt_chunks) == 1 else prompt_chunks
+    )
+
+
+def _is_system_reminder_projection_message(message: object) -> bool:
+    if not isinstance(message, dict):
+        return False
+    parts = message.get("parts")
+    if not isinstance(parts, list) or not parts:
+        return False
+    for part in parts:
+        if not isinstance(part, dict):
+            return False
+        if str(part.get("part_kind") or "") != "user-prompt":
+            return False
+        content = user_prompt_content_to_text(part.get("content"))
+        if not _is_system_reminder_text(content):
+            return False
+    return True
+
+
+def _is_system_reminder_text(content: object) -> bool:
+    return is_rendered_system_reminder_text(str(content or ""))
+
+
+def _truncate_message_rows_to_safe_boundary(
+    rows: list[sqlite3.Row],
+) -> list[sqlite3.Row]:
+    grouped: dict[str, list[sqlite3.Row]] = {}
+    for row in rows:
+        grouped.setdefault(
+            str(row["conversation_id"] or row["instance_id"]), []
+        ).append(row)
+
+    allowed_ids: set[int] = set()
+    for conversation_rows in grouped.values():
+        allowed_ids.update(_safe_row_ids(conversation_rows))
+    return [
+        row
+        for row in rows
+        if isinstance(row["id"], int) and int(row["id"]) in allowed_ids
+    ]
+
+
+def _drop_duplicate_tool_outcome_rows(
+    rows: Sequence[sqlite3.Row],
+) -> list[sqlite3.Row]:
+    if not rows:
+        return []
+    history_rows: list[tuple[int, Sequence[ModelMessage]]] = []
+    for row in rows:
+        row_id = row["id"]
+        if not isinstance(row_id, int):
+            continue
+        messages = _validate_message_row(row)
+        if not messages:
+            continue
+        history_rows.append((row_id, messages))
+    duplicate_ids = _duplicate_tool_outcome_row_ids(history_rows)
+    if not duplicate_ids:
+        return list(rows)
+    return [
+        row
+        for row in rows
+        if not isinstance(row["id"], int) or int(row["id"]) not in duplicate_ids
+    ]
+
+
+def _truncate_model_history_to_safe_boundary(
+    messages: list[ModelMessage],
+) -> list[ModelMessage]:
+    return normalize_replayed_messages_to_safe_boundary(messages)
+
+
+def _history_ends_with_user_prompt(
+    history: Sequence[ModelMessage],
+    content_key: str,
+) -> bool:
+
+    target = str(content_key or "").strip()
+    if not target or not history:
+        return False
+    last = history[-1]
+    if not isinstance(last, ModelRequest):
+        return False
+    prompt_parts = [part for part in last.parts if isinstance(part, UserPromptPart)]
+    if len(prompt_parts) != len(last.parts):
+        return False
+    combined_parts = [part.content for part in prompt_parts]
+    current_key = user_prompt_content_key(
+        combined_parts[0] if len(combined_parts) == 1 else combined_parts
+    )
+    return current_key == target
+
+
+def _task_history_has_response(rows: Sequence[sqlite3.Row]) -> bool:
+
+    for row in rows:
+        messages = ModelMessagesTypeAdapter.validate_json(
+            _sanitize_message_json(str(row["message_json"]))
+        )
+        if any(isinstance(message, ModelResponse) for message in messages):
+            return True
+    return False
+
+
+def _row_is_user_prompt_only(row: sqlite3.Row) -> bool:
+
+    messages = ModelMessagesTypeAdapter.validate_json(
+        _sanitize_message_json(str(row["message_json"]))
+    )
+    if len(messages) != 1:
+        return False
+    message = messages[0]
+    if not isinstance(message, ModelRequest):
+        return False
+    prompt_parts = [part for part in message.parts if isinstance(part, UserPromptPart)]
+    return bool(prompt_parts) and len(prompt_parts) == len(message.parts)
+
+
+def _history_ends_with_system_prompt(
+    history: Sequence[ModelMessage],
+    content: str,
+) -> bool:
+
+    target = str(content or "").strip()
+    if not target or not history:
+        return False
+    last = history[-1]
+    if not isinstance(last, ModelRequest):
+        return False
+    prompt_parts = [part for part in last.parts if isinstance(part, SystemPromptPart)]
+    if len(prompt_parts) != len(last.parts):
+        return False
+    combined = "\n".join(
+        str(part.content or "").strip() for part in prompt_parts
+    ).strip()
+    return combined == target
+
+
+def _normalize_message_for_persistence(message: ModelMessage) -> ModelMessage:
+    if not isinstance(message, ModelResponse):
+        return message
+    next_parts = list(message.parts)
+    changed = False
+    for index, part in enumerate(message.parts):
+        if not isinstance(part, ToolCallPart) or not isinstance(part.args, str):
+            continue
+        repaired = repair_tool_args(part.args)
+        if not repaired.repair_applied and not repaired.fallback_invalid_json:
+            continue
+        next_parts[index] = replace(part, args=repaired.arguments_json)
+        changed = True
+    if not changed:
+        return message
+    return replace(message, parts=next_parts)
+
+
+def _safe_row_ids(rows: Sequence[sqlite3.Row]) -> set[int]:
+    history_rows: list[tuple[int, Sequence[ModelMessage]]] = []
+    for row in rows:
+        row_id = row["id"]
+        if not isinstance(row_id, int):
+            continue
+        messages = _validate_message_row(row)
+        if not messages:
+            continue
+        history_rows.append((row_id, messages))
+    return collect_safe_row_ids(history_rows) - _duplicate_tool_outcome_row_ids(
+        history_rows
+    )
+
+
+ToolCallKey = tuple[str, str]
+ToolCallSignature = tuple[str, str, str]
+
+
+def _duplicate_tool_outcome_row_ids(
+    rows: Sequence[tuple[int, Sequence[ModelMessage]]],
+) -> set[int]:
+    pending_tool_calls: set[ToolCallKey] = set()
+    pending_tool_call_signatures: dict[ToolCallKey, ToolCallSignature] = {}
+    recent_completed_tool_calls: set[ToolCallSignature] = set()
+    pending_duplicate_tool_calls: set[ToolCallKey] = set()
+    duplicate_row_ids: set[int] = set()
+    for row_id, messages in rows:
+        call_signatures = _message_tool_call_signatures(messages)
+        call_keys = _message_tool_call_keys(messages)
+        outcome_keys = _message_tool_outcome_keys(messages)
+        if (
+            call_signatures
+            and _messages_contain_only_tool_calls(messages)
+            and all(
+                signature in recent_completed_tool_calls
+                and _tool_call_signature_key(signature) not in pending_tool_calls
+                for signature in call_signatures
+            )
+        ):
+            duplicate_row_ids.add(row_id)
+            pending_duplicate_tool_calls.update(call_keys)
+            continue
+        if (
+            outcome_keys
+            and _messages_contain_only_tool_outcomes(messages)
+            and all(key in pending_duplicate_tool_calls for key in outcome_keys)
+        ):
+            duplicate_row_ids.add(row_id)
+            pending_duplicate_tool_calls.difference_update(outcome_keys)
+            continue
+
+        if call_signatures:
+            recent_completed_tool_calls.clear()
+        for signature in call_signatures:
+            key = _tool_call_signature_key(signature)
+            pending_tool_calls.add(key)
+            pending_tool_call_signatures[key] = signature
+        for key in outcome_keys:
+            if key in pending_tool_calls:
+                pending_tool_calls.remove(key)
+                signature = pending_tool_call_signatures.pop(key, None)
+                if signature is not None:
+                    recent_completed_tool_calls.add(signature)
+        if _messages_contain_user_prompt(messages):
+            recent_completed_tool_calls.clear()
+
+    return duplicate_row_ids
+
+
+def _messages_contain_only_tool_calls(
+    messages: Sequence[ModelMessage],
+) -> bool:
+    if not messages:
+        return False
+    for message in messages:
+        if not isinstance(message, ModelResponse) or not message.parts:
+            return False
+        if not all(isinstance(part, ToolCallPart) for part in message.parts):
+            return False
+    return True
+
+
+def _messages_contain_only_tool_outcomes(
+    messages: Sequence[ModelMessage],
+) -> bool:
+    if not messages:
+        return False
+    for message in messages:
+        if not isinstance(message, ModelRequest) or not message.parts:
+            return False
+        if not all(
+            isinstance(part, (ToolReturnPart, RetryPromptPart))
+            for part in message.parts
+        ):
+            return False
+    return True
+
+
+def _message_tool_call_keys(
+    messages: Sequence[ModelMessage],
+) -> list[ToolCallKey]:
+    return [
+        _tool_call_signature_key(signature)
+        for signature in _message_tool_call_signatures(messages)
+    ]
+
+
+def _message_tool_call_signatures(
+    messages: Sequence[ModelMessage],
+) -> list[ToolCallSignature]:
+    signatures: list[ToolCallSignature] = []
+    for message in messages:
+        if not isinstance(message, ModelResponse):
+            continue
+        for part in message.parts:
+            if not isinstance(part, ToolCallPart):
+                continue
+            key = _tool_call_key(part.tool_name, part.tool_call_id)
+            if key is not None:
+                signatures.append((*key, _tool_call_args_key(part.args)))
+    return signatures
+
+
+def _message_tool_outcome_keys(
+    messages: Sequence[ModelMessage],
+) -> list[ToolCallKey]:
+    keys: list[ToolCallKey] = []
+    for message in messages:
+        if not isinstance(message, ModelRequest):
+            continue
+        for part in message.parts:
+            if not isinstance(part, (ToolReturnPart, RetryPromptPart)):
+                continue
+            key = _tool_call_key(part.tool_name, part.tool_call_id)
+            if key is not None:
+                keys.append(key)
+    return keys
+
+
+def _tool_call_key(tool_name: object, tool_call_id: object) -> ToolCallKey | None:
+    normalized_tool_name = str(tool_name or "").strip()
+    normalized_tool_call_id = str(tool_call_id or "").strip()
+    if not normalized_tool_call_id:
+        return None
+    return normalized_tool_name, normalized_tool_call_id
+
+
+def _tool_call_signature_key(signature: ToolCallSignature) -> ToolCallKey:
+    return signature[0], signature[1]
+
+
+def _tool_call_args_key(args: object) -> str:
+    try:
+        return json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
+    except TypeError:
+        return str(args)
+
+
+def _messages_contain_user_prompt(
+    messages: Sequence[ModelMessage],
+) -> bool:
+    for message in messages:
+        if not isinstance(message, ModelRequest):
+            continue
+        if any(isinstance(part, UserPromptPart) for part in message.parts):
+            return True
+    return False
+
+
+def _validate_message_row(row: sqlite3.Row) -> list[ModelMessage]:
+    try:
+        return list(
+            ModelMessagesTypeAdapter.validate_json(
+                _sanitize_message_json(str(row["message_json"]))
+            )
+        )
+    except Exception as exc:
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            event="llm.history.dropped_invalid_message_row",
+            message="Dropped invalid persisted message row during history replay",
+            payload={
+                "row_id": _row_id(row),
+                "error_type": exc.__class__.__name__,
+                "error": str(exc),
+            },
+        )
+        return []
+
+
+def _validated_history_from_rows(
+    rows: Sequence[sqlite3.Row],
+) -> list[ModelMessage]:
+    allowed_ids = _safe_row_ids(rows)
+    result: list[ModelMessage] = []
+    for row in rows:
+        row_id = row["id"]
+        if not isinstance(row_id, int) or row_id not in allowed_ids:
+            continue
+        msgs = _validate_message_row(row)
+        result.extend(msgs)
+    return _truncate_model_history_to_safe_boundary(result)
+
+
+def _row_id(row: sqlite3.Row) -> int:
+    try:
+        raw_row_id = row["id"]
+    except (IndexError, KeyError):
+        return 0
+    return raw_row_id if isinstance(raw_row_id, int) else 0
+
+
+def _ensure_after_iso_value(candidate: datetime, raw_value: str | None) -> datetime:
+    if raw_value is None:
+        return candidate
+    try:
+        reference = datetime.fromisoformat(raw_value)
+    except ValueError:
+        return candidate
+    return _ensure_after_datetime(candidate, reference)
+
+
+def _ensure_after_datetime(candidate: datetime, reference: datetime) -> datetime:
+    normalized_reference = (
+        reference.replace(tzinfo=timezone.utc)
+        if reference.tzinfo is None
+        else reference.astimezone(timezone.utc)
+    )
+    if candidate > normalized_reference:
+        return candidate
+    return normalized_reference + timedelta(microseconds=1)

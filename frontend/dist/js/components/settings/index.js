@@ -3,40 +3,103 @@
  * Settings modal shell and tab routing.
  */
 import { bindAgentSettingsHandlers, loadAgentSettingsPanel } from './agentsSettings.js';
+import {
+    bindAgentRegistrySettingsHandlers,
+    showAgentRegistryListView,
+} from './agentRegistrySettings.js';
+import {
+    bindCommandsSettingsHandlers,
+    loadCommandsSettingsPanel,
+    syncCommandsSettingsActions,
+} from './commandsSettings.js';
+import {
+    bindHooksSettingsHandlers,
+    loadHooksSettingsPanel,
+    syncHooksSettingsActions,
+} from './hooksSettings.js';
+import {
+    bindPluginsSettingsHandlers,
+    loadPluginsSettingsPanel,
+    syncPluginsSettingsActions,
+} from './pluginsSettings.js';
 import { bindModelProfileHandlers, loadModelProfilesPanel } from './modelProfiles.js';
+import { renderModelProfilesPanelMarkup } from './modelProfiles/template.js';
 import {
     bindNotificationSettingsHandlers,
+    canSaveNotificationConfig,
+    collectNotificationConfigFromPanel,
+    getLoadedNotificationConfig,
     loadNotificationSettingsPanel,
+    renderNotificationSettingsSectionMarkup,
 } from './notifications.js';
 import { bindEnvironmentVariableSettingsHandlers, loadEnvironmentVariablesPanel } from './environmentVariables.js';
-import { bindGitHubSettingsHandlers, loadGitHubSettingsPanel } from './githubSettings.js';
 import {
     bindOrchestrationSettingsHandlers,
     loadOrchestrationSettingsPanel,
 } from './orchestrationSettings.js';
 import { bindProxySettingsHandlers, loadProxyStatusPanel } from './proxySettings.js';
 import { bindRoleSettingsHandlers, loadRoleSettingsPanel } from './rolesSettings.js';
-import { bindTriggerSettingsHandlers, loadTriggerSettingsPanel } from './triggerSettings.js';
+import {
+    bindSpeechSettingsHandlers,
+    canSaveSpeechConfig,
+    loadSpeechSettingsPanel,
+    readSpeechForm,
+    renderSpeechSettingsSectionMarkup,
+} from './speechSettings.js';
+import { bindWorkspaceSettingsHandlers, loadWorkspaceSettingsPanel } from './workspaceSettings.js';
 import { bindWebSettingsHandlers, loadWebSettingsPanel } from './webSettings.js';
 import { bindSystemStatusHandlers, loadMcpStatusPanel, loadSkillsStatusPanel } from './systemStatus.js';
+import { bindAppearanceHandlers, loadAppearancePanel, initAppearanceOnStartup } from './appearanceSettings.js';
+import { applyShellSafetyPolicyEnabled } from '../../app/prompt.js';
+import {
+    fetchGeneralConfig,
+    saveNotificationConfig,
+    saveGeneralConfig,
+    saveSpeechConfig,
+    fetchModelProfiles,
+    fetchOrchestrationConfig,
+    fetchRoleConfigOptions,
+    fetchRoleConfigs,
+} from '../../core/api.js';
+import { showToast } from '../../utils/feedback.js';
 import { t, translateDocument } from '../../utils/i18n.js';
+import { errorToPayload, logError, sysLog } from '../../utils/logger.js';
 
 let settingsModal = null;
-let currentTab = 'model';
+let currentTab = 'appearance';
 let initialized = false;
+let actionOwnershipObserver = null;
+let panelLoadRequestId = 0;
+let settingsWarmupPromise = null;
 
 const TAB_METADATA = {
+    appearance: {
+        titleKey: 'settings.panel.appearance.title',
+        descriptionKey: 'settings.panel.appearance.description',
+    },
+    general: {
+        titleKey: 'settings.panel.general.title',
+        descriptionKey: 'settings.panel.general.description',
+    },
     model: {
         titleKey: 'settings.panel.model.title',
         descriptionKey: 'settings.panel.model.description',
     },
-    skills: {
-        titleKey: 'settings.panel.skills.title',
-        descriptionKey: 'settings.panel.skills.description',
-    },
     mcp: {
         titleKey: 'settings.panel.mcp.title',
         descriptionKey: 'settings.panel.mcp.description',
+    },
+    plugins: {
+        titleKey: 'settings.panel.plugins.title',
+        descriptionKey: 'settings.panel.plugins.description',
+    },
+    commands: {
+        titleKey: 'settings.panel.commands.title',
+        descriptionKey: 'settings.panel.commands.description',
+    },
+    hooks: {
+        titleKey: 'settings.panel.hooks.title',
+        descriptionKey: 'settings.panel.hooks.description',
     },
     agents: {
         titleKey: 'settings.panel.agents.title',
@@ -50,10 +113,6 @@ const TAB_METADATA = {
         titleKey: 'settings.panel.orchestration.title',
         descriptionKey: 'settings.panel.orchestration.description',
     },
-    triggers: {
-        titleKey: 'settings.panel.triggers.title',
-        descriptionKey: 'settings.panel.triggers.description',
-    },
     notifications: {
         titleKey: 'settings.panel.notifications.title',
         descriptionKey: 'settings.panel.notifications.description',
@@ -62,13 +121,13 @@ const TAB_METADATA = {
         titleKey: 'settings.panel.web.title',
         descriptionKey: 'settings.panel.web.description',
     },
-    github: {
-        titleKey: 'settings.panel.github.title',
-        descriptionKey: 'settings.panel.github.description',
-    },
     proxy: {
         titleKey: 'settings.panel.proxy.title',
         descriptionKey: 'settings.panel.proxy.description',
+    },
+    workspace: {
+        titleKey: 'settings.panel.workspace.title',
+        descriptionKey: 'settings.panel.workspace.description',
     },
     environment: {
         titleKey: 'settings.panel.environment.title',
@@ -76,11 +135,231 @@ const TAB_METADATA = {
     },
 };
 
+const ACTION_TAB_OWNERS = {
+    'save-general-btn': 'general',
+    'add-profile-btn': 'model',
+    'save-profile-btn': 'model',
+    'cancel-profile-btn': 'model',
+    'test-profile-btn': 'model',
+    'profile-probe-inline-status': 'model',
+    'add-ssh-profile-btn': 'workspace',
+    'save-ssh-profile-btn': 'workspace',
+    'cancel-ssh-profile-btn': 'workspace',
+    'test-ssh-profile-btn': 'workspace',
+    'delete-ssh-profile-btn': 'workspace',
+    'test-agent-btn': 'agents',
+    'add-agent-btn': 'agents',
+    'refresh-agent-registry-btn': 'agents',
+    'back-agents-btn': 'agents',
+    'save-agent-btn': 'agents',
+    'delete-agent-btn': 'agents',
+    'cancel-agent-btn': 'agents',
+    'refresh-commands-btn': 'commands',
+    'add-command-btn': 'commands',
+    'preview-command-btn': 'commands',
+    'save-command-btn': 'commands',
+    'cancel-command-btn': 'commands',
+    'add-hook-btn': 'hooks',
+    'validate-hooks-btn': 'hooks',
+    'save-hooks-btn': 'hooks',
+    'add-role-btn': 'roles',
+    'validate-role-btn': 'roles',
+    'save-role-btn': 'roles',
+    'cancel-role-btn': 'roles',
+    'add-orchestration-preset-btn': 'orchestration',
+    'save-orchestration-btn': 'orchestration',
+    'cancel-orchestration-btn': 'orchestration',
+    'add-env-btn': 'environment',
+    'save-env-btn': 'environment',
+    'cancel-env-btn': 'environment',
+    'save-web-btn': 'web',
+    'save-proxy-btn': 'proxy',
+    'add-mcp-server-btn': 'mcp',
+    'save-mcp-server-btn': 'mcp',
+    'cancel-mcp-server-btn': 'mcp',
+    'reload-mcp-btn': 'mcp',
+    'refresh-plugins-btn': 'plugins',
+    'validate-plugin-btn': 'plugins',
+    'install-plugin-btn': 'plugins',
+    'reset-appearance-btn': 'appearance',
+};
+
 export function initSettings() {
     if (initialized) return;
     createModal();
     setupEventListeners();
     initialized = true;
+}
+
+function renderGeneralSettingsPanelMarkup() {
+    return `
+        <div class="settings-panel" id="general-panel" style="display:none;">
+            <div class="settings-section">
+                <div class="settings-content-stack general-settings-stack">
+                    <section class="proxy-form-section settings-form-section general-setting-card">
+                        <div class="proxy-form-section-header settings-form-section-header general-setting-card-head">
+                            <div class="general-setting-card-copy-block">
+                                <h5 class="settings-form-section-title" data-i18n="settings.appearance.diagnostics">Diagnostics</h5>
+                            </div>
+                            <label class="notification-toggle general-setting-toggle">
+                                <input type="checkbox" id="settings-show-diagnostics">
+                                <span class="notification-toggle-check" aria-hidden="true"></span>
+                                <span class="notification-toggle-label" data-i18n="settings.field.enabled">Enabled</span>
+                            </label>
+                        </div>
+                        <div class="appearance-grid settings-field-grid general-setting-card-body">
+                            <div class="appearance-row settings-field-row">
+                                <label for="settings-show-diagnostics" data-i18n="settings.appearance.show_diagnostics">Show diagnostic information</label>
+                                <span class="general-setting-inline-note" data-i18n="settings.appearance.show_diagnostics_note">Shows raw error codes and guardrail details in failed or verification-warning runs.</span>
+                            </div>
+                        </div>
+                    </section>
+                    <section class="proxy-form-section settings-form-section general-setting-card">
+                        <div class="proxy-form-section-header settings-form-section-header general-setting-card-head">
+                            <div class="general-setting-card-copy-block">
+                                <h5 data-i18n="settings.general.shell_policy_title">Shell Policy</h5>
+                            </div>
+                            <label class="notification-toggle general-setting-toggle">
+                                <input type="checkbox" id="settings-shell-safety-policy-toggle" checked>
+                                <span class="notification-toggle-check" aria-hidden="true"></span>
+                                <span class="notification-toggle-label" data-i18n="settings.field.enabled">Enabled</span>
+                            </label>
+                        </div>
+                        <div class="appearance-grid settings-field-grid general-setting-card-body">
+                            <div class="appearance-row settings-field-row">
+                                <label for="settings-shell-safety-policy-toggle" data-i18n="settings.general.shell_policy">Enable shell safety policy</label>
+                                <span class="general-setting-inline-note" data-i18n="settings.general.shell_policy_state">Applies to future runs after you save.</span>
+                            </div>
+                        </div>
+                    </section>
+                    ${renderSpeechSettingsSectionMarkup()}
+                    ${renderNotificationSettingsSectionMarkup()}
+                </div>
+            </div>
+        </div>
+    `;
+}
+
+function bindGeneralSettingsHandlers() {
+    const toggle = document.getElementById('settings-shell-safety-policy-toggle');
+    if (toggle && toggle.dataset.bound !== 'true') {
+        toggle.dataset.bound = 'true';
+    }
+    const saveBtn = document.getElementById('save-general-btn');
+    if (saveBtn && saveBtn.dataset.bound !== 'true') {
+        saveBtn.dataset.bound = 'true';
+        saveBtn.addEventListener('click', () => handleSaveGeneralSettings());
+    }
+}
+
+async function handleSaveGeneralSettings() {
+    const toggle = document.getElementById('settings-shell-safety-policy-toggle');
+    const nextShellSafetyPolicyEnabled = toggle?.checked !== false;
+    try {
+        await saveGeneralConfig({
+            shell_safety_policy_enabled: nextShellSafetyPolicyEnabled,
+        });
+    } catch (error) {
+        const message = error?.message || t('settings.general.save_failed');
+        showToast({
+            title: t('settings.general.save_failed'),
+            message,
+            tone: 'danger',
+        });
+        sysLog(message, 'log-error');
+        return;
+    }
+
+    applyShellSafetyPolicyEnabled(nextShellSafetyPolicyEnabled);
+    showToast({
+        title: t('settings.general.saved'),
+        message: t('settings.general.saved_message'),
+        tone: 'success',
+    });
+    sysLog(t('settings.general.log_saved'));
+
+    if (canSaveSpeechConfig()) {
+        try {
+            await saveSpeechConfig(readSpeechForm());
+            document.dispatchEvent(new CustomEvent('agent-teams-speech-config-updated'));
+        } catch (error) {
+            const message = error?.message || t('settings.speech.save_failed');
+            showToast({
+                title: t('settings.speech.save_failed'),
+                message,
+                tone: 'danger',
+            });
+            sysLog(message, 'log-error');
+        }
+    }
+    if (canSaveNotificationConfig()) {
+        try {
+            await saveNotificationConfig(
+                mergeNotificationConfig(
+                    getLoadedNotificationConfig(),
+                    collectNotificationConfigFromPanel(),
+                ),
+            );
+        } catch (error) {
+            const message = error?.message || t('settings.notifications.save_failed');
+            showToast({
+                title: t('settings.notifications.save_failed'),
+                message,
+                tone: 'danger',
+            });
+            sysLog(message, 'log-error');
+        }
+    }
+}
+
+async function loadGeneralSettingsPanel() {
+    const toggle = document.getElementById('settings-shell-safety-policy-toggle');
+    const generalConfig = await fetchGeneralConfig();
+    const enabled = generalConfig?.shell_safety_policy_enabled !== false;
+    applyShellSafetyPolicyEnabled(enabled);
+    if (toggle) {
+        toggle.checked = enabled;
+    }
+    return Promise.all([
+        loadSpeechSettingsPanel(),
+        loadNotificationSettingsPanel(),
+    ]);
+}
+
+function mergeNotificationConfig(currentConfig, panelConfig) {
+    const nextConfig = {};
+    const baseConfig = (currentConfig && typeof currentConfig === 'object')
+        ? currentConfig
+        : {};
+    const patchConfig = (panelConfig && typeof panelConfig === 'object')
+        ? panelConfig
+        : {};
+    Object.keys(baseConfig).forEach(type => {
+        const existingRule = baseConfig[type];
+        nextConfig[type] = existingRule && typeof existingRule === 'object'
+            ? { ...existingRule }
+            : existingRule;
+    });
+    Object.keys(patchConfig).forEach(type => {
+        const existingRule = baseConfig[type];
+        const nextRule = patchConfig[type];
+        const mergedRule = existingRule && typeof existingRule === 'object'
+            ? { ...existingRule }
+            : {};
+        if (nextRule && typeof nextRule === 'object') {
+            if (Object.prototype.hasOwnProperty.call(nextRule, 'enabled')) {
+                mergedRule.enabled = nextRule.enabled;
+            }
+            if (Array.isArray(nextRule.channels)) {
+                const preservedChannels = Array.isArray(existingRule?.channels)
+                    ? existingRule.channels.filter(channel => !['browser', 'toast'].includes(channel))
+                    : [];
+                mergedRule.channels = [...preservedChannels, ...nextRule.channels];
+            }
+        }
+        nextConfig[type] = mergedRule;
+    });
+    return nextConfig;
 }
 
 function createModal() {
@@ -94,17 +373,29 @@ function createModal() {
                     <h2 data-i18n="settings.shell">Settings</h2>
                 </div>
                 <div class="settings-tabs" role="tablist" aria-label="Settings Sections" data-i18n-aria-label="settings.sections">
-                    <button class="settings-tab active" data-tab="model">
-                        <span class="settings-tab-label" data-i18n="settings.tab.model">Model</span>
+                    <button class="settings-tab active" data-tab="appearance">
+                        <span class="settings-tab-label" data-i18n="settings.tab.appearance">Appearance</span>
                     </button>
-                    <button class="settings-tab" data-tab="skills">
-                        <span class="settings-tab-label" data-i18n="settings.tab.skills">Skills</span>
+                    <button class="settings-tab" data-tab="general">
+                        <span class="settings-tab-label" data-i18n="settings.tab.general">General</span>
+                    </button>
+                    <button class="settings-tab" data-tab="model">
+                        <span class="settings-tab-label" data-i18n="settings.tab.model">Model</span>
                     </button>
                     <button class="settings-tab" data-tab="mcp">
                         <span class="settings-tab-label" data-i18n="settings.tab.mcp">MCP</span>
                     </button>
+                    <button class="settings-tab" data-tab="plugins">
+                        <span class="settings-tab-label" data-i18n="settings.tab.plugins">Plugins</span>
+                    </button>
+                    <button class="settings-tab" data-tab="commands">
+                        <span class="settings-tab-label" data-i18n="settings.tab.commands">Commands</span>
+                    </button>
+                    <button class="settings-tab" data-tab="hooks">
+                        <span class="settings-tab-label" data-i18n="settings.tab.hooks">Hooks</span>
+                    </button>
                     <button class="settings-tab" data-tab="agents">
-                        <span class="settings-tab-label" data-i18n="settings.tab.agents">Agents</span>
+                        <span class="settings-tab-label" data-i18n="settings.tab.agents">Agent Runtime</span>
                     </button>
                     <button class="settings-tab" data-tab="roles">
                         <span class="settings-tab-label" data-i18n="settings.tab.roles">Roles</span>
@@ -112,20 +403,14 @@ function createModal() {
                     <button class="settings-tab" data-tab="orchestration">
                         <span class="settings-tab-label" data-i18n="settings.tab.orchestration">Orchestration</span>
                     </button>
-                    <button class="settings-tab" data-tab="triggers">
-                        <span class="settings-tab-label" data-i18n="settings.tab.triggers">Gateway</span>
-                    </button>
-                    <button class="settings-tab" data-tab="notifications">
-                        <span class="settings-tab-label" data-i18n="settings.tab.notifications">Notifications</span>
-                    </button>
                     <button class="settings-tab" data-tab="web">
                         <span class="settings-tab-label" data-i18n="settings.tab.web">Web</span>
                     </button>
-                    <button class="settings-tab" data-tab="github">
-                        <span class="settings-tab-label" data-i18n="settings.tab.github">GitHub</span>
-                    </button>
                     <button class="settings-tab" data-tab="proxy">
                         <span class="settings-tab-label" data-i18n="settings.tab.proxy">Proxy</span>
+                    </button>
+                    <button class="settings-tab" data-tab="workspace">
+                        <span class="settings-tab-label" data-i18n="settings.tab.workspace">Remote Workspace</span>
                     </button>
                     <button class="settings-tab" data-tab="environment">
                         <span class="settings-tab-label" data-i18n="settings.tab.environment">Environment</span>
@@ -135,135 +420,135 @@ function createModal() {
             <section class="settings-main">
                 <div class="modal-header settings-modal-header">
                     <div class="settings-modal-heading">
-                        <h2 id="settings-panel-title">Model</h2>
-                        <p id="settings-panel-description">Manage providers, endpoints, request limits, and sampling defaults.</p>
+                        <h2 id="settings-panel-title" data-i18n="settings.panel.appearance.title">Appearance</h2>
+                        <p id="settings-panel-description" data-i18n="settings.panel.appearance.description">Customize colors, fonts, and density. Changes apply in real time.</p>
                     </div>
                     <button class="close-btn" id="settings-close" aria-label="Close Settings" data-i18n-aria-label="settings.close_title" data-i18n-title="settings.close_title">&times;</button>
                 </div>
                 <div class="settings-body">
-                    <div class="settings-panel" id="model-panel">
-                        <div class="settings-section settings-section-model">
-                            <div class="settings-content-stack settings-model-stack">
-                                <div class="profiles-list" id="profiles-list"></div>
-                                <div class="profile-editor" id="profile-editor" style="display:none;">
-                                    <div class="profile-editor-header">
-                                        <h4 id="profile-editor-title" data-i18n="settings.model.add_profile">Add Profile</h4>
-                                        <p data-i18n="settings.model.editor_copy">Configure the endpoint, model, request limits, and sampling defaults.</p>
+                    <div class="settings-panel" id="appearance-panel">
+                        <div class="settings-section">
+                            <div class="settings-content-stack">
+                                <section class="proxy-form-section settings-form-section general-setting-card">
+                                    <div class="proxy-form-section-header settings-form-section-header general-setting-card-head general-setting-card-head-compact">
+                                        <div class="general-setting-card-copy-block">
+                                            <h5 class="settings-form-section-title" data-i18n="settings.appearance.colors">Colors</h5>
+                                        </div>
                                     </div>
-                                    <form class="profile-editor-form" id="profile-editor-form" autocomplete="off">
-                                        <div class="profile-editor-grid">
-                                            <div class="form-group">
-                                                <label for="profile-name" data-i18n="settings.model.profile_name">Profile Name</label>
-                                                <input type="text" id="profile-name" placeholder="e.g., default, kimi" data-i18n-placeholder="settings.model.profile_name_placeholder" autocomplete="off">
-                                            </div>
-                                            <div class="form-group">
-                                                <label for="profile-provider" data-i18n="settings.model.provider">Provider</label>
-                                                <select id="profile-provider">
-                                                    <option value="openai_compatible">openai_compatible</option>
-                                                    <option value="bigmodel">bigmodel</option>
-                                                    <option value="minimax">minimax</option>
-                                                </select>
-                                            </div>
-                                            <div class="form-group form-group-span-2">
-                                                <label for="profile-base-url" data-i18n="settings.model.base_url">Base URL</label>
-                                                <input type="text" id="profile-base-url" placeholder="e.g., https://api.openai.com/v1" data-i18n-placeholder="settings.model.base_url_placeholder" autocomplete="url">
-                                            </div>
-                                            <div class="profile-credentials-row form-group-span-2">
-                                                <div class="form-group">
-                                                    <label for="profile-api-key" data-i18n="settings.model.api_key">API Key</label>
-                                                    <div class="secure-input-row">
-                                                        <input type="password" id="profile-api-key" placeholder="sk-..." autocomplete="current-password">
-                                                        <button class="secure-input-btn" id="toggle-profile-api-key-btn" type="button" title="Show API key" aria-label="Show API key" style="display:none;">
-                                                            <svg viewBox="0 0 24 24" fill="none" class="icon-sm" aria-hidden="true">
-                                                                <path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"></path>
-                                                                <circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="1.8"></circle>
-                                                            </svg>
-                                                        </button>
-                                                    </div>
-                                                </div>
-                                                <div class="form-group form-group-inline-action">
-                                                    <label for="profile-model" data-i18n="settings.model.model">Model</label>
-                                                    <div class="secure-input-row profile-model-input-row">
-                                                        <input type="text" id="profile-model" autocomplete="off" spellcheck="false">
-                                                        <button class="secure-input-btn profile-model-menu-btn" id="open-profile-model-menu-btn" type="button" title="Show Models" aria-label="Show Models">
-                                                            <svg viewBox="0 0 24 24" fill="none" class="icon-sm" aria-hidden="true">
-                                                                <path d="m7 10 5 5 5-5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path>
-                                                            </svg>
-                                                        </button>
-                                                        <button class="secure-input-btn profile-discovery-btn" id="fetch-profile-models-btn" type="button" title="Fetch Models" aria-label="Fetch Models">
-                                                            <svg viewBox="0 0 24 24" fill="none" class="icon-sm" aria-hidden="true">
-                                                                <path d="M20 12a8 8 0 1 1-2.34-5.66" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path>
-                                                                <path d="M20 4v6h-6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path>
-                                                            </svg>
-                                                        </button>
-                                                        <div class="profile-model-menu" id="profile-model-menu" style="display:none;"></div>
-                                                    </div>
-                                                </div>
+                                    <div class="appearance-grid settings-field-grid general-setting-card-body">
+                                        <div class="appearance-row settings-field-row">
+                                            <label data-i18n="settings.appearance.accent">Accent</label>
+                                            <div class="appearance-color-field" id="appearance-accent">
+                                                <input type="color" value="#91a698">
+                                                <input type="text" placeholder="#91a698" spellcheck="false">
                                             </div>
                                         </div>
-                                        <div class="profile-model-discovery-status" id="profile-model-discovery-status" style="display:none;"></div>
-                                        <div class="profile-editor-subsection">
-                                            <h5 data-i18n="settings.model.request_controls">Request Controls</h5>
-                                            <div class="form-row">
-                                                <div class="form-group">
-                                                    <label for="profile-temperature" data-i18n="settings.model.temperature">Temperature</label>
-                                                    <input type="number" id="profile-temperature" value="0.7" step="0.1" min="0" max="2" autocomplete="off">
-                                                </div>
-                                                <div class="form-group">
-                                                    <label for="profile-top-p" data-i18n="settings.model.top_p">Top P</label>
-                                                    <input type="number" id="profile-top-p" value="1.0" step="0.1" min="0" max="1" autocomplete="off">
-                                                </div>
-                                                <div class="form-group">
-                                                    <label for="profile-max-tokens" data-i18n="settings.model.max_output_tokens">Max Output Tokens</label>
-                                                    <input type="number" id="profile-max-tokens" value="100000" min="1" autocomplete="off">
-                                                </div>
-                                                <div class="form-group">
-                                                    <label for="profile-context-window" data-i18n="settings.model.context_window">Context Window</label>
-                                                    <input type="number" id="profile-context-window" value="" min="1" autocomplete="off" placeholder="Optional" data-i18n-placeholder="settings.model.optional">
-                                                </div>
-                                                <div class="form-group">
-                                                    <label for="profile-connect-timeout" data-i18n="settings.model.connect_timeout">Connect Timeout (s)</label>
-                                                    <input type="number" id="profile-connect-timeout" value="15" step="1" min="1" max="300" autocomplete="off">
-                                                </div>
-                                                <div class="form-group">
-                                                    <label for="profile-ssl-verify" data-i18n="settings.proxy.default_ssl">SSL Verification</label>
-                                                    <select id="profile-ssl-verify">
-                                                        <option value="" data-i18n="settings.proxy.inherit_default">Inherit Default</option>
-                                                        <option value="true" data-i18n="settings.proxy.verify">Verify</option>
-                                                        <option value="false" data-i18n="settings.proxy.skip_verify">Skip Verify</option>
-                                                    </select>
-                                                </div>
+                                        <div class="appearance-row settings-field-row">
+                                            <label data-i18n="settings.appearance.background">Background</label>
+                                            <div class="appearance-color-field" id="appearance-background">
+                                                <input type="color" value="#161718">
+                                                <input type="text" placeholder="#161718" spellcheck="false">
                                             </div>
                                         </div>
-                                        <div class="profile-default-row">
-                                            <input type="checkbox" id="profile-is-default">
-                                            <label for="profile-is-default" data-i18n="settings.model.set_default">Set as default profile</label>
+                                        <div class="appearance-row settings-field-row">
+                                            <label data-i18n="settings.appearance.foreground">Foreground</label>
+                                            <div class="appearance-color-field" id="appearance-foreground">
+                                                <input type="color" value="#f0eee8">
+                                                <input type="text" placeholder="#f0eee8" spellcheck="false">
+                                            </div>
                                         </div>
-                                        <div class="profile-probe-status" id="profile-probe-status" style="display:none;"></div>
-                                    </form>
-                                </div>
+                                    </div>
+                                </section>
+                                <section class="proxy-form-section settings-form-section general-setting-card">
+                                    <div class="proxy-form-section-header settings-form-section-header general-setting-card-head general-setting-card-head-compact">
+                                        <div class="general-setting-card-copy-block">
+                                            <h5 class="settings-form-section-title" data-i18n="settings.appearance.fonts">Fonts</h5>
+                                        </div>
+                                    </div>
+                                    <div class="appearance-grid settings-field-grid general-setting-card-body">
+                                        <div class="appearance-row settings-field-row">
+                                            <label data-i18n="settings.appearance.ui_font">UI Font</label>
+                                            <input type="text" id="appearance-ui-font" class="appearance-text-input" placeholder="IBM Plex Sans, sans-serif" spellcheck="false">
+                                        </div>
+                                        <div class="appearance-row settings-field-row">
+                                            <label data-i18n="settings.appearance.code_font">Code Font</label>
+                                            <input type="text" id="appearance-code-font" class="appearance-text-input" placeholder="IBM Plex Mono, monospace" spellcheck="false">
+                                        </div>
+                                    </div>
+                                </section>
+                                <section class="proxy-form-section settings-form-section general-setting-card">
+                                    <div class="proxy-form-section-header settings-form-section-header general-setting-card-head general-setting-card-head-compact">
+                                        <div class="general-setting-card-copy-block">
+                                            <h5 class="settings-form-section-title" data-i18n="settings.appearance.sizing">Sizing</h5>
+                                        </div>
+                                    </div>
+                                    <div class="appearance-grid settings-field-grid general-setting-card-body">
+                                        <div class="appearance-row settings-field-row">
+                                            <label data-i18n="settings.appearance.ui_font_size">UI Font Size</label>
+                                            <div class="appearance-range-field">
+                                                <input type="range" id="appearance-ui-font-size" min="11" max="20" value="15" step="1">
+                                                <span class="appearance-range-value">15px</span>
+                                            </div>
+                                        </div>
+                                        <div class="appearance-row settings-field-row">
+                                            <label data-i18n="settings.appearance.code_font_size">Code Font Size</label>
+                                            <div class="appearance-range-field">
+                                                <input type="range" id="appearance-code-font-size" min="10" max="18" value="13" step="1">
+                                                <span class="appearance-range-value">13px</span>
+                                            </div>
+                                        </div>
+                                        <div class="appearance-row settings-field-row">
+                                            <label data-i18n="settings.appearance.line_height">Line Height</label>
+                                            <div class="appearance-range-field">
+                                                <input type="range" id="appearance-line-height" min="120" max="200" value="148" step="2">
+                                                <span class="appearance-range-value">1.48</span>
+                                            </div>
+                                        </div>
+                                        <div class="appearance-row settings-field-row">
+                                            <label data-i18n="settings.appearance.msg_density">Message Spacing</label>
+                                            <div class="appearance-range-field">
+                                                <input type="range" id="appearance-msg-density" min="30" max="150" value="85" step="5">
+                                                <span class="appearance-range-value">0.85</span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </section>
                             </div>
                         </div>
                     </div>
+                    ${renderGeneralSettingsPanelMarkup()}
+                    ${renderModelProfilesPanelMarkup()}
                     <div class="settings-panel" id="mcp-panel" style="display:none;">
                         <div class="settings-section">
                             <div class="settings-content-stack status-stack" id="mcp-status"></div>
                         </div>
                     </div>
+                    <div class="settings-panel" id="commands-panel" style="display:none;">
+                        <div class="settings-section">
+                            <div class="settings-content-stack status-stack" id="commands-status"></div>
+                        </div>
+                    </div>
+                    <div class="settings-panel" id="hooks-panel" style="display:none;">
+                        <div class="settings-section">
+                            <div class="settings-content-stack status-stack" id="hooks-runtime-status"></div>
+                        </div>
+                    </div>
                     <div class="settings-panel" id="agents-panel" style="display:none;">
                         <div class="settings-section">
                             <div class="settings-content-stack">
-                                <div class="roles-list" id="agents-list"></div>
-                                <div class="role-editor-panel" id="agent-editor-panel" style="display:none;">
+                                <div class="agent-runtime-settings-view" id="agent-runtime-settings-view">
+                                    <div class="roles-list" id="agents-list"></div>
+                                    <div class="role-editor-panel" id="agent-editor-panel" style="display:none;">
                                     <div class="roles-editor-empty settings-empty-state settings-empty-state-compact" id="agents-editor-empty" style="display:none;">
-                                        <h4 data-i18n="settings.agents.empty">No agent selected</h4>
-                                        <p data-i18n="settings.agents.empty_copy">Select an external ACP agent to edit its transport settings.</p>
+                                        <h4 data-i18n="settings.agents.empty">No runtime selected</h4>
+                                        <p data-i18n="settings.agents.empty_copy">Select an agent runtime to edit its protocol and transport settings.</p>
                                     </div>
                                     <div class="role-editor-form" id="agent-editor-form" style="display:none;">
-                                        <div class="role-editor-header">
-                                            <div>
-                                                <h4 data-i18n="settings.agents.editor">Agent Editor</h4>
-                                                <p data-i18n="settings.agents.editor_copy">Configure an ACP-compatible external agent and bind it to roles.</p>
+                                        <div class="agent-create-method-bar" id="agent-create-method-bar" style="display:none;">
+                                            <span data-i18n="settings.agents.create_method_label">New agent</span>
+                                            <div class="agent-create-method-tabs" role="tablist" aria-label="Agent creation method">
+                                                <button class="agent-create-method-tab active" id="agent-create-custom-btn" type="button" role="tab" aria-selected="true" data-agent-create-method="custom" data-i18n="settings.action.add_agent_custom">Custom</button>
+                                                <button class="agent-create-method-tab" id="agent-create-registry-btn" type="button" role="tab" aria-selected="false" data-agent-create-method="registry" data-i18n="settings.action.add_agent_registry">Registry</button>
                                             </div>
                                         </div>
                                         <div class="role-editor-sections">
@@ -282,11 +567,20 @@ function createModal() {
                                                         <input type="text" id="agent-description-input" placeholder="Short summary shown in role binding pickers" data-i18n-placeholder="settings.agents.description_placeholder">
                                                     </div>
                                                     <div class="form-group">
+                                                        <label for="agent-protocol-input" data-i18n="settings.agents.protocol">Protocol</label>
+                                                        <select id="agent-protocol-input">
+                                                            <option value="acp" data-i18n="settings.agents.protocol_acp">ACP</option>
+                                                            <option value="a2a" data-i18n="settings.agents.protocol_a2a">A2A</option>
+                                                            <option value="cli" data-i18n="settings.agents.protocol_cli">CLI</option>
+                                                        </select>
+                                                    </div>
+                                                    <div class="form-group">
                                                         <label for="agent-transport-input" data-i18n="settings.agents.transport">Transport</label>
                                                         <select id="agent-transport-input">
                                                             <option value="stdio" data-i18n="settings.agents.transport_stdio">stdio</option>
                                                             <option value="streamable_http" data-i18n="settings.agents.transport_http">streamable_http</option>
                                                             <option value="custom" data-i18n="settings.agents.transport_custom">custom</option>
+                                                            <option value="registry" data-i18n="settings.agents.transport_registry">registry</option>
                                                         </select>
                                                     </div>
                                                 </div>
@@ -348,9 +642,79 @@ function createModal() {
                                                     </div>
                                                 </div>
                                             </section>
+                                            <section class="role-editor-section" id="agent-transport-registry" style="display:none;">
+                                                <h5 data-i18n="settings.agents.registry_transport">ACP Registry Transport</h5>
+                                                <div class="profile-editor-grid role-editor-grid">
+                                                    <div class="form-group">
+                                                        <label for="agent-registry-id-input" data-i18n="settings.agents.registry_id">Registry ID</label>
+                                                        <input type="text" id="agent-registry-id-input" placeholder="e.g. zed-industries/claude-code-acp" data-i18n-placeholder="settings.agents.registry_id_placeholder">
+                                                    </div>
+                                                    <div class="form-group">
+                                                        <label for="agent-registry-distribution-input" data-i18n="settings.agents.registry_distribution">Distribution</label>
+                                                        <select id="agent-registry-distribution-input">
+                                                            <option value="auto" data-i18n="settings.agents.registry_distribution_auto">Auto</option>
+                                                            <option value="binary" data-i18n="settings.agents.registry_distribution_binary">Binary</option>
+                                                            <option value="npx" data-i18n="settings.agents.registry_distribution_npx">npx</option>
+                                                            <option value="uvx" data-i18n="settings.agents.registry_distribution_uvx">uvx</option>
+                                                        </select>
+                                                    </div>
+                                                    <div class="form-group form-group-span-2">
+                                                        <label for="agent-registry-version-input" data-i18n="settings.agents.registry_version">Registry Version</label>
+                                                        <input type="text" id="agent-registry-version-input" readonly>
+                                                    </div>
+                                                </div>
+                                                <div class="role-prompt-header">
+                                                    <h5 data-i18n="settings.agents.env_bindings">Environment Bindings</h5>
+                                                    <div class="role-prompt-tabs">
+                                                        <button class="role-prompt-tab active" id="add-agent-registry-env-btn" type="button" data-i18n="settings.agents.add_env_binding">Add Variable</button>
+                                                    </div>
+                                                </div>
+                                                <div id="agent-registry-env-list"></div>
+                                            </section>
                                         </div>
                                         <div class="role-editor-status" id="agent-editor-status" style="display:none;"></div>
                                     </div>
+                                    </div>
+                                </div>
+                                <div class="agent-registry-view" id="agent-registry-view" style="display:none;">
+                                    <div class="agent-create-method-bar" id="agent-registry-create-method-bar" style="display:none;">
+                                        <span data-i18n="settings.agents.create_method_label">New agent</span>
+                                        <div class="agent-create-method-tabs" role="tablist" aria-label="Agent creation method">
+                                            <button class="agent-create-method-tab" id="agent-registry-create-custom-btn" type="button" role="tab" aria-selected="false" data-agent-create-method="custom" data-i18n="settings.action.add_agent_custom">Custom</button>
+                                            <button class="agent-create-method-tab active" id="agent-registry-create-registry-btn" type="button" role="tab" aria-selected="true" data-agent-create-method="registry" data-i18n="settings.action.add_agent_registry">Registry</button>
+                                        </div>
+                                    </div>
+                                    <div class="agent-registry-source-field proxy-inline-field web-provider-inline-field">
+                                        <span class="settings-token-source-label" data-i18n="settings.agents.registry_source_label">Source</span>
+                                        <a class="web-provider-link-card agent-registry-source-link" id="agent-registry-source-link" href="https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json" target="_blank" rel="noreferrer" title="https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json" aria-label="https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json">
+                                            <span class="web-provider-link-copy">
+                                                <span class="web-provider-link-url agent-registry-source-url">https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json</span>
+                                            </span>
+                                            <span class="web-provider-link-arrow" aria-hidden="true">
+                                                <svg viewBox="0 0 24 24" fill="none" class="icon-sm">
+                                                    <path d="M7 17L17 7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path>
+                                                    <path d="M9 7h8v8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path>
+                                                </svg>
+                                            </span>
+                                        </a>
+                                    </div>
+                                    <div class="agent-registry-toolbar">
+                                        <label class="agent-registry-search-field" for="agent-registry-search-input">
+                                            <span data-i18n="settings.agents.registry_search_label">Search</span>
+                                            <input type="search" id="agent-registry-search-input" placeholder="Search registry" data-i18n-placeholder="settings.agents.registry_search" autocomplete="off">
+                                        </label>
+                                        <label class="agent-registry-filter-field" for="agent-registry-filter-input">
+                                            <span data-i18n="settings.agents.registry_filter_label">Status</span>
+                                            <select id="agent-registry-filter-input" aria-label="Registry filter">
+                                                <option value="all" data-i18n="settings.agents.registry_filter_all">All</option>
+                                                <option value="available" data-i18n="settings.agents.registry_filter_available">Available</option>
+                                                <option value="installed" data-i18n="settings.agents.registry_filter_installed">Installed</option>
+                                                <option value="updates" data-i18n="settings.agents.registry_filter_updates">Updates</option>
+                                            </select>
+                                        </label>
+                                    </div>
+                                    <div class="role-editor-status" id="agent-registry-status" style="display:none;"></div>
+                                    <div class="roles-list" id="agent-registry-list"></div>
                                 </div>
                             </div>
                         </div>
@@ -398,11 +762,15 @@ function createModal() {
                                                         <label for="role-bound-agent-input">Bound Agent</label>
                                                         <select id="role-bound-agent-input"></select>
                                                     </div>
+                                                    <div class="form-group">
+                                                        <label for="role-execution-surface-input">Execution Surface</label>
+                                                        <select id="role-execution-surface-input"></select>
+                                                    </div>
                                                 </div>
                                             </section>
                                             <section class="role-editor-section">
-                                                <h5 data-i18n="settings.roles.allowed_tools">Allowed Tools</h5>
-                                                <div class="role-option-picker role-option-picker-tools" id="role-tools-picker"></div>
+                                                <h5 data-i18n="settings.roles.tool_groups">Tool Groups</h5>
+                                                <div class="role-option-picker role-option-picker-single" id="role-tool-groups-picker"></div>
                                             </section>
                                             <section class="role-editor-section">
                                                 <h5 data-i18n="settings.roles.mcp_servers">MCP Servers</h5>
@@ -425,6 +793,10 @@ function createModal() {
                                                         <span data-i18n="settings.roles.memory_note">Role memory is global by role. Stage documents are managed separately under the bound workspace and session directory.</span>
                                                     </p>
                                                 </div>
+                                            </section>
+                                            <section class="role-editor-section">
+                                                <h5 data-i18n="settings.roles.contract">Role Contract</h5>
+                                                <textarea class="config-textarea role-contract-textarea" id="role-contract-input" placeholder='{"preconditions":[],"postconditions":[],"invariants":[]}' data-i18n-placeholder="settings.roles.contract_placeholder"></textarea>
                                             </section>
                                             <section class="role-editor-section">
                                                 <div class="role-prompt-header">
@@ -491,155 +863,68 @@ function createModal() {
                             </div>
                         </div>
                     </div>
-                    <div class="settings-panel" id="notifications-panel" style="display:none;">
-                        <div class="settings-section">
-                            <div class="settings-content-stack notifications-panel-body">
-                                <p class="notifications-help" data-i18n="settings.notifications.help">
-                                    A notification is sent only when <strong>Enabled</strong> is on and at least one delivery channel is selected.
-                                </p>
-                                <div class="notification-grid">
-                                    <div class="notification-row" data-notif-type="tool_approval_requested">
-                                        <div class="notification-row-main">
-                                            <div class="notification-row-title" data-i18n="settings.notifications.tool_approval_requested">Tool approval requested</div>
-                                            <div class="notification-row-desc" data-i18n="settings.notifications.tool_approval_requested_copy">When an agent asks for approval before a tool call.</div>
-                                        </div>
-                                        <label class="notification-toggle">
-                                            <input type="checkbox" id="notif-tool_approval_requested-enabled">
-                                            <span class="notification-toggle-check" aria-hidden="true"></span>
-                                            <span class="notification-toggle-label" data-i18n="settings.field.enabled">Enabled</span>
-                                        </label>
-                                        <label class="notification-toggle">
-                                            <input type="checkbox" id="notif-tool_approval_requested-browser">
-                                            <span class="notification-toggle-check" aria-hidden="true"></span>
-                                            <span class="notification-toggle-label" data-i18n="settings.field.browser">Browser</span>
-                                        </label>
-                                        <label class="notification-toggle">
-                                            <input type="checkbox" id="notif-tool_approval_requested-toast">
-                                            <span class="notification-toggle-check" aria-hidden="true"></span>
-                                            <span class="notification-toggle-label" data-i18n="settings.field.toast">Toast</span>
-                                        </label>
-                                    </div>
-                                    <div class="notification-row" data-notif-type="run_completed">
-                                        <div class="notification-row-main">
-                                            <div class="notification-row-title" data-i18n="settings.notifications.run_completed">Run completed</div>
-                                            <div class="notification-row-desc" data-i18n="settings.notifications.run_completed_copy">When a run finishes successfully.</div>
-                                        </div>
-                                        <label class="notification-toggle">
-                                            <input type="checkbox" id="notif-run_completed-enabled">
-                                            <span class="notification-toggle-check" aria-hidden="true"></span>
-                                            <span class="notification-toggle-label" data-i18n="settings.field.enabled">Enabled</span>
-                                        </label>
-                                        <label class="notification-toggle">
-                                            <input type="checkbox" id="notif-run_completed-browser">
-                                            <span class="notification-toggle-check" aria-hidden="true"></span>
-                                            <span class="notification-toggle-label" data-i18n="settings.field.browser">Browser</span>
-                                        </label>
-                                        <label class="notification-toggle">
-                                            <input type="checkbox" id="notif-run_completed-toast">
-                                            <span class="notification-toggle-check" aria-hidden="true"></span>
-                                            <span class="notification-toggle-label" data-i18n="settings.field.toast">Toast</span>
-                                        </label>
-                                    </div>
-                                    <div class="notification-row" data-notif-type="run_failed">
-                                        <div class="notification-row-main">
-                                            <div class="notification-row-title" data-i18n="settings.notifications.run_failed">Run failed</div>
-                                            <div class="notification-row-desc" data-i18n="settings.notifications.run_failed_copy">When a run stops because of an error.</div>
-                                        </div>
-                                        <label class="notification-toggle">
-                                            <input type="checkbox" id="notif-run_failed-enabled">
-                                            <span class="notification-toggle-check" aria-hidden="true"></span>
-                                            <span class="notification-toggle-label" data-i18n="settings.field.enabled">Enabled</span>
-                                        </label>
-                                        <label class="notification-toggle">
-                                            <input type="checkbox" id="notif-run_failed-browser">
-                                            <span class="notification-toggle-check" aria-hidden="true"></span>
-                                            <span class="notification-toggle-label" data-i18n="settings.field.browser">Browser</span>
-                                        </label>
-                                        <label class="notification-toggle">
-                                            <input type="checkbox" id="notif-run_failed-toast">
-                                            <span class="notification-toggle-check" aria-hidden="true"></span>
-                                            <span class="notification-toggle-label" data-i18n="settings.field.toast">Toast</span>
-                                        </label>
-                                    </div>
-                                    <div class="notification-row" data-notif-type="run_stopped">
-                                        <div class="notification-row-main">
-                                            <div class="notification-row-title" data-i18n="settings.notifications.run_stopped">Run stopped</div>
-                                            <div class="notification-row-desc" data-i18n="settings.notifications.run_stopped_copy">When a run is stopped by user action.</div>
-                                        </div>
-                                        <label class="notification-toggle">
-                                            <input type="checkbox" id="notif-run_stopped-enabled">
-                                            <span class="notification-toggle-check" aria-hidden="true"></span>
-                                            <span class="notification-toggle-label" data-i18n="settings.field.enabled">Enabled</span>
-                                        </label>
-                                        <label class="notification-toggle">
-                                            <input type="checkbox" id="notif-run_stopped-browser">
-                                            <span class="notification-toggle-check" aria-hidden="true"></span>
-                                            <span class="notification-toggle-label" data-i18n="settings.field.browser">Browser</span>
-                                        </label>
-                                        <label class="notification-toggle">
-                                            <input type="checkbox" id="notif-run_stopped-toast">
-                                            <span class="notification-toggle-check" aria-hidden="true"></span>
-                                            <span class="notification-toggle-label" data-i18n="settings.field.toast">Toast</span>
-                                        </label>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
                     <div class="settings-panel" id="proxy-panel" style="display:none;">
                         <div class="settings-section">
                             <div class="settings-content-stack proxy-panel-body">
                                 <div class="proxy-editor-form">
-                                    <section class="proxy-form-section">
-                                        <div class="proxy-form-section-header">
-                                            <h5 data-i18n="settings.proxy.section">Proxy Settings</h5>
+                                    <section class="proxy-form-section settings-form-section">
+                                        <div class="proxy-form-section-header settings-form-section-header">
+                                            <h5 class="settings-form-section-title" data-i18n="settings.proxy.section">Proxy Settings</h5>
                                         </div>
-                                        <div class="proxy-form-grid">
-                                            <div class="form-group proxy-inline-field">
+                                        <div class="proxy-form-grid settings-field-grid">
+                                            <div class="form-group proxy-inline-field settings-field-row">
                                                 <label for="proxy-http-proxy" data-i18n="settings.proxy.http">HTTP Proxy</label>
                                                 <input type="text" id="proxy-http-proxy" placeholder="http://127.0.0.1:7890" autocomplete="off">
                                             </div>
-                                            <div class="form-group proxy-inline-field">
+                                            <div class="form-group proxy-inline-field settings-field-row">
                                                 <label for="proxy-https-proxy" data-i18n="settings.proxy.https">HTTPS Proxy</label>
                                                 <input type="text" id="proxy-https-proxy" placeholder="http://127.0.0.1:7890" autocomplete="off">
                                             </div>
-                                            <div class="form-group proxy-inline-field">
+                                            <div class="form-group proxy-inline-field settings-field-row">
                                                 <label for="proxy-all-proxy" data-i18n="settings.proxy.all">ALL Proxy</label>
                                                 <input type="text" id="proxy-all-proxy" placeholder="socks5://127.0.0.1:7890" autocomplete="off">
                                             </div>
-                                            <div class="form-group proxy-inline-field">
+                                            <div class="form-group proxy-inline-field settings-field-row">
                                                 <label for="proxy-username" data-i18n="settings.proxy.username">Username</label>
                                                 <input type="text" id="proxy-username" placeholder="Optional proxy username" data-i18n-placeholder="settings.proxy.username_placeholder" autocomplete="username">
                                             </div>
-                                            <div class="form-group proxy-inline-field">
+                                            <div class="form-group proxy-inline-field settings-field-row">
                                                 <label for="proxy-password" data-i18n="settings.proxy.password">Password</label>
-                                                <input type="password" id="proxy-password" placeholder="Optional proxy password" data-i18n-placeholder="settings.proxy.password_placeholder" autocomplete="current-password">
+                                                <div class="secure-input-row">
+                                                    <input type="password" id="proxy-password" placeholder="Optional proxy password" data-i18n-placeholder="settings.proxy.password_placeholder" autocomplete="new-password" autocapitalize="off" autocorrect="off" spellcheck="false">
+                                                    <button class="secure-input-btn" id="toggle-proxy-password-btn" type="button" title="Show password" aria-label="Show password" style="display:none;">
+                                                        <svg viewBox="0 0 24 24" fill="none" class="icon-sm" aria-hidden="true">
+                                                            <path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"></path>
+                                                            <circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="1.8"></circle>
+                                                        </svg>
+                                                    </button>
+                                                </div>
                                             </div>
-                                            <div class="form-group proxy-inline-field">
+                                            <div class="form-group proxy-inline-field settings-field-row">
                                                 <label for="proxy-no-proxy" data-i18n="settings.proxy.no_proxy">NO_PROXY</label>
                                                 <input type="text" id="proxy-no-proxy" placeholder="localhost;127.*;192.168.*;<local>" autocomplete="off">
                                             </div>
-                                            <div class="form-group proxy-inline-field proxy-inline-field-compact">
+                                            <div class="form-group proxy-inline-field proxy-inline-field-compact settings-field-row">
                                                 <label for="proxy-ssl-verify" data-i18n="settings.proxy.default_ssl">Default SSL Verification</label>
                                                 <select id="proxy-ssl-verify">
                                                     <option value="" data-i18n="settings.proxy.inherit_default">Inherit Default</option>
                                                     <option value="true" data-i18n="settings.proxy.verify">Verify</option>
-                                                    <option value="false" data-i18n="settings.proxy.skip_verify">Skip Verify</option>
+                                                    <option value="false" selected data-i18n="settings.proxy.skip_verify">Skip Verify</option>
                                                 </select>
                                             </div>
                                         </div>
                                     </section>
-                                    <section class="proxy-form-section proxy-form-section-test">
-                                        <div class="proxy-form-section-header">
-                                            <h5 data-i18n="settings.proxy.connectivity">Connectivity Test</h5>
+                                    <section class="proxy-form-section settings-form-section proxy-form-section-test">
+                                        <div class="proxy-form-section-header settings-form-section-header">
+                                            <h5 class="settings-form-section-title" data-i18n="settings.proxy.connectivity">Connectivity Test</h5>
                                         </div>
-                                        <div class="proxy-probe-grid">
-                                            <div class="form-group proxy-inline-field proxy-inline-field-test">
+                                        <div class="proxy-probe-grid settings-field-grid">
+                                            <div class="form-group proxy-inline-field proxy-inline-field-test settings-field-row">
                                                 <label for="proxy-probe-url" data-i18n="settings.proxy.target_url">Target URL</label>
                                                 <input type="text" id="proxy-probe-url" placeholder="https://example.com" data-i18n-placeholder="settings.proxy.target_url_placeholder" autocomplete="url">
                                                 <button class="secondary-btn section-action-btn proxy-inline-test-btn" id="test-proxy-web-btn" type="button" data-i18n="settings.proxy.test_url">Test URL</button>
                                             </div>
-                                            <div class="form-group proxy-inline-field proxy-inline-field-compact">
+                                            <div class="form-group proxy-inline-field proxy-inline-field-compact settings-field-row">
                                                 <label for="proxy-probe-timeout" data-i18n="settings.proxy.timeout">Timeout (ms)</label>
                                                 <input type="number" id="proxy-probe-timeout" value="5000" min="1000" max="300000" step="500" autocomplete="off">
                                             </div>
@@ -650,61 +935,138 @@ function createModal() {
                             </div>
                         </div>
                     </div>
-                    <div class="settings-panel" id="web-panel" style="display:none;">
-                        <div class="settings-section">
-                            <div class="settings-content-stack proxy-panel-body">
-                                <div class="proxy-editor-form">
-                                    <section class="proxy-form-section">
-                                        <div class="proxy-form-section-header">
-                                            <h5 data-i18n="settings.web.section">Web Search</h5>
-                                        </div>
-                                        <div class="proxy-form-grid">
-                                            <div class="form-group proxy-inline-field">
-                                                <label for="web-provider" data-i18n="settings.web.provider">Provider</label>
-                                                <select id="web-provider">
-                                                    <option value="exa">Exa</option>
-                                                </select>
+                    <div class="settings-panel" id="workspace-panel" style="display:none;">
+                        <div class="settings-section settings-section-model">
+                            <div class="settings-content-stack settings-model-stack">
+                                <div class="profiles-list" id="workspace-ssh-profile-list"></div>
+                                <div class="profile-editor" id="workspace-ssh-profile-editor" style="display:none;">
+                                    <div class="profile-editor-header">
+                                        <h4 id="workspace-ssh-profile-editor-title" data-i18n="settings.workspace.add_profile">Add SSH Profile</h4>
+                                        <p data-i18n="settings.workspace.editor_copy">Reusable SSH profiles are referenced by remote workspace mounts. The login username is required; password and private key are optional authentication material.</p>
+                                    </div>
+                                    <form class="profile-editor-form" id="workspace-ssh-profile-form" autocomplete="off">
+                                        <div class="profile-editor-grid workspace-profile-grid">
+                                            <div class="form-group workspace-field-span-1">
+                                                <label for="workspace-ssh-profile-id" data-i18n="settings.workspace.profile_id">Profile ID</label>
+                                                <input type="text" id="workspace-ssh-profile-id" placeholder="e.g. prod, staging" data-i18n-placeholder="settings.workspace.profile_id_placeholder" autocomplete="off">
                                             </div>
-                                            <div class="form-group proxy-inline-field">
-                                                <label for="web-api-key" data-i18n="settings.web.api_key">API Key</label>
-                                                <input type="password" id="web-api-key" placeholder="Optional for higher rate limits" data-i18n-placeholder="settings.web.api_key_placeholder" autocomplete="current-password">
+                                            <div class="form-group workspace-field-span-1">
+                                                <label for="workspace-ssh-profile-host" data-i18n="settings.workspace.host">Host</label>
+                                                <input type="text" id="workspace-ssh-profile-host" placeholder="e.g. prod-alias" data-i18n-placeholder="settings.workspace.host_placeholder" autocomplete="off">
+                                            </div>
+                                            <div class="form-group workspace-field-span-1">
+                                                <label for="workspace-ssh-profile-port" data-i18n="settings.workspace.port">Port</label>
+                                                <input type="text" id="workspace-ssh-profile-port" placeholder="22" data-i18n-placeholder="settings.workspace.port_placeholder" inputmode="numeric" autocomplete="off">
+                                            </div>
+                                            <div class="form-group workspace-field-span-2">
+                                                <label for="workspace-ssh-profile-shell" data-i18n="settings.workspace.remote_shell">Remote Shell</label>
+                                                <input type="text" id="workspace-ssh-profile-shell" placeholder="e.g. /bin/bash" data-i18n-placeholder="settings.workspace.remote_shell_placeholder" autocomplete="off">
+                                            </div>
+                                            <div class="form-group workspace-field-span-1">
+                                                <label for="workspace-ssh-profile-timeout" data-i18n="settings.workspace.connect_timeout_seconds">Connect Timeout (s)</label>
+                                                <input type="text" id="workspace-ssh-profile-timeout" placeholder="15" data-i18n-placeholder="settings.workspace.connect_timeout_seconds_placeholder" inputmode="numeric" autocomplete="off">
                                             </div>
                                         </div>
-                                        <p class="notifications-help">
-                                            <span data-i18n="settings.web.provider_site">Provider website:</span>
-                                            <a href="https://exa.ai" target="_blank" rel="noreferrer">https://exa.ai</a>
-                                        </p>
-                                    </section>
+                                        <div class="profile-editor-subsection">
+                                            <div class="profile-editor-subsection-header">
+                                                <h5 data-i18n="settings.workspace.auth_title">Authentication</h5>
+                                                <p data-i18n="settings.workspace.auth_copy">Set the remote login username, then optionally save a password or import a private key.</p>
+                                                <p data-i18n="settings.workspace.auth_system_copy">If password and private key are empty, Agent Teams can use your system SSH authentication, but the login username still comes from this profile.</p>
+                                            </div>
+                                            <div class="profile-editor-grid workspace-auth-grid">
+                                                <div class="form-group workspace-auth-field">
+                                                    <label for="workspace-ssh-profile-username" data-i18n="settings.workspace.username">Username</label>
+                                                    <input type="text" id="workspace-ssh-profile-username" placeholder="Remote login username" data-i18n-placeholder="settings.workspace.username_placeholder" autocomplete="username" required>
+                                                </div>
+                                                <div class="form-group workspace-auth-field">
+                                                    <label for="workspace-ssh-profile-password" data-i18n="settings.workspace.password">Password</label>
+                                                    <div class="secure-input-row">
+                                                        <input type="password" id="workspace-ssh-profile-password" placeholder="Optional password" data-i18n-placeholder="settings.workspace.password_placeholder" autocomplete="new-password" autocapitalize="off" autocorrect="off" spellcheck="false">
+                                                        <button class="secure-input-btn" id="toggle-workspace-ssh-profile-password-btn" type="button" title="Show password" aria-label="Show password" style="display:none;">
+                                                            <svg viewBox="0 0 24 24" fill="none" class="icon-sm" aria-hidden="true">
+                                                                <path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"></path>
+                                                                <circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="1.8"></circle>
+                                                            </svg>
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                                <div class="form-group form-group-span-2 workspace-auth-field workspace-auth-field-span-2 workspace-private-key-field">
+                                                    <label class="workspace-private-key-label-row" for="workspace-ssh-profile-private-key" data-i18n="settings.workspace.private_key">Private Key</label>
+                                                    <div class="settings-inline-action-row workspace-private-key-action-row">
+                                                        <button class="secondary-btn section-action-btn" id="workspace-ssh-profile-import-private-key-btn" type="button" data-i18n="settings.workspace.private_key_import">Import Private Key</button>
+                                                    </div>
+                                                    <textarea class="config-textarea workspace-private-key-textarea" id="workspace-ssh-profile-private-key" placeholder="Paste a private key or import one from a file" data-i18n-placeholder="settings.workspace.private_key_placeholder" autocapitalize="off" autocorrect="off" spellcheck="false"></textarea>
+                                                    <input type="hidden" id="workspace-ssh-profile-private-key-name">
+                                                    <input type="file" id="workspace-ssh-profile-private-key-file" style="display:none;" accept=".pem,.key,.ppk,text/plain">
+                                                </div>
+                                            </div>
+                                            <p class="workspace-auth-state" id="workspace-ssh-profile-auth-state"></p>
+                                            <div class="profile-probe-status" id="workspace-ssh-profile-probe-status" style="display:none;"></div>
+                                        </div>
+                                    </form>
                                 </div>
                             </div>
                         </div>
                     </div>
-                    <div class="settings-panel" id="github-panel" style="display:none;">
+                    <div class="settings-panel" id="web-panel" style="display:none;">
                         <div class="settings-section">
                             <div class="settings-content-stack proxy-panel-body">
                                 <div class="proxy-editor-form">
-                                    <section class="proxy-form-section">
-                                        <div class="proxy-form-section-header">
-                                            <h5 data-i18n="settings.github.section">GitHub CLI</h5>
+                                    <section class="proxy-form-section settings-form-section">
+                                        <div class="proxy-form-section-header settings-form-section-header">
+                                            <h5 class="settings-form-section-title" data-i18n="settings.web.section">网页搜索</h5>
                                         </div>
-                                        <div class="proxy-form-grid">
-                                            <div class="form-group proxy-inline-field">
-                                                <label for="github-token" data-i18n="settings.github.token">GitHub Token</label>
-                                                <input type="password" id="github-token" placeholder="ghp_..." data-i18n-placeholder="settings.github.token_placeholder" autocomplete="current-password">
+                                        <div class="proxy-form-grid settings-field-grid">
+                                            <div class="form-group proxy-inline-field settings-field-row">
+                                                <label for="web-provider" data-i18n="settings.web.provider">提供商</label>
+                                                <select id="web-provider">
+                                                    <option value="exa">Exa</option>
+                                                </select>
+                                            </div>
+                                            <div class="form-group proxy-inline-field settings-field-row">
+                                                <label for="web-api-key" id="web-api-key-label" data-i18n="settings.web.exa_api_key">Exa API Key</label>
+                                                <div class="secure-input-row">
+                                                    <input type="password" id="web-api-key" placeholder="可选，用于更高频率限制" data-i18n-placeholder="settings.web.api_key_placeholder" autocomplete="new-password" autocapitalize="off" autocorrect="off" spellcheck="false">
+                                                    <button class="secure-input-btn" id="toggle-web-api-key-btn" type="button" title="Show API key" aria-label="Show API key">
+                                                        <svg viewBox="0 0 24 24" fill="none" class="icon-sm" aria-hidden="true">
+                                                            <path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"></path>
+                                                            <circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="1.8"></circle>
+                                                        </svg>
+                                                    </button>
+                                                </div>
+                                            </div>
+                                            <div class="form-group proxy-inline-field settings-field-row">
+                                                <label for="web-fallback-provider" data-i18n="settings.web.fallback_provider">回退提供商</label>
+                                                <select id="web-fallback-provider">
+                                                    <option value="searxng">SearXNG</option>
+                                                    <option value="disabled">Disabled</option>
+                                                </select>
+                                            </div>
+                                            <div class="form-group proxy-inline-field settings-field-row" id="web-searxng-instance-url-field" style="display:none;">
+                                                <label for="web-searxng-instance-url" data-i18n="settings.web.searxng_instance_url">SearXNG 实例 URL</label>
+                                                <input type="text" id="web-searxng-instance-url" placeholder="默认值：{default}" data-i18n-placeholder="settings.web.searxng_instance_url_placeholder" autocomplete="off">
+                                            </div>
+                                            <div class="form-group proxy-inline-field settings-field-row" id="web-searxng-builtins-field" style="display:none;">
+                                                <span class="web-searxng-builtins-label settings-field-label" data-i18n="settings.web.searxng_builtin_instances">内置实例</span>
+                                                <div class="web-searxng-builtins-list" id="web-searxng-builtins-list"></div>
                                             </div>
                                         </div>
-                                    </section>
-                                    <section class="proxy-form-section proxy-form-section-test">
-                                        <div class="proxy-form-section-header">
-                                            <h5 data-i18n="settings.github.connectivity">Connection Test</h5>
+                                        <div class="form-group proxy-inline-field settings-field-row web-provider-inline-field">
+                                            <span class="web-provider-inline-label settings-field-label" data-i18n="settings.web.provider_site">提供商网站：</span>
+                                            <a class="web-provider-link-card" id="web-provider-site-link" href="https://exa.ai" target="_blank" rel="noreferrer" title="https://exa.ai" aria-label="https://exa.ai">
+                                                <span class="web-provider-link-copy">
+                                                    <span class="web-provider-link-badge" id="web-provider-site-badge">Exa</span>
+                                                    <span class="web-provider-link-url" id="web-provider-site-url">https://exa.ai</span>
+                                                    <span class="web-provider-link-note" data-i18n="settings.web.provider_site_help">官方文档与账户概览</span>
+                                                </span>
+                                                <span class="web-provider-link-arrow" aria-hidden="true">
+                                                    <svg viewBox="0 0 24 24" fill="none" class="icon-sm">
+                                                        <path d="M7 17L17 7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path>
+                                                        <path d="M9 7h8v8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path>
+                                                    </svg>
+                                                </span>
+                                            </a>
                                         </div>
-                                        <div class="proxy-probe-grid">
-                                            <div class="form-group proxy-inline-field proxy-inline-field-test">
-                                                <label for="test-github-btn" data-i18n="settings.github.test_label">Saved token</label>
-                                                <button class="secondary-btn section-action-btn proxy-inline-test-btn" id="test-github-btn" type="button" data-i18n="settings.github.test_connection">Test Connection</button>
-                                            </div>
-                                        </div>
-                                        <div class="proxy-probe-status" id="github-probe-status" style="display:none;"></div>
                                     </section>
                                 </div>
                             </div>
@@ -712,7 +1074,16 @@ function createModal() {
                     </div>
                     <div class="settings-panel" id="skills-panel" style="display:none;">
                         <div class="settings-section">
-                            <div class="settings-content-stack status-stack" id="skills-status"></div>
+                            <div class="settings-content-stack">
+                                <div class="status-stack" id="skills-status"></div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="settings-panel" id="plugins-panel" style="display:none;">
+                        <div class="settings-section">
+                            <div class="settings-content-stack">
+                                <div class="plugins-settings-root" id="plugins-settings-root"></div>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -720,35 +1091,53 @@ function createModal() {
                     <div class="settings-panel-actions" id="settings-panel-actions">
                         <div class="settings-panel-actions-group settings-panel-actions-group-start">
                             <button class="secondary-btn section-action-btn settings-action" id="test-profile-btn" type="button" style="display:none;">Test</button>
+                            <span class="settings-action-status profile-probe-inline-status" id="profile-probe-inline-status" style="display:none;"></span>
+                            <button class="secondary-btn section-action-btn settings-action" id="test-ssh-profile-btn" type="button" style="display:none;" data-i18n="settings.action.test">Test</button>
                             <button class="secondary-btn section-action-btn settings-action" id="test-agent-btn" type="button" style="display:none;" data-i18n="settings.action.test">Test</button>
                             <button class="secondary-btn section-action-btn settings-action" id="validate-role-btn" type="button" style="display:none;" data-i18n="settings.action.validate">Validate</button>
+                            <button class="secondary-btn section-action-btn settings-action" id="cancel-command-btn" type="button" style="display:none;" data-i18n="settings.action.cancel">Cancel</button>
                         </div>
                         <div class="settings-panel-actions-group settings-panel-actions-group-end">
+                            <button class="secondary-btn section-action-btn settings-action" id="add-hook-btn" type="button" style="display:none;" data-i18n="settings.hooks.add_group">新增 Hook</button>
+                            <button class="secondary-btn section-action-btn settings-action" id="validate-hooks-btn" type="button" style="display:none;" data-i18n="settings.action.validate">Validate</button>
+                            <button class="primary-btn section-action-btn settings-action" id="save-hooks-btn" type="button" style="display:none;" data-i18n="settings.action.save">Save</button>
+                            <button class="primary-btn section-action-btn settings-action" id="save-general-btn" type="button" style="display:none;" data-i18n="settings.action.save">Save</button>
                             <button class="secondary-btn section-action-btn settings-action" id="add-profile-btn" type="button" style="display:none;" data-i18n="settings.action.add_profile">Add Profile</button>
+                            <button class="secondary-btn section-action-btn settings-action" id="add-ssh-profile-btn" type="button" style="display:none;" data-i18n="settings.workspace.add_profile">Add SSH Profile</button>
                             <button class="primary-btn section-action-btn settings-action" id="save-profile-btn" type="button" style="display:none;" data-i18n="settings.action.save">Save</button>
+                            <button class="primary-btn section-action-btn settings-action" id="save-ssh-profile-btn" type="button" style="display:none;" data-i18n="settings.action.save">Save</button>
                             <button class="secondary-btn section-action-btn settings-action" id="cancel-profile-btn" type="button" style="display:none;" data-i18n="settings.action.cancel">Cancel</button>
+                            <button class="secondary-btn section-action-btn settings-action" id="cancel-ssh-profile-btn" type="button" style="display:none;" data-i18n="settings.action.cancel">Cancel</button>
+                            <button class="secondary-btn section-action-btn settings-action" id="back-agents-btn" type="button" style="display:none;" data-i18n="settings.action.back_agents">Back</button>
+                            <button class="secondary-btn section-action-btn settings-action" id="refresh-agent-registry-btn" type="button" style="display:none;" data-i18n="settings.action.refresh">Refresh</button>
                             <button class="secondary-btn section-action-btn settings-action" id="add-agent-btn" type="button" style="display:none;" data-i18n="settings.action.add_agent">Add Agent</button>
                             <button class="primary-btn section-action-btn settings-action" id="save-agent-btn" type="button" style="display:none;" data-i18n="settings.action.save">Save</button>
                             <button class="secondary-btn section-action-btn settings-action" id="delete-agent-btn" type="button" style="display:none;" data-i18n="settings.action.delete">Delete</button>
                             <button class="secondary-btn section-action-btn settings-action" id="cancel-agent-btn" type="button" style="display:none;" data-i18n="settings.action.cancel">Cancel</button>
+                            <button class="secondary-btn section-action-btn settings-action" id="add-command-btn" type="button" style="display:none;" data-i18n="settings.commands.add">Add Command</button>
+                            <button class="secondary-btn section-action-btn settings-action" id="refresh-commands-btn" type="button" style="display:none;" data-i18n="settings.commands.refresh">Refresh</button>
+                            <button class="secondary-btn section-action-btn settings-action" id="preview-command-btn" type="button" style="display:none;" data-i18n="settings.commands.preview">Preview</button>
+                            <button class="primary-btn section-action-btn settings-action" id="save-command-btn" type="button" style="display:none;" data-i18n="settings.action.save">Save</button>
                             <button class="secondary-btn section-action-btn settings-action" id="add-role-btn" type="button" style="display:none;" data-i18n="settings.action.add_role">Add Role</button>
                             <button class="secondary-btn section-action-btn settings-action" id="add-orchestration-preset-btn" type="button" style="display:none;" data-i18n="settings.action.add_orchestration">Add Orchestration</button>
-                            <button class="secondary-btn section-action-btn settings-action" id="add-trigger-btn" type="button" style="display:none;" data-i18n="settings.action.add_trigger">Add Trigger</button>
                             <button class="secondary-btn section-action-btn settings-action" id="add-env-btn" type="button" style="display:none;" data-i18n="settings.action.add_variable">Add Variable</button>
                             <button class="primary-btn section-action-btn settings-action" id="save-role-btn" type="button" style="display:none;" data-i18n="settings.action.save">Save</button>
                             <button class="primary-btn section-action-btn settings-action" id="save-orchestration-btn" type="button" style="display:none;" data-i18n="settings.action.save">Save</button>
-                            <button class="primary-btn section-action-btn settings-action" id="save-trigger-btn" type="button" style="display:none;" data-i18n="settings.action.save">Save</button>
                             <button class="secondary-btn section-action-btn settings-action" id="cancel-role-btn" type="button" style="display:none;" data-i18n="settings.action.cancel">Cancel</button>
                             <button class="secondary-btn section-action-btn settings-action" id="cancel-orchestration-btn" type="button" style="display:none;" data-i18n="settings.action.cancel">Cancel</button>
-                            <button class="secondary-btn section-action-btn settings-action" id="cancel-trigger-btn" type="button" style="display:none;" data-i18n="settings.action.cancel">Cancel</button>
                             <button class="primary-btn section-action-btn settings-action" id="save-env-btn" type="button" style="display:none;" data-i18n="settings.action.save">Save</button>
                             <button class="secondary-btn section-action-btn settings-action" id="cancel-env-btn" type="button" style="display:none;" data-i18n="settings.action.cancel">Cancel</button>
-                            <button class="primary-btn section-action-btn settings-action" id="save-notifications-btn" type="button" style="display:none;" data-i18n="settings.action.save">Save</button>
                             <button class="primary-btn section-action-btn settings-action" id="save-web-btn" type="button" style="display:none;" data-i18n="settings.action.save">Save</button>
-                            <button class="primary-btn section-action-btn settings-action" id="save-github-btn" type="button" style="display:none;" data-i18n="settings.action.save">Save</button>
                             <button class="primary-btn section-action-btn settings-action" id="save-proxy-btn" type="button" style="display:none;" data-i18n="settings.action.save">Save</button>
+                            <button class="secondary-btn section-action-btn settings-action" id="delete-ssh-profile-btn" type="button" style="display:none;" data-i18n="settings.action.delete">Delete</button>
+                            <button class="secondary-btn section-action-btn settings-action" id="add-mcp-server-btn" type="button" style="display:none;" data-i18n="settings.mcp.add_server">Add Server</button>
+                            <button class="primary-btn section-action-btn settings-action" id="save-mcp-server-btn" type="button" style="display:none;" data-i18n="settings.action.save">Save</button>
+                            <button class="secondary-btn section-action-btn settings-action" id="cancel-mcp-server-btn" type="button" style="display:none;" data-i18n="settings.action.cancel">Cancel</button>
                             <button class="secondary-btn section-action-btn settings-action" id="reload-mcp-btn" type="button" style="display:none;" data-i18n="settings.action.reload">Reload</button>
-                            <button class="secondary-btn section-action-btn settings-action" id="reload-skills-btn" type="button" style="display:none;" data-i18n="settings.action.reload">Reload</button>
+                            <button class="secondary-btn section-action-btn settings-action" id="refresh-plugins-btn" type="button" style="display:none;" data-i18n="settings.action.refresh">Refresh</button>
+                            <button class="secondary-btn section-action-btn settings-action" id="validate-plugin-btn" type="button" style="display:none;" data-i18n="settings.plugins.validate">Validate</button>
+                            <button class="primary-btn section-action-btn settings-action" id="install-plugin-btn" type="button" style="display:none;" data-i18n="settings.plugins.install">Add Plugin</button>
+                            <button class="secondary-btn section-action-btn settings-action" id="reset-appearance-btn" type="button" style="display:none;" data-i18n="settings.action.reset">Reset</button>
                         </div>
                     </div>
                 </div>
@@ -757,6 +1146,7 @@ function createModal() {
     `;
     document.body.appendChild(settingsModal);
     translateDocument(settingsModal);
+    setupSettingsActionOwnership();
 }
 
 function setupEventListeners() {
@@ -765,30 +1155,32 @@ function setupEventListeners() {
         closeBtn.onclick = closeSettings;
     }
 
-    settingsModal.onclick = (e) => {
-        if (e.target === settingsModal) {
-            closeSettings();
-        }
-    };
-
     document.querySelectorAll('.settings-tab').forEach(tab => {
         tab.onclick = () => {
             currentTab = tab.dataset.tab;
-            showPanel(currentTab);
+            return showPanel(currentTab);
         };
     });
 
     bindModelProfileHandlers();
+    bindCommandsSettingsHandlers();
+    bindHooksSettingsHandlers();
+    bindPluginsSettingsHandlers();
     bindAgentSettingsHandlers();
+    bindAgentRegistrySettingsHandlers({
+        onBack: () => loadAgentSettingsPanel(),
+    });
     bindOrchestrationSettingsHandlers();
     bindRoleSettingsHandlers();
-    bindTriggerSettingsHandlers();
+    bindGeneralSettingsHandlers();
+    bindSpeechSettingsHandlers();
     bindEnvironmentVariableSettingsHandlers();
     bindNotificationSettingsHandlers();
     bindWebSettingsHandlers();
-    bindGitHubSettingsHandlers();
     bindProxySettingsHandlers();
+    bindWorkspaceSettingsHandlers();
     bindSystemStatusHandlers();
+    try { bindAppearanceHandlers(); } catch (e) { console.error('appearance bind failed', e); }
     if (typeof document.addEventListener === 'function') {
         document.addEventListener('agent-teams-language-changed', () => {
             if (!settingsModal) {
@@ -801,6 +1193,7 @@ function setupEventListeners() {
 }
 
 async function showPanel(tab) {
+    const requestId = ++panelLoadRequestId;
     document.querySelectorAll('.settings-tab').forEach(button => {
         button.classList.toggle('active', button.dataset.tab === tab);
     });
@@ -812,42 +1205,64 @@ async function showPanel(tab) {
     });
 
     updatePanelHeading(tab);
-    renderPanelActions(tab);
+    clearPanelActions(tab);
     bindModelProfileHandlers();
+    bindCommandsSettingsHandlers();
+    bindHooksSettingsHandlers();
+    bindPluginsSettingsHandlers();
     bindAgentSettingsHandlers();
+    bindAgentRegistrySettingsHandlers({
+        onBack: () => loadAgentSettingsPanel(),
+    });
     bindOrchestrationSettingsHandlers();
     bindRoleSettingsHandlers();
-    bindTriggerSettingsHandlers();
+    bindSpeechSettingsHandlers();
     bindEnvironmentVariableSettingsHandlers();
     bindWebSettingsHandlers();
-    bindGitHubSettingsHandlers();
     bindProxySettingsHandlers();
+    bindWorkspaceSettingsHandlers();
     bindSystemStatusHandlers();
 
+    await loadSettingsPanel(tab);
+    if (requestId !== panelLoadRequestId || currentTab !== tab) {
+        return;
+    }
+    renderPanelActions(tab);
+}
+
+async function loadSettingsPanel(tab) {
     if (tab === 'model') {
         await loadModelProfilesPanel();
+    } else if (tab === 'general') {
+        await loadGeneralSettingsPanel();
+        loadAppearancePanel();
+    } else if (tab === 'hooks') {
+        await loadHooksSettingsPanel();
     } else if (tab === 'agents') {
+        showAgentRegistryListView(false);
         await loadAgentSettingsPanel();
     } else if (tab === 'roles') {
         await loadRoleSettingsPanel();
     } else if (tab === 'orchestration') {
         await loadOrchestrationSettingsPanel();
-    } else if (tab === 'triggers') {
-        await loadTriggerSettingsPanel();
     } else if (tab === 'environment') {
         await loadEnvironmentVariablesPanel();
-    } else if (tab === 'notifications') {
-        await loadNotificationSettingsPanel();
     } else if (tab === 'web') {
         await loadWebSettingsPanel();
-    } else if (tab === 'github') {
-        await loadGitHubSettingsPanel();
     } else if (tab === 'proxy') {
         await loadProxyStatusPanel();
+    } else if (tab === 'workspace') {
+        await loadWorkspaceSettingsPanel();
     } else if (tab === 'mcp') {
         await loadMcpStatusPanel();
+    } else if (tab === 'plugins') {
+        await loadPluginsSettingsPanel();
+    } else if (tab === 'commands') {
+        await loadCommandsSettingsPanel();
     } else if (tab === 'skills') {
         await loadSkillsStatusPanel();
+    } else if (tab === 'appearance') {
+        loadAppearancePanel();
     }
 }
 
@@ -857,71 +1272,190 @@ function updatePanelHeading(tab) {
     document.getElementById('settings-panel-description').textContent = t(meta.descriptionKey);
 }
 
+function clearPanelActions(tab) {
+    const actions = document.getElementById('settings-panel-actions');
+    const actionsBar = document.getElementById('settings-actions-bar');
+    if (!actions) {
+        return;
+    }
+    if (actionsBar) {
+        actionsBar.dataset.activeTab = tab;
+    }
+    hideAllSettingsActions();
+    setPanelActionsLoading(tab, false);
+    enforceSettingsActionOwnership();
+}
+
 function renderPanelActions(tab) {
     const actions = document.getElementById('settings-panel-actions');
     const actionsBar = document.getElementById('settings-actions-bar');
     if (!actions) {
         return;
     }
-    actions.querySelectorAll('.settings-action').forEach(button => {
-        button.style.display = 'none';
-    });
+    if (actionsBar) {
+        actionsBar.dataset.activeTab = tab;
+    }
+    hideAllSettingsActions();
     if (actionsBar) actionsBar.style.display = 'flex';
     if (tab === 'model') {
         document.getElementById('add-profile-btn').style.display = 'inline-flex';
         return;
     }
-    if (tab === 'agents') {
+    if (tab === 'general') {
+        document.getElementById('save-general-btn').style.display = 'inline-flex';
+    } else if (tab === 'hooks') {
+        syncHooksSettingsActions();
+    } else if (tab === 'agents') {
         document.getElementById('add-agent-btn').style.display = 'inline-flex';
-        return;
-    }
-    if (tab === 'roles') {
+    } else if (tab === 'roles') {
         document.getElementById('add-role-btn').style.display = 'inline-flex';
-        return;
-    }
-    if (tab === 'orchestration') {
+    } else if (tab === 'orchestration') {
         document.getElementById('add-orchestration-preset-btn').style.display = 'inline-flex';
-        return;
-    }
-    if (tab === 'triggers') {
-        return;
-    }
-    if (tab === 'environment') {
+    } else if (tab === 'environment') {
         document.getElementById('add-env-btn').style.display = 'inline-flex';
-        return;
-    }
-    if (tab === 'notifications') {
-        document.getElementById('save-notifications-btn').style.display = 'inline-flex';
-        return;
-    }
-    if (tab === 'web') {
+    } else if (tab === 'web') {
         document.getElementById('save-web-btn').style.display = 'inline-flex';
-        return;
-    }
-    if (tab === 'github') {
-        document.getElementById('save-github-btn').style.display = 'inline-flex';
-        return;
-    }
-    if (tab === 'proxy') {
+    } else if (tab === 'proxy') {
         document.getElementById('save-proxy-btn').style.display = 'inline-flex';
-        return;
-    }
-    if (tab === 'mcp') {
+    } else if (tab === 'workspace') {
+        document.getElementById('add-ssh-profile-btn').style.display = 'inline-flex';
+    } else if (tab === 'mcp') {
+        document.getElementById('add-mcp-server-btn').style.display = 'inline-flex';
         document.getElementById('reload-mcp-btn').style.display = 'inline-flex';
-        return;
+    } else if (tab === 'plugins') {
+        syncPluginsSettingsActions();
+    } else if (tab === 'commands') {
+        syncCommandsSettingsActions();
+    } else if (tab === 'appearance') {
+        document.getElementById('reset-appearance-btn').style.display = 'inline-flex';
+    } else if (actionsBar) {
+        actionsBar.style.display = 'none';
     }
-    if (tab === 'skills') {
-        document.getElementById('reload-skills-btn').style.display = 'inline-flex';
-        return;
-    }
-    if (actionsBar) actionsBar.style.display = 'none';
+    setPanelActionsLoading(tab, false);
+    enforceSettingsActionOwnership();
 }
 
-export function openSettings() {
+function warmSettingsHeavyData() {
+    if (settingsWarmupPromise) {
+        return settingsWarmupPromise;
+    }
+    settingsWarmupPromise = Promise.allSettled([
+        fetchRoleConfigs(),
+        fetchRoleConfigOptions(),
+        fetchModelProfiles(),
+        fetchOrchestrationConfig(),
+    ])
+        .then(results => {
+            results.forEach((result, index) => {
+                if (result.status !== 'rejected') {
+                    return;
+                }
+                logError(
+                    'frontend.settings.warmup_failed',
+                    'Failed to warm settings data',
+                    {
+                        dependency: [
+                            'role_configs',
+                            'role_options',
+                            'model_profiles',
+                            'orchestration_config',
+                        ][index],
+                        ...errorToPayload(result.reason),
+                    },
+                );
+            });
+        })
+        .finally(() => {
+            settingsWarmupPromise = null;
+        });
+    return settingsWarmupPromise;
+}
+
+function setPanelActionsLoading(tab, loading) {
+    Object.entries(ACTION_TAB_OWNERS).forEach(([id, ownerTab]) => {
+        if (ownerTab !== tab) {
+            return;
+        }
+        const action = document.getElementById(id);
+        if (!action || !('disabled' in action)) {
+            return;
+        }
+        action.disabled = loading;
+        action.dataset.settingsActionLoading = loading ? 'true' : 'false';
+    });
+}
+
+function hideAllSettingsActions() {
+    Object.keys(ACTION_TAB_OWNERS).forEach(id => {
+        const action = document.getElementById(id);
+        if (action) {
+            action.style.display = 'none';
+        }
+    });
+}
+
+function setupSettingsActionOwnership() {
+    annotateSettingsActions();
+    installSettingsActionOwnershipObserver();
+}
+
+function annotateSettingsActions() {
+    Object.entries(ACTION_TAB_OWNERS).forEach(([id, tab]) => {
+        const action = document.getElementById(id);
+        if (action) {
+            action.dataset.settingsActionTab = tab;
+        }
+    });
+}
+
+function installSettingsActionOwnershipObserver() {
+    if (actionOwnershipObserver || typeof MutationObserver !== 'function') {
+        return;
+    }
+    const actions = document.getElementById('settings-panel-actions');
+    if (!actions) {
+        return;
+    }
+    let enforcing = false;
+    actionOwnershipObserver = new MutationObserver(() => {
+        if (enforcing) {
+            return;
+        }
+        enforcing = true;
+        try {
+            enforceSettingsActionOwnership();
+        } finally {
+            enforcing = false;
+        }
+    });
+    actionOwnershipObserver.observe(actions, {
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['style', 'class', 'hidden'],
+    });
+}
+
+function enforceSettingsActionOwnership() {
+    const actionsBar = document.getElementById('settings-actions-bar');
+    const activeTab = String(actionsBar?.dataset.activeTab || currentTab || '').trim();
+    Object.entries(ACTION_TAB_OWNERS).forEach(([id, tab]) => {
+        const action = document.getElementById(id);
+        if (action && tab !== activeTab) {
+            action.style.display = 'none';
+        }
+    });
+}
+
+export function openSettings(tab = null) {
     if (!initialized) initSettings();
+    const normalizedTab = String(tab || '').trim();
+    if (normalizedTab && TAB_METADATA[normalizedTab]) {
+        currentTab = normalizedTab;
+    }
     settingsModal.style.display = 'flex';
     settingsModal.classList.add('settings-modal-visible');
-    showPanel(currentTab);
+    void warmSettingsHeavyData();
+    return showPanel(currentTab);
 }
 
 export function closeSettings() {
