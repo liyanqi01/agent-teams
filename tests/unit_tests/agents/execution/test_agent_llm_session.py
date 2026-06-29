@@ -10,7 +10,10 @@ from relay_teams.agents.execution.session_prompt import SessionPromptMixin
 from relay_teams.agents.execution.session_recovery import SessionRecoveryMixin
 from relay_teams.agents.execution.session_runtime import SessionRuntimeMixin
 from relay_teams.agents.execution.session_support import SessionSupportMixin
-from relay_teams.tools.runtime.policy import ToolApprovalPolicy
+from relay_teams.tools.runtime.policy import (
+    ExternalDirectoryPermissionMode,
+    ToolApprovalPolicy,
+)
 
 
 def test_agent_llm_session_module_re_exports_runtime_symbols() -> None:
@@ -39,6 +42,7 @@ class _RunIntentRepo:
         return SimpleNamespace(
             yolo=True,
             shell_safety_policy_enabled=False,
+            external_directory_permission=ExternalDirectoryPermissionMode.DENY,
         )
 
 
@@ -55,3 +59,4 @@ async def test_session_prompt_resolves_shell_safety_policy_from_run_intent() -> 
 
     assert policy.yolo is True
     assert policy.shell_safety_policy_enabled is False
+    assert policy.external_directory_permission == ExternalDirectoryPermissionMode.DENY

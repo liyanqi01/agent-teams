@@ -1042,6 +1042,7 @@ CREATE TABLE IF NOT EXISTS run_intents (
     session_mode   TEXT NOT NULL DEFAULT 'normal',
     yolo           TEXT NOT NULL DEFAULT 'false',
     shell_safety_policy_enabled TEXT NOT NULL DEFAULT 'true',
+    external_directory_permission TEXT NOT NULL DEFAULT 'ask',
     thinking_enabled TEXT NOT NULL DEFAULT 'false',
     thinking_effort TEXT,
     target_role_id TEXT,
@@ -1067,6 +1068,7 @@ Notes:
 - `generation_config_json` stores the typed native media-generation config for provider-native image/audio/video runs.
 - `yolo` controls whether tool approvals are skipped entirely for that run.
 - `shell_safety_policy_enabled` controls whether shell execution keeps the local shell safety deny layer enabled for that run.
+- `external_directory_permission` snapshots the General setting for workspace-external file write/edit access. Values are `ask`, `allow`, and `deny`.
 - `thinking_enabled` and `thinking_effort` capture per-run thinking configuration for providers that support reasoning streams.
 - `target_role_id` stores an optional one-run direct-chat override, such as a leading `@Role` mention from the web composer.
 - `session_mode` and `topology_json` snapshot the resolved root-agent topology, including the selected normal-mode root role, selected fixed orchestration graph when present, and effective orchestration policy, used when the run was created, so recoverable resumes do not drift when global orchestration settings change later. The policy snapshot includes DelegationPlanner auto-planning fields such as `auto_plan_long_tasks`, `planner_role_id`, and `max_temporary_roles_per_run`.

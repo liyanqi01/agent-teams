@@ -1251,6 +1251,7 @@ Returns saved General settings that apply to future runs started from the web UI
 
 Fields:
 - `shell_safety_policy_enabled`
+- `external_directory_permission`: `ask`, `allow`, or `deny`
 
 ### `PUT /system/configs/general`
 
@@ -1258,6 +1259,7 @@ Replaces saved General settings.
 
 Fields:
 - `shell_safety_policy_enabled`
+- `external_directory_permission`: `ask`, `allow`, or `deny`
 
 ### `GET /system/configs/orchestration`
 
@@ -2001,6 +2003,7 @@ Request:
     "execution_mode": "ai",
     "yolo": false,
     "shell_safety_policy_enabled": true,
+    "external_directory_permission": "ask",
     "target_role_id": "Architect",
   "thinking": {
     "enabled": false,
@@ -2048,6 +2051,12 @@ Notes:
 - When no General setting has been saved yet, the effective default remains `true`.
 - `shell_safety_policy_enabled: true` preserves the current local shell pre-execution safety policy.
 - `shell_safety_policy_enabled: false` disables only the shell-local deny layer and directory-change restrictions; normal tool authorization, approval, timeout, and audit behavior still apply.
+- `external_directory_permission` is stored in General settings and snapshotted into each run intent at creation time. It controls workspace-external file write/edit access for tools such as `write`, `edit`, and `notebook_edit`.
+- `external_directory_permission: ask` turns a write outside the workspace into a normal tool approval request instead of failing path resolution immediately.
+- `external_directory_permission: allow` allows workspace-external file access through the same tool path without an external-directory approval prompt.
+- `external_directory_permission: deny` blocks workspace-external file access at runtime policy evaluation.
+- `yolo: true` still skips human approval, including external-directory approval, while preserving tool-local path and input validation.
+- Shell safety policy and workspace write scope are independent controls. Disabling shell safety does not widen the `write`/`edit` workspace path allowlist.
 - `thinking` is optional.
 - `thinking.enabled` enables model thinking streams for providers that emit thinking parts.
 - `thinking.effort` optionally sets provider reasoning effort (`minimal`, `low`, `medium`, `high`); when set, it is forwarded to OpenAI-compatible providers as `openai_reasoning_effort`.

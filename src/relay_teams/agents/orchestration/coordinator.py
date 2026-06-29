@@ -252,6 +252,7 @@ class CoordinatorGraph(BaseModel):
         verification_tool_policy = ToolApprovalPolicy(
             yolo=intent.yolo,
             shell_safety_policy_enabled=intent.shell_safety_policy_enabled,
+            external_directory_permission=intent.external_directory_permission,
         )
 
         root_task = TaskEnvelope(
@@ -2464,6 +2465,7 @@ class CoordinatorGraph(BaseModel):
         return ToolApprovalPolicy(
             yolo=intent.yolo,
             shell_safety_policy_enabled=intent.shell_safety_policy_enabled,
+            external_directory_permission=intent.external_directory_permission,
         )
 
     async def _topology_for_run_async(

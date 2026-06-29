@@ -72,6 +72,8 @@ let actionOwnershipObserver = null;
 let panelLoadRequestId = 0;
 let settingsWarmupPromise = null;
 
+const EXTERNAL_DIRECTORY_PERMISSION_VALUES = new Set(['ask', 'allow', 'deny']);
+
 const TAB_METADATA = {
     appearance: {
         titleKey: 'settings.panel.appearance.title',
@@ -232,6 +234,28 @@ function renderGeneralSettingsPanelMarkup() {
                             </div>
                         </div>
                     </section>
+                    <section class="proxy-form-section settings-form-section general-setting-card">
+                        <div class="proxy-form-section-header settings-form-section-header general-setting-card-head">
+                            <div class="general-setting-card-copy-block">
+                                <h5 data-i18n="settings.general.external_directory_title">External Directory</h5>
+                            </div>
+                            <select
+                                id="settings-external-directory-permission"
+                                class="appearance-text-input"
+                                aria-label="${t('settings.general.external_directory_mode')}"
+                            >
+                                <option value="ask" data-i18n="settings.general.external_directory_ask">Ask</option>
+                                <option value="allow" data-i18n="settings.general.external_directory_allow">Allow</option>
+                                <option value="deny" data-i18n="settings.general.external_directory_deny">Deny</option>
+                            </select>
+                        </div>
+                        <div class="appearance-grid settings-field-grid general-setting-card-body">
+                            <div class="appearance-row settings-field-row">
+                                <label for="settings-external-directory-permission" data-i18n="settings.general.external_directory_mode">Workspace-external writes</label>
+                                <span class="general-setting-inline-note" data-i18n="settings.general.external_directory_state">Ask prompts for approval, allow skips prompts, deny blocks access outside the workspace.</span>
+                            </div>
+                        </div>
+                    </section>
                     ${renderSpeechSettingsSectionMarkup()}
                     ${renderNotificationSettingsSectionMarkup()}
                 </div>
@@ -252,12 +276,24 @@ function bindGeneralSettingsHandlers() {
     }
 }
 
+function normalizeExternalDirectoryPermission(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    return EXTERNAL_DIRECTORY_PERMISSION_VALUES.has(normalized) ? normalized : 'ask';
+}
+
+function readExternalDirectoryPermission() {
+    const select = document.getElementById('settings-external-directory-permission');
+    return normalizeExternalDirectoryPermission(select?.value);
+}
+
 async function handleSaveGeneralSettings() {
     const toggle = document.getElementById('settings-shell-safety-policy-toggle');
     const nextShellSafetyPolicyEnabled = toggle?.checked !== false;
+    const nextExternalDirectoryPermission = readExternalDirectoryPermission();
     try {
         await saveGeneralConfig({
             shell_safety_policy_enabled: nextShellSafetyPolicyEnabled,
+            external_directory_permission: nextExternalDirectoryPermission,
         });
     } catch (error) {
         const message = error?.message || t('settings.general.save_failed');
@@ -314,11 +350,20 @@ async function handleSaveGeneralSettings() {
 
 async function loadGeneralSettingsPanel() {
     const toggle = document.getElementById('settings-shell-safety-policy-toggle');
+    const externalDirectorySelect = document.getElementById(
+        'settings-external-directory-permission',
+    );
     const generalConfig = await fetchGeneralConfig();
     const enabled = generalConfig?.shell_safety_policy_enabled !== false;
+    const externalDirectoryPermission = normalizeExternalDirectoryPermission(
+        generalConfig?.external_directory_permission,
+    );
     applyShellSafetyPolicyEnabled(enabled);
     if (toggle) {
         toggle.checked = enabled;
+    }
+    if (externalDirectorySelect) {
+        externalDirectorySelect.value = externalDirectoryPermission;
     }
     return Promise.all([
         loadSpeechSettingsPanel(),

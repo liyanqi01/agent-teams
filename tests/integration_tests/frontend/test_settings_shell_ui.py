@@ -78,6 +78,7 @@ console.log(JSON.stringify({
     )
     assert "notifications-actions" not in modal_html
     assert 'id="settings-shell-safety-policy-toggle"' in modal_html
+    assert 'id="settings-external-directory-permission"' in modal_html
     assert "general-setting-card" in modal_html
     assert "general-setting-card-copy" in modal_html
     assert 'data-i18n="settings.appearance.colors"' in modal_html
@@ -323,10 +324,13 @@ initSettings();
 await openSettings("general");
 
 const shellToggle = document.getElementById("settings-shell-safety-policy-toggle");
+const externalDirectorySelect = document.getElementById("settings-external-directory-permission");
 shellToggle.checked = false;
+externalDirectorySelect.value = "deny";
 
 const beforeSave = {
     shell: globalThis.__savedGeneral.shell,
+    externalDirectory: globalThis.__savedGeneral.externalDirectory,
     speech: globalThis.__savedGeneral.speech,
     notifications: globalThis.__savedGeneral.notifications,
 };
@@ -343,12 +347,14 @@ console.log(JSON.stringify({
 
     assert payload["beforeSave"] == {
         "shell": True,
+        "externalDirectory": "ask",
         "speech": None,
         "notifications": None,
     }
     after_save = cast(dict[str, JsonValue], payload["afterSave"])
     assert after_save["shell"] is False
     assert after_save["savedShell"] is False
+    assert after_save["externalDirectory"] == "deny"
     assert isinstance(after_save["speech"], dict)
     assert isinstance(after_save["notifications"], dict)
     notifications = cast(dict[str, JsonValue], after_save["notifications"])
@@ -1210,6 +1216,12 @@ export function t(key) {
         'settings.general.shell_policy_title': 'Shell Policy',
         'settings.general.shell_policy': 'Enable local shell safeguards',
         'settings.general.shell_policy_state': 'Applies to future runs after you save.',
+        'settings.general.external_directory_title': 'External Directory',
+        'settings.general.external_directory_mode': 'Workspace-external writes',
+        'settings.general.external_directory_state': 'Ask prompts for approval, allow skips prompts, deny blocks access outside the workspace.',
+        'settings.general.external_directory_ask': 'Ask',
+        'settings.general.external_directory_allow': 'Allow',
+        'settings.general.external_directory_deny': 'Deny',
         'settings.general.saved': 'General Settings Saved',
         'settings.general.saved_message': 'General settings were saved and will apply to new runs.',
         'settings.general.save_failed': 'Failed to save general settings',
@@ -1261,6 +1273,7 @@ export async function fetchOrchestrationConfig() {
 export async function fetchGeneralConfig() {
     return {
         shell_safety_policy_enabled: globalThis.__savedGeneral.savedShell,
+        external_directory_permission: globalThis.__savedGeneral.externalDirectory,
     };
 }
 
@@ -1271,6 +1284,7 @@ export async function fetchNotificationConfig() {
 export async function saveGeneralConfig(payload) {
     globalThis.__savedGeneral.savedShell = payload.shell_safety_policy_enabled !== false;
     globalThis.__savedGeneral.shell = payload.shell_safety_policy_enabled !== false;
+    globalThis.__savedGeneral.externalDirectory = payload.external_directory_permission;
     return { status: 'ok' };
 }
 
@@ -1587,6 +1601,7 @@ function createElement(tagName = "div") {{
     globalThis.__toasts = [];
     globalThis.__savedGeneral = {{
         savedShell: true,
+        externalDirectory: "ask",
         shell: null,
         speech: null,
         notifications: null,

@@ -19,6 +19,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime, timezone
 from enum import Enum
 from json import dumps
+from pathlib import Path
 from typing import (
     Literal,
     ParamSpec,
@@ -1250,6 +1251,10 @@ def _file_write_target(
     tool_input: dict[str, JsonValue],
     internal_data: JsonValue | None,
 ) -> str | None:
+    if _internal_data_bool(internal_data, "external_directory"):
+        resolved_path = _internal_data_text(internal_data, "resolved_path")
+        if resolved_path is not None:
+            return resolved_path
     if tool_name == "write_tmp":
         internal_path = _internal_data_text(internal_data, "path")
         if internal_path is not None:
@@ -1282,13 +1287,30 @@ def _workspace_file_digest(
     logical_path: str,
 ) -> tuple[str | None, int | None, str | None]:
     try:
-        file_path = ctx.deps.workspace.resolve_path(logical_path, write=False)
+        file_path = _resolve_digest_path(ctx, logical_path)
         if not path_is_file(file_path):
             return None, None, "target is not a file"
         content = read_bytes_file(file_path)
     except Exception as exc:
         return None, None, f"{type(exc).__name__}: {exc}"
     return f"sha256:{sha256(content).hexdigest()}", len(content), None
+
+
+def _resolve_digest_path(ctx: ToolContext, logical_path: str) -> Path:
+    try:
+        return ctx.deps.workspace.resolve_path(
+            logical_path,
+            write=False,
+            allow_external_directory=True,
+        )
+    except TypeError:
+        return ctx.deps.workspace.resolve_path(logical_path, write=False)
+
+
+def _internal_data_bool(internal_data: JsonValue | None, key: str) -> bool:
+    if not isinstance(internal_data, dict):
+        return False
+    return internal_data.get(key) is True
 
 
 def _internal_data_text(internal_data: JsonValue | None, key: str) -> str | None:

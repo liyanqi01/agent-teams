@@ -57,6 +57,7 @@ from relay_teams.sessions.runs.run_runtime_repo import (
     RunRuntimeStatus,
 )
 from relay_teams.sessions.session_models import SessionMode
+from relay_teams.tools.runtime.policy import ExternalDirectoryPermissionMode
 from relay_teams.workspace import WorkspaceHandle
 from relay_teams.workspace.ids import build_instance_conversation_id
 from relay_teams.env.hook_runtime_env import merge_tool_hook_runtime_env
@@ -1790,6 +1791,7 @@ class BackgroundTaskService:
         parent_thinking = RunThinkingConfig()
         parent_yolo = False
         parent_shell_safety_policy_enabled = True
+        parent_external_directory_permission = ExternalDirectoryPermissionMode.ASK
         parent_conversation_context = None
         try:
             parent_intent = self._run_intent_repo.get(parent_run_id)
@@ -1801,6 +1803,9 @@ class BackgroundTaskService:
             parent_shell_safety_policy_enabled = (
                 parent_intent.shell_safety_policy_enabled
             )
+            parent_external_directory_permission = (
+                parent_intent.external_directory_permission
+            )
             parent_conversation_context = parent_intent.conversation_context
         self._run_intent_repo.upsert(
             run_id=subagent_run_id,
@@ -1811,6 +1816,7 @@ class BackgroundTaskService:
                 execution_mode=ExecutionMode.AI,
                 yolo=parent_yolo,
                 shell_safety_policy_enabled=parent_shell_safety_policy_enabled,
+                external_directory_permission=parent_external_directory_permission,
                 reuse_root_instance=False,
                 thinking=parent_thinking,
                 target_role_id=subagent_role_id,

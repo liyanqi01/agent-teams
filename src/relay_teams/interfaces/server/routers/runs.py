@@ -350,10 +350,9 @@ async def create_run(
             )
         shell_safety_policy_enabled = req.shell_safety_policy_enabled
         shell_safety_policy_override_provided = shell_safety_policy_enabled is not None
+        general_config = await asyncio.to_thread(general_config_service.get_config)
         if shell_safety_policy_enabled is None:
-            shell_safety_policy_enabled = await asyncio.to_thread(
-                lambda: general_config_service.get_config().shell_safety_policy_enabled
-            )
+            shell_safety_policy_enabled = general_config.shell_safety_policy_enabled
         intent_input = IntentInput(
             session_id=req.session_id,
             input=normalized_input,
@@ -364,6 +363,9 @@ async def create_run(
             yolo=req.yolo,
             shell_safety_policy_enabled=shell_safety_policy_enabled,
             shell_safety_policy_override_provided=shell_safety_policy_override_provided,
+            external_directory_permission=(
+                general_config.external_directory_permission
+            ),
             thinking=req.thinking,
             target_role_id=req.target_role_id,
             skills=resolved_skills,
@@ -386,6 +388,9 @@ async def create_run(
                     "execution_mode": req.execution_mode.value,
                     "yolo": req.yolo,
                     "shell_safety_policy_enabled": shell_safety_policy_enabled,
+                    "external_directory_permission": (
+                        general_config.external_directory_permission.value
+                    ),
                 },
             )
         return CreateRunResponse(

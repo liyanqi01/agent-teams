@@ -30,6 +30,7 @@ from relay_teams.tools.workspace_tools.edit_state import (
     record_file_read,
     record_file_read_async,
 )
+from relay_teams.workspace.handle import WorkspacePathScope
 
 
 class _FakeAgent:
@@ -56,7 +57,37 @@ class _FakeWorkspace:
 
     def resolve_path(self, relative_path: str, *, write: bool = False) -> Path:
         _ = write
+        raw_path = Path(relative_path)
+        if raw_path.is_absolute():
+            return raw_path.resolve()
         return (self.scope_root / relative_path).resolve()
+
+    def resolve_workspace_path(
+        self,
+        raw_path: str,
+        *,
+        write: bool = False,
+        allow_host_read_bypass: bool = False,
+        allow_external_directory: bool = False,
+    ) -> SimpleNamespace:
+        del allow_host_read_bypass
+        resolved = self.resolve_path(raw_path, write=write)
+        external = allow_external_directory and not self._is_within_root(
+            resolved, self.scope_root.resolve()
+        )
+        return SimpleNamespace(
+            mount_name=None if external else "default",
+            local_path=resolved,
+            scope=(
+                WorkspacePathScope.EXTERNAL_DIRECTORY
+                if external
+                else WorkspacePathScope.WORKSPACE
+            ),
+        )
+
+    @staticmethod
+    def _is_within_root(candidate: Path, root: Path) -> bool:
+        return candidate == root or root in candidate.parents
 
 
 def test_replace_content_replaces_unique_exact_match() -> None:

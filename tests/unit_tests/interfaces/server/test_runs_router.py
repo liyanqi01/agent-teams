@@ -28,6 +28,7 @@ from relay_teams.sessions.runs.run_models import RunEvent
 from relay_teams.sessions.runs.run_service import SessionRunService
 from relay_teams.sessions.runs.enums import RunEventType
 from relay_teams.sessions.runs.user_question_models import UserQuestionAnswer
+from relay_teams.tools.runtime.policy import ExternalDirectoryPermissionMode
 
 
 class _FakeRunService:
@@ -517,8 +518,17 @@ class _FakeContainer:
 
 
 class _FakeGeneralConfigService:
-    def __init__(self, enabled: bool = True) -> None:
-        self._config = GeneralConfig(shell_safety_policy_enabled=enabled)
+    def __init__(
+        self,
+        enabled: bool = True,
+        external_directory_permission: ExternalDirectoryPermissionMode = (
+            ExternalDirectoryPermissionMode.ASK
+        ),
+    ) -> None:
+        self._config = GeneralConfig(
+            shell_safety_policy_enabled=enabled,
+            external_directory_permission=external_directory_permission,
+        )
 
     def get_config(self) -> GeneralConfig:
         return self._config
@@ -700,7 +710,10 @@ def test_create_run_route_uses_saved_general_shell_policy_by_default() -> None:
     fake_service = _FakeRunService()
     client = _create_client(
         fake_service,
-        fake_general_config_service=_FakeGeneralConfigService(enabled=False),
+        fake_general_config_service=_FakeGeneralConfigService(
+            enabled=False,
+            external_directory_permission=ExternalDirectoryPermissionMode.DENY,
+        ),
     )
 
     response = client.post(
@@ -716,6 +729,7 @@ def test_create_run_route_uses_saved_general_shell_policy_by_default() -> None:
     created = fake_service.created_run_inputs[0]
     assert created.shell_safety_policy_enabled is False
     assert created.shell_safety_policy_override_provided is False
+    assert created.external_directory_permission == ExternalDirectoryPermissionMode.DENY
 
 
 def test_create_run_route_allows_explicit_shell_policy_override() -> None:

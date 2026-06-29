@@ -4,6 +4,7 @@ from __future__ import annotations
 import posixpath
 import re
 import sys
+from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import ClassVar
 
@@ -21,6 +22,11 @@ from relay_teams.workspace.workspace_models import (
 )
 
 
+class WorkspacePathScope(str, Enum):
+    WORKSPACE = "workspace"
+    EXTERNAL_DIRECTORY = "external_directory"
+
+
 class ResolvedWorkspacePath(BaseModel):
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
@@ -30,6 +36,7 @@ class ResolvedWorkspacePath(BaseModel):
     local_path: Path | None = None
     remote_path: str | None = None
     host_bypass: bool = False
+    scope: WorkspacePathScope = WorkspacePathScope.WORKSPACE
 
 
 class WorkspaceHandle(BaseModel):
@@ -331,12 +338,25 @@ class WorkspaceHandle(BaseModel):
             )
         return None
 
+    @staticmethod
+    def _external_directory_result(path_obj: Path) -> ResolvedWorkspacePath:
+        resolved_path = path_obj.resolve()
+        return ResolvedWorkspacePath(
+            mount_name=None,
+            provider=WorkspaceMountProvider.LOCAL,
+            logical_path=resolved_path.as_posix(),
+            local_path=resolved_path,
+            host_bypass=True,
+            scope=WorkspacePathScope.EXTERNAL_DIRECTORY,
+        )
+
     def resolve_workspace_path(
         self,
         raw_path: str,
         *,
         write: bool = False,
         allow_host_read_bypass: bool = False,
+        allow_external_directory: bool = False,
     ) -> ResolvedWorkspacePath:
         normalized_path = self._normalize_raw_path(raw_path)
         path_obj = Path(normalized_path)
@@ -373,6 +393,8 @@ class WorkspaceHandle(BaseModel):
                     local_path=path_obj.resolve(),
                     host_bypass=True,
                 )
+            if allow_external_directory:
+                return self._external_directory_result(path_obj)
             action = "write" if write else "read"
             raise ValueError(
                 f"Path is outside workspace {action} scope: requested={raw_path}, "
@@ -424,12 +446,22 @@ class WorkspaceHandle(BaseModel):
                 resolved_mount,
                 write=write,
             )
-            resolved_path = self._validate_allowed_local_path(
-                candidate,
-                allowed_roots=allowed_roots,
-                raw_path=raw_path,
-                write=write,
-            )
+            try:
+                resolved_path = self._validate_allowed_local_path(
+                    candidate,
+                    allowed_roots=allowed_roots,
+                    raw_path=raw_path,
+                    write=write,
+                )
+            except ValueError:
+                if (
+                    allow_external_directory
+                    and mount_name is None
+                    and resolved_mount.mount_name == self.locations.mount_name
+                    and resolved_mount.provider == self.locations.provider
+                ):
+                    return self._external_directory_result(candidate)
+                raise
             return ResolvedWorkspacePath(
                 mount_name=resolved_mount.mount_name,
                 provider=resolved_mount.provider,
@@ -469,8 +501,18 @@ class WorkspaceHandle(BaseModel):
             )
         return resolved.local_path
 
-    def resolve_path(self, relative_path: str, *, write: bool = False) -> Path:
-        resolved = self.resolve_workspace_path(relative_path, write=write)
+    def resolve_path(
+        self,
+        relative_path: str,
+        *,
+        write: bool = False,
+        allow_external_directory: bool = False,
+    ) -> Path:
+        resolved = self.resolve_workspace_path(
+            relative_path,
+            write=write,
+            allow_external_directory=allow_external_directory,
+        )
         if resolved.local_path is None:
             raise ValueError(
                 f"Workspace path resolves to non-local mount: {resolved.mount_name}"

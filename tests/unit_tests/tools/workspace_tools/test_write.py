@@ -10,8 +10,10 @@ import pytest
 from pydantic_ai import Agent
 
 from relay_teams.tools.runtime.context import ToolDeps
-from relay_teams.tools.runtime.models import ToolResultProjection
+from relay_teams.tools.runtime.models import ToolApprovalRequest, ToolResultProjection
+from relay_teams.tools.runtime.policy import EXTERNAL_DIRECTORY_SOURCE
 from relay_teams.tools.workspace_tools import register_write, register_write_tmp
+from relay_teams.workspace.handle import WorkspacePathScope
 
 
 async def _invoke_tool_action(
@@ -223,10 +225,40 @@ class _FakeWorkspace:
 
     def resolve_path(self, relative_path: str, *, write: bool = False) -> Path:
         del write
+        raw_path = Path(relative_path)
+        if raw_path.is_absolute():
+            return raw_path.resolve()
         if relative_path == "tmp" or relative_path.startswith("tmp/"):
             suffix = relative_path.removeprefix("tmp").lstrip("/\\")
             return (self.tmp_root / suffix).resolve()
         return (self.execution_root / relative_path).resolve()
+
+    def resolve_workspace_path(
+        self,
+        raw_path: str,
+        *,
+        write: bool = False,
+        allow_host_read_bypass: bool = False,
+        allow_external_directory: bool = False,
+    ) -> SimpleNamespace:
+        del allow_host_read_bypass
+        resolved = self.resolve_path(raw_path, write=write)
+        workspace_roots = (
+            self.execution_root.resolve(),
+            self.tmp_root.resolve(),
+        )
+        external = allow_external_directory and not any(
+            self._is_within_root(resolved, root) for root in workspace_roots
+        )
+        return SimpleNamespace(
+            mount_name=None if external else "default",
+            local_path=resolved,
+            scope=(
+                WorkspacePathScope.EXTERNAL_DIRECTORY
+                if external
+                else WorkspacePathScope.WORKSPACE
+            ),
+        )
 
     def resolve_tmp_path(self, relative_path: str, *, write: bool = True) -> Path:
         del write
@@ -239,6 +271,10 @@ class _FakeWorkspace:
                 f"Path is outside workspace tmp directory: {relative_path}"
             )
         return requested_path
+
+    @staticmethod
+    def _is_within_root(candidate: Path, root: Path) -> bool:
+        return candidate == root or root in candidate.parents
 
 
 @pytest.mark.asyncio
@@ -283,6 +319,69 @@ async def test_write_tool_supports_managed_tmp_prefix(
     assert (tmp_path / "tmp" / "reports" / "spec.md").read_text(encoding="utf-8") == (
         "hello tmp\n"
     )
+
+
+@pytest.mark.asyncio
+async def test_write_tool_requests_approval_for_external_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from relay_teams.tools.workspace_tools import write as write_module
+
+    fake_agent = _FakeAgent()
+    register_write(cast(Agent[ToolDeps, str], fake_agent))
+    tool = cast(
+        Callable[..., Awaitable[dict[str, object]]],
+        fake_agent.tools["write"],
+    )
+    ctx = SimpleNamespace(
+        deps=SimpleNamespace(
+            workspace=_FakeWorkspace(tmp_path / "workspace"),
+        )
+    )
+    external_file = tmp_path / "external" / "findings.json"
+    approval_requests: list[ToolApprovalRequest | None] = []
+    approval_summaries: list[dict[str, object] | None] = []
+
+    async def _fake_execute_tool(
+        ctx,
+        *,
+        tool_name: str,
+        args_summary: dict[str, object],
+        action: Callable[..., Awaitable[ToolResultProjection]],
+        raw_args: dict[str, object] | None = None,
+        approval_request_factory=None,
+        approval_args_summary_factory=None,
+        **_: object,
+    ) -> dict[str, object]:
+        del ctx, tool_name, args_summary
+        tool_input = {
+            "path": str(dict(raw_args or {})["path"]),
+            "content": str(dict(raw_args or {})["content"]),
+        }
+        if approval_request_factory is not None:
+            approval_requests.append(approval_request_factory(tool_input))
+        if approval_args_summary_factory is not None:
+            approval_summaries.append(approval_args_summary_factory(tool_input))
+        projected = await _invoke_tool_action(action, raw_args)
+        return cast(dict[str, object], projected.internal_data)
+
+    monkeypatch.setattr(write_module, "execute_tool_call", _fake_execute_tool)
+
+    result = await tool(ctx, path=str(external_file), content='{"ok": true}\n')
+
+    request = approval_requests[0]
+    summary = approval_summaries[0]
+    assert request is not None
+    assert request.source == EXTERNAL_DIRECTORY_SOURCE
+    assert request.target_summary == str(external_file.parent.resolve())
+    assert request.metadata["requested_path"] == str(external_file)
+    assert summary is not None
+    assert summary["permission"] == EXTERNAL_DIRECTORY_SOURCE
+    assert summary["directory"] == str(external_file.parent.resolve())
+    assert result["external_directory"] is True
+    assert result["resolved_path"] == str(external_file.resolve())
+    assert external_file.read_text(encoding="utf-8") == '{"ok": true}\n'
 
 
 @pytest.mark.asyncio

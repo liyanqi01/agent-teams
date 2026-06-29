@@ -24,6 +24,7 @@ from relay_teams.tools.workspace_tools.notebook import (
     notebook_edit_file_with_guard,
     project_notebook,
 )
+from relay_teams.workspace.handle import WorkspacePathScope
 
 
 def _notebook() -> dict[str, object]:
@@ -87,7 +88,37 @@ class _FakeWorkspace:
 
     def resolve_path(self, relative_path: str, *, write: bool = False) -> Path:
         _ = write
+        raw_path = Path(relative_path)
+        if raw_path.is_absolute():
+            return raw_path.resolve()
         return (self.scope_root / relative_path).resolve()
+
+    def resolve_workspace_path(
+        self,
+        raw_path: str,
+        *,
+        write: bool = False,
+        allow_host_read_bypass: bool = False,
+        allow_external_directory: bool = False,
+    ) -> SimpleNamespace:
+        del allow_host_read_bypass
+        resolved = self.resolve_path(raw_path, write=write)
+        external = allow_external_directory and not self._is_within_root(
+            resolved, self.scope_root.resolve()
+        )
+        return SimpleNamespace(
+            mount_name=None if external else "default",
+            local_path=resolved,
+            scope=(
+                WorkspacePathScope.EXTERNAL_DIRECTORY
+                if external
+                else WorkspacePathScope.WORKSPACE
+            ),
+        )
+
+    @staticmethod
+    def _is_within_root(candidate: Path, root: Path) -> bool:
+        return candidate == root or root in candidate.parents
 
 
 def test_project_notebook_projects_cells_and_outputs(tmp_path: Path) -> None:
@@ -312,23 +343,32 @@ async def test_notebook_edit_tool_runs_registered_sync_action(
         )
     )
 
-    async def _fake_execute_tool(
+    async def _fake_execute_tool_call(
         ctx: ToolContext,
         *,
         tool_name: str,
         args_summary: dict[str, JsonValue],
-        action: Callable[[], ToolResultProjection | Awaitable[ToolResultProjection]],
+        action: Callable[..., ToolResultProjection | Awaitable[ToolResultProjection]],
+        raw_args: dict[str, object],
         **kwargs: object,
     ) -> dict[str, JsonValue]:
         del ctx, tool_name, args_summary, kwargs
-        maybe_projection = action()
+        parameter_names = set(inspect.signature(action).parameters)
+        action_args = {
+            key: value for key, value in raw_args.items() if key in parameter_names
+        }
+        maybe_projection = action(**action_args)
         if inspect.isawaitable(maybe_projection):
             projection = await maybe_projection
         else:
             projection = maybe_projection
         return cast(dict[str, JsonValue], projection.internal_data)
 
-    monkeypatch.setattr(notebook_edit_module, "execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(
+        notebook_edit_module,
+        "execute_tool_call",
+        _fake_execute_tool_call,
+    )
 
     result = await tool(
         cast(ToolContext, cast(object, ctx)),

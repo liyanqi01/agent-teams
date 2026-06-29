@@ -41,6 +41,7 @@ from relay_teams.sessions.runs.run_runtime_repo import (
 from relay_teams.sessions.runs.user_question_repository import UserQuestionRepository
 from relay_teams.sessions.session_repository import SessionRepository
 from relay_teams.tools.runtime.approval_ticket_repo import ApprovalTicketRepository
+from relay_teams.tools.runtime.policy import ExternalDirectoryPermissionMode
 from relay_teams.trace import bind_trace_context
 
 logger = get_logger(__name__)
@@ -474,7 +475,11 @@ class RunFollowupRouter:
             normalized_session_id
         )
         _ = self._session_repo.mark_started(normalized_session_id)
-        source_yolo, source_shell_safety_policy_enabled = self._source_run_policy(
+        (
+            source_yolo,
+            source_shell_safety_policy_enabled,
+            source_external_directory_permission,
+        ) = self._source_run_policy(
             source_run_id=source_run_id,
             session_id=normalized_session_id,
         )
@@ -483,6 +488,7 @@ class RunFollowupRouter:
             input=(TextContentPart(text=message),),
             yolo=source_yolo,
             shell_safety_policy_enabled=source_shell_safety_policy_enabled,
+            external_directory_permission=source_external_directory_permission,
         )
         new_run_id, _ = self._create_run(intent, InjectionSource.SYSTEM)
         self._ensure_run_started(new_run_id)
@@ -552,6 +558,7 @@ class RunFollowupRouter:
         (
             source_yolo,
             source_shell_safety_policy_enabled,
+            source_external_directory_permission,
         ) = await self._source_run_policy_async(
             source_run_id=source_run_id,
             session_id=normalized_session_id,
@@ -561,6 +568,7 @@ class RunFollowupRouter:
             input=(TextContentPart(text=message),),
             yolo=source_yolo,
             shell_safety_policy_enabled=source_shell_safety_policy_enabled,
+            external_directory_permission=source_external_directory_permission,
         )
         if self._create_run_async is None:
             new_run_id, _ = await asyncio.to_thread(
@@ -899,30 +907,38 @@ class RunFollowupRouter:
 
     def _source_run_policy(
         self, *, source_run_id: str, session_id: str
-    ) -> tuple[bool, bool]:
+    ) -> tuple[bool, bool, ExternalDirectoryPermissionMode]:
         run_intent_repo = self._get_run_intent_repo()
         if run_intent_repo is None:
-            return False, True
+            return False, True, ExternalDirectoryPermissionMode.ASK
         try:
             intent = run_intent_repo.get(source_run_id, fallback_session_id=session_id)
         except KeyError:
-            return False, True
-        return intent.yolo, intent.shell_safety_policy_enabled
+            return False, True, ExternalDirectoryPermissionMode.ASK
+        return (
+            intent.yolo,
+            intent.shell_safety_policy_enabled,
+            intent.external_directory_permission,
+        )
 
     async def _source_run_policy_async(
         self, *, source_run_id: str, session_id: str
-    ) -> tuple[bool, bool]:
+    ) -> tuple[bool, bool, ExternalDirectoryPermissionMode]:
         run_intent_repo = self._get_run_intent_repo()
         if run_intent_repo is None:
-            return False, True
+            return False, True, ExternalDirectoryPermissionMode.ASK
         try:
             intent = await run_intent_repo.get_async(
                 source_run_id,
                 fallback_session_id=session_id,
             )
         except KeyError:
-            return False, True
-        return intent.yolo, intent.shell_safety_policy_enabled
+            return False, True, ExternalDirectoryPermissionMode.ASK
+        return (
+            intent.yolo,
+            intent.shell_safety_policy_enabled,
+            intent.external_directory_permission,
+        )
 
     def publish_injection_event(
         self,

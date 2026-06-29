@@ -25,6 +25,12 @@ from relay_teams.tools.runtime.context import (
 )
 from relay_teams.tools.runtime.execution import execute_tool_call
 from relay_teams.tools.runtime.models import ToolResultProjection
+from relay_teams.tools.workspace_tools.external_directory import (
+    build_external_directory_approval_args_summary,
+    build_external_directory_approval_request,
+    external_directory_internal_data,
+    resolve_workspace_write_path,
+)
 
 
 def generate_diff(old_path: str, old_content: str, new_content: str) -> str:
@@ -110,15 +116,19 @@ def _project_write_result(
     diff_summary: str,
     path: str,
     created: bool,
+    extra_internal_data: dict[str, JsonValue] | None = None,
 ) -> ToolResultProjection:
+    internal_data: dict[str, JsonValue] = {
+        "output": output,
+        "diff_summary": diff_summary,
+        "path": path,
+        "created": created,
+    }
+    if extra_internal_data is not None:
+        internal_data.update(extra_internal_data)
     return ToolResultProjection(
         visible_data={"output": output},
-        internal_data={
-            "output": output,
-            "diff_summary": diff_summary,
-            "path": path,
-            "created": created,
-        },
+        internal_data=internal_data,
     )
 
 
@@ -138,7 +148,8 @@ def register(agent: Agent[ToolDeps, str]) -> None:
         """
 
         async def _action(path: str, content: str) -> ToolResultProjection:
-            file_path = ctx.deps.workspace.resolve_path(path, write=True)
+            access = resolve_workspace_write_path(ctx, path)
+            file_path = access.resolved_path
 
             old_content = ""
             created = not path_exists(file_path)
@@ -162,6 +173,7 @@ def register(agent: Agent[ToolDeps, str]) -> None:
                 diff_summary=diff_summary,
                 path=path,
                 created=created,
+                extra_internal_data=external_directory_internal_data(access),
             )
 
         return await execute_tool_call(
@@ -173,4 +185,18 @@ def register(agent: Agent[ToolDeps, str]) -> None:
             },
             action=_action,
             raw_args=locals(),
+            approval_request_factory=lambda tool_input: (
+                build_external_directory_approval_request(
+                    ctx,
+                    tool_name="write",
+                    tool_input=tool_input,
+                )
+            ),
+            approval_args_summary_factory=lambda tool_input: (
+                build_external_directory_approval_args_summary(
+                    ctx,
+                    tool_name="write",
+                    tool_input=tool_input,
+                )
+            ),
         )

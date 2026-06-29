@@ -23,6 +23,7 @@ from relay_teams.sessions.runs.enums import (
 )
 from relay_teams.sessions.runs import run_config_models
 from relay_teams.sessions.session_models import SessionMode
+from relay_teams.tools.runtime.policy import ExternalDirectoryPermissionMode
 from relay_teams.validation import (
     OptionalIdentifierStr,
     RequiredIdentifierStr,
@@ -75,6 +76,9 @@ class IntentInput(BaseModel):
     yolo: bool = False
     shell_safety_policy_enabled: bool = True
     shell_safety_policy_override_provided: bool = False
+    external_directory_permission: ExternalDirectoryPermissionMode = (
+        ExternalDirectoryPermissionMode.ASK
+    )
     reuse_root_instance: bool = True
     thinking: RunThinkingConfig = Field(default_factory=RunThinkingConfig)
     target_role_id: OptionalIdentifierStr = None

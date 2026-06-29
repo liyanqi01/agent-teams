@@ -3,7 +3,7 @@
  * Approval rendering and status helpers.
  */
 import { parseMarkdown } from '../../../utils/markdown.js';
-import { t } from '../../../utils/i18n.js';
+import { formatMessage, t } from '../../../utils/i18n.js';
 
 export function decoratePendingApprovalBlock(toolBlock, approval) {
     if (approval?.tool_call_id) {
@@ -88,7 +88,7 @@ function historicalApprovalLabel(status) {
 }
 
 function formatPendingApprovalResult(approval) {
-    const details = [
+    const details = formatExternalDirectoryApprovalDetails(approval) || [
         approval?.source ? `source: ${approval.source}` : '',
         approval?.risk_level ? `risk: ${approval.risk_level}` : '',
         approval?.permission_scope ? `scope: ${approval.permission_scope}` : '',
@@ -107,6 +107,25 @@ function formatPendingApprovalResult(approval) {
             : t('approval.result.approved_no_result');
     }
     return details ? `${t('approval.result.pending')}\n\n${details}` : t('approval.result.pending');
+}
+
+function formatExternalDirectoryApprovalDetails(approval) {
+    if (String(approval?.source || '') !== 'external_directory') {
+        return null;
+    }
+    return [
+        approval?.tool_name
+            ? formatMessage('approval.result.external_directory_tool', {
+                tool: approval.tool_name,
+            })
+            : '',
+        approval?.target_summary
+            ? formatMessage('approval.result.external_directory_directory', {
+                directory: approval.target_summary,
+            })
+            : '',
+        approval?.risk_level ? `risk: ${approval.risk_level}` : '',
+    ].filter(Boolean).join('\n');
 }
 
 function extractApprovalMeta(envelope) {

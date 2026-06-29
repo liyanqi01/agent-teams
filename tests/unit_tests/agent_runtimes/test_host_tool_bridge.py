@@ -23,7 +23,10 @@ from relay_teams.sessions.runs.enums import InjectionSource
 from relay_teams.sessions.runs.event_stream import RunEventHub
 from relay_teams.sessions.runs.injection_queue import RunInjectionManager
 from relay_teams.sessions.runs.run_models import RunEvent
-from relay_teams.tools.runtime.policy import ToolApprovalPolicy
+from relay_teams.tools.runtime.policy import (
+    ExternalDirectoryPermissionMode,
+    ToolApprovalPolicy,
+)
 
 
 class _PublicTool:
@@ -56,16 +59,24 @@ class _FakeToolApprovalPolicy:
         *,
         yolo: bool | None = None,
         shell_safety_policy_enabled: bool | None = None,
+        external_directory_permission: ExternalDirectoryPermissionMode | None = None,
     ) -> "_FakeToolApprovalPolicy":
-        _ = (yolo, shell_safety_policy_enabled)
+        _ = (yolo, shell_safety_policy_enabled, external_directory_permission)
         return self
 
 
 class _RunIntentRepo:
-    def __init__(self, *, yolo: bool, shell_safety_policy_enabled: bool) -> None:
+    def __init__(
+        self,
+        *,
+        yolo: bool,
+        shell_safety_policy_enabled: bool,
+        external_directory_permission: ExternalDirectoryPermissionMode,
+    ) -> None:
         self._intent = SimpleNamespace(
             yolo=yolo,
             shell_safety_policy_enabled=shell_safety_policy_enabled,
+            external_directory_permission=external_directory_permission,
         )
 
     async def get_async(self, _run_id: str) -> object:
@@ -373,6 +384,7 @@ async def test_build_tool_deps_applies_shell_safety_policy_from_run_intent() -> 
             "_run_intent_repo": _RunIntentRepo(
                 yolo=True,
                 shell_safety_policy_enabled=False,
+                external_directory_permission=ExternalDirectoryPermissionMode.DENY,
             ),
             "_get_role_registry": lambda: object(),
             "_get_skill_registry": lambda: object(),
@@ -397,6 +409,9 @@ async def test_build_tool_deps_applies_shell_safety_policy_from_run_intent() -> 
 
     assert deps.tool_approval_policy.yolo is True
     assert deps.tool_approval_policy.shell_safety_policy_enabled is False
+    assert deps.tool_approval_policy.external_directory_permission == (
+        ExternalDirectoryPermissionMode.DENY
+    )
 
 
 def test_host_tool_bridge_init_stores_model_resolver(

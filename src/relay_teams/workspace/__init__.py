@@ -3,7 +3,11 @@ from __future__ import annotations
 
 from relay_teams.workspace.directory_picker import pick_workspace_directory
 from relay_teams.workspace.git_worktree import GitWorktreeClient
-from relay_teams.workspace.handle import WorkspaceHandle
+from relay_teams.workspace.handle import (
+    ResolvedWorkspacePath,
+    WorkspaceHandle,
+    WorkspacePathScope,
+)
 from relay_teams.workspace.ssh_profile_secret_store import (
     SshProfileSecretStore,
     get_ssh_profile_secret_store,
@@ -67,6 +71,8 @@ from relay_teams.workspace.workspace_service import WorkspaceService
 __all__ = [
     "WorkspaceBackend",
     "WorkspaceHandle",
+    "WorkspacePathScope",
+    "ResolvedWorkspacePath",
     "GitWorktreeClient",
     "WorkspaceDiffChangeType",
     "WorkspaceDiffFile",

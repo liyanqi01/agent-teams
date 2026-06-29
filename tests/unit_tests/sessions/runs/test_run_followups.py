@@ -33,6 +33,7 @@ from relay_teams.sessions.runs.run_runtime_repo import RunRuntimeRecord
 from relay_teams.sessions.runs.user_question_repository import UserQuestionRepository
 from relay_teams.sessions.session_repository import SessionRepository
 from relay_teams.tools.runtime.approval_ticket_repo import ApprovalTicketRepository
+from relay_teams.tools.runtime.policy import ExternalDirectoryPermissionMode
 from relay_teams.media import content_parts_from_text
 
 
@@ -386,6 +387,7 @@ async def test_spawn_system_followup_run_async_inherits_source_shell_policy(
             input=content_parts_from_text("source"),
             yolo=True,
             shell_safety_policy_enabled=False,
+            external_directory_permission=ExternalDirectoryPermissionMode.ALLOW,
         ),
     )
     router = _RecordingRunFollowupRouter(
@@ -404,6 +406,9 @@ async def test_spawn_system_followup_run_async_inherits_source_shell_policy(
     assert run_id == "run-created-sync"
     assert router.created_intents[0].yolo is True
     assert router.created_intents[0].shell_safety_policy_enabled is False
+    assert router.created_intents[0].external_directory_permission == (
+        ExternalDirectoryPermissionMode.ALLOW
+    )
 
 
 def test_spawn_system_followup_run_inherits_source_shell_policy(
@@ -419,6 +424,7 @@ def test_spawn_system_followup_run_inherits_source_shell_policy(
             input=content_parts_from_text("source"),
             yolo=True,
             shell_safety_policy_enabled=False,
+            external_directory_permission=ExternalDirectoryPermissionMode.DENY,
         ),
     )
     router = _RecordingRunFollowupRouter(
@@ -437,6 +443,9 @@ def test_spawn_system_followup_run_inherits_source_shell_policy(
     assert run_id == "run-created-sync"
     assert router.created_intents[0].yolo is True
     assert router.created_intents[0].shell_safety_policy_enabled is False
+    assert router.created_intents[0].external_directory_permission == (
+        ExternalDirectoryPermissionMode.DENY
+    )
 
 
 @pytest.mark.asyncio

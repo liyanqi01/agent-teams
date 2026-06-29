@@ -21,6 +21,12 @@ from relay_teams.tools.workspace_tools.edit_state import (
     assert_file_unchanged_since_read,
     record_file_read,
 )
+from relay_teams.tools.workspace_tools.external_directory import (
+    build_external_directory_approval_args_summary,
+    build_external_directory_approval_request,
+    external_directory_internal_data,
+    resolve_workspace_write_path,
+)
 from relay_teams.tools.workspace_tools.write import (
     atomic_write,
     format_diff_summary,
@@ -485,8 +491,14 @@ def edit_file_with_guard(
     return result
 
 
-def _project_edit_result(result: dict[str, str]) -> ToolResultProjection:
+def _project_edit_result(
+    result: dict[str, str],
+    *,
+    extra_internal_data: dict[str, JsonValue] | None = None,
+) -> ToolResultProjection:
     internal_data: dict[str, JsonValue] = {key: value for key, value in result.items()}
+    if extra_internal_data is not None:
+        internal_data.update(extra_internal_data)
     return ToolResultProjection(
         visible_data={
             "output": result["output"],
@@ -510,7 +522,8 @@ def register(agent: Agent[ToolDeps, str]) -> None:
             new_string: str,
             replace_all: bool = False,
         ) -> ToolResultProjection:
-            file_path = ctx.deps.workspace.resolve_path(path, write=True)
+            access = resolve_workspace_write_path(ctx, path)
+            file_path = access.resolved_path
             result = edit_file_with_guard(
                 shared_store=ctx.deps.shared_store,
                 session_id=ctx.deps.session_id,
@@ -520,7 +533,10 @@ def register(agent: Agent[ToolDeps, str]) -> None:
                 new_string=new_string,
                 replace_all=replace_all,
             )
-            return _project_edit_result(result)
+            return _project_edit_result(
+                result,
+                extra_internal_data=external_directory_internal_data(access),
+            )
 
         return await execute_tool_call(
             ctx,
@@ -533,4 +549,18 @@ def register(agent: Agent[ToolDeps, str]) -> None:
             },
             action=_action,
             raw_args=locals(),
+            approval_request_factory=lambda tool_input: (
+                build_external_directory_approval_request(
+                    ctx,
+                    tool_name="edit",
+                    tool_input=tool_input,
+                )
+            ),
+            approval_args_summary_factory=lambda tool_input: (
+                build_external_directory_approval_args_summary(
+                    ctx,
+                    tool_name="edit",
+                    tool_input=tool_input,
+                )
+            ),
         )

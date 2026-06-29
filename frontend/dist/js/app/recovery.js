@@ -2641,12 +2641,7 @@ function renderApprovalItem(activeRun, approval) {
     const statusText = error || (busy ? t('recovery.applying') : '');
     const actor = humanizeRoleLabel(approval?.role_id || approval?.instance_id || 'Agent');
     const title = approvalTitle(approval);
-    const subtitle = [
-        formatMessage('recovery.requested_by', { actor }),
-        approval?.source ? `source ${approval.source}` : '',
-        approval?.risk_level ? `risk ${approval.risk_level}` : '',
-        approval?.target_summary ? `target ${approval.target_summary}` : '',
-    ].filter(Boolean).join(' · ');
+    const subtitle = approvalSubtitle(approval, actor);
 
     return `
         <section class="recovery-approval-card">
@@ -2664,6 +2659,30 @@ function renderApprovalItem(activeRun, approval) {
             </div>
         </section>
     `;
+}
+
+function approvalSubtitle(approval, actor) {
+    if (String(approval?.source || '') === 'external_directory') {
+        return [
+            formatMessage('recovery.requested_by', { actor }),
+            approval?.tool_name
+                ? formatMessage('recovery.approval.external_directory_tool', {
+                    tool: humanizeToolName(String(approval.tool_name)),
+                })
+                : '',
+            approval?.target_summary
+                ? formatMessage('recovery.approval.external_directory_directory', {
+                    directory: approval.target_summary,
+                })
+                : '',
+        ].filter(Boolean).join(' · ');
+    }
+    return [
+        formatMessage('recovery.requested_by', { actor }),
+        approval?.source ? `source ${approval.source}` : '',
+        approval?.risk_level ? `risk ${approval.risk_level}` : '',
+        approval?.target_summary ? `target ${approval.target_summary}` : '',
+    ].filter(Boolean).join(' · ');
 }
 
 function renderApprovalActionButtons(approval, disabled) {
@@ -2735,6 +2754,9 @@ function approvalActionForAcpOption(option) {
 }
 
 function approvalTitle(approval) {
+    if (String(approval?.source || '') === 'external_directory') {
+        return t('recovery.tool.external_directory');
+    }
     const toolName = String(approval?.tool_name || '');
     const args = parseApprovalArgs(approval?.args_preview);
     if (toolName === 'orch_list_available_roles') {

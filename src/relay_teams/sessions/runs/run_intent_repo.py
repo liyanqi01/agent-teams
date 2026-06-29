@@ -29,6 +29,7 @@ from relay_teams.sessions.runs.run_models import (
     RunTopologySnapshot,
 )
 from relay_teams.sessions.session_models import SessionMode
+from relay_teams.tools.runtime.policy import ExternalDirectoryPermissionMode
 from relay_teams.validation import normalize_persisted_text
 
 LOGGER = get_logger(__name__)
@@ -48,6 +49,7 @@ _RUN_INTENT_SELECT_COLUMNS = """
     execution_mode,
     yolo,
     shell_safety_policy_enabled,
+    external_directory_permission,
     reuse_root_instance,
     thinking_enabled,
     thinking_effort,
@@ -70,6 +72,7 @@ _RUN_INTENT_UPSERT_SQL = """
         execution_mode,
         yolo,
         shell_safety_policy_enabled,
+        external_directory_permission,
         reuse_root_instance,
         thinking_enabled,
         thinking_effort,
@@ -82,7 +85,7 @@ _RUN_INTENT_UPSERT_SQL = """
         created_at,
         updated_at
     )
-    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(run_id)
     DO UPDATE SET
         session_id=excluded.session_id,
@@ -94,6 +97,7 @@ _RUN_INTENT_UPSERT_SQL = """
         execution_mode=excluded.execution_mode,
         yolo=excluded.yolo,
         shell_safety_policy_enabled=excluded.shell_safety_policy_enabled,
+        external_directory_permission=excluded.external_directory_permission,
         reuse_root_instance=excluded.reuse_root_instance,
         thinking_enabled=excluded.thinking_enabled,
         thinking_effort=excluded.thinking_effort,
@@ -127,6 +131,7 @@ class RunIntentRepository(SharedSqliteRepository):
                     execution_mode TEXT NOT NULL,
                     yolo           TEXT NOT NULL DEFAULT 'false',
                     shell_safety_policy_enabled TEXT NOT NULL DEFAULT 'true',
+                    external_directory_permission TEXT NOT NULL DEFAULT 'ask',
                     reuse_root_instance TEXT NOT NULL DEFAULT 'true',
                     thinking_enabled TEXT NOT NULL DEFAULT 'false',
                     thinking_effort TEXT,
@@ -157,6 +162,12 @@ class RunIntentRepository(SharedSqliteRepository):
                 self._conn.execute(
                     """
                     ALTER TABLE run_intents ADD COLUMN shell_safety_policy_enabled TEXT NOT NULL DEFAULT 'true'
+                    """
+                )
+            if "external_directory_permission" not in columns:
+                self._conn.execute(
+                    """
+                    ALTER TABLE run_intents ADD COLUMN external_directory_permission TEXT NOT NULL DEFAULT 'ask'
                     """
                 )
             if "thinking_enabled" not in columns:
@@ -614,6 +625,7 @@ def _run_intent_upsert_params(
         intent.execution_mode.value,
         "true" if intent.yolo else "false",
         "true" if intent.shell_safety_policy_enabled else "false",
+        intent.external_directory_permission.value,
         "true" if intent.reuse_root_instance else "false",
         "true" if intent.thinking.enabled else "false",
         intent.thinking.effort,
@@ -657,6 +669,9 @@ def _intent_input_from_row(
         yolo=str(row["yolo"]).strip().lower() == "true",
         shell_safety_policy_enabled=(
             str(row["shell_safety_policy_enabled"]).strip().lower() != "false"
+        ),
+        external_directory_permission=_coerce_external_directory_permission(
+            row["external_directory_permission"]
         ),
         reuse_root_instance=(
             str(row["reuse_root_instance"]).strip().lower() != "false"
@@ -705,6 +720,17 @@ def _coerce_thinking_effort(
     if normalized == "high":
         return "high"
     return None
+
+
+def _coerce_external_directory_permission(
+    value: object,
+) -> ExternalDirectoryPermissionMode:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        for mode in ExternalDirectoryPermissionMode:
+            if normalized == mode.value:
+                return mode
+    return ExternalDirectoryPermissionMode.ASK
 
 
 def _coerce_topology(value: object) -> RunTopologySnapshot | None:

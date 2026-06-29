@@ -153,6 +153,7 @@ from relay_teams.skills.skill_market_models import (
     ClawHubSkillMarketUninstallResponse,
 )
 from relay_teams.skills.skill_models import Skill, SkillMetadata, SkillSource
+from relay_teams.tools.runtime.policy import ExternalDirectoryPermissionMode
 from relay_teams.hooks import HookRuntimeView, HooksConfig
 from relay_teams.notifications.models import NotificationConfig
 from relay_teams.agents.orchestration.settings_models import OrchestrationSettings
@@ -1510,7 +1511,10 @@ def test_get_general_config() -> None:
     response = client.get("/api/system/configs/general")
 
     assert response.status_code == 200
-    assert response.json() == {"shell_safety_policy_enabled": False}
+    assert response.json() == {
+        "shell_safety_policy_enabled": False,
+        "external_directory_permission": "ask",
+    }
 
 
 def test_get_ui_language_settings() -> None:
@@ -2122,13 +2126,24 @@ def test_save_general_config() -> None:
 
     response = client.put(
         "/api/system/configs/general",
-        json={"config": {"shell_safety_policy_enabled": False}},
+        json={
+            "config": {
+                "shell_safety_policy_enabled": False,
+                "external_directory_permission": "allow",
+            }
+        },
     )
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
-    assert service.saved_general_config == {"shell_safety_policy_enabled": False}
+    assert service.saved_general_config == {
+        "shell_safety_policy_enabled": False,
+        "external_directory_permission": ExternalDirectoryPermissionMode.ALLOW,
+    }
     assert service.general_config.shell_safety_policy_enabled is False
+    assert service.general_config.external_directory_permission == (
+        ExternalDirectoryPermissionMode.ALLOW
+    )
 
 
 def test_save_general_config_returns_500_for_persist_error() -> None:

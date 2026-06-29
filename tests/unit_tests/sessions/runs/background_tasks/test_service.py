@@ -50,6 +50,7 @@ from relay_teams.sessions.runs.run_runtime_repo import (
     RunRuntimeRepository,
     RunRuntimeStatus,
 )
+from relay_teams.tools.runtime.policy import ExternalDirectoryPermissionMode
 from relay_teams.hooks import (
     HookDecisionBundle,
     HookDecisionType,
@@ -530,6 +531,7 @@ def _parent_intent() -> IntentInput:
         session_id="session-1",
         execution_mode=ExecutionMode.AI,
         shell_safety_policy_enabled=False,
+        external_directory_permission=ExternalDirectoryPermissionMode.ALLOW,
         thinking=RunThinkingConfig(enabled=True, effort="medium"),
         session_mode=SessionMode.NORMAL,
     )
@@ -553,6 +555,9 @@ def test_background_task_service_subagent_intent_inherits_shell_policy() -> None
 
     subagent_intent = intent_repo.get("run-subagent-1")
     assert subagent_intent.shell_safety_policy_enabled is False
+    assert subagent_intent.external_directory_permission == (
+        ExternalDirectoryPermissionMode.ALLOW
+    )
 
 
 @pytest.mark.asyncio

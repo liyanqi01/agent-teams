@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+import faulthandler
 import importlib
 import json
 import logging
@@ -12,6 +13,7 @@ from pathlib import Path
 import re
 import signal
 import sys
+import threading
 import time
 from types import FrameType
 from typing import Protocol, cast
@@ -49,6 +51,9 @@ SERVICE_INITIALIZING = "service_initializing"
 HYDRATION_READ_WAIT_SECONDS = 0.0
 HYDRATION_MUTATION_WAIT_SECONDS = 0.0
 _RUNTIME_BUNDLE_MODULE = "relay_teams.interfaces.server.runtime_bundle"
+_EVENT_LOOP_HEARTBEAT_INTERVAL_SECONDS = 1.0
+_EVENT_LOOP_STALL_WARNING_SECONDS = 8.0
+_EVENT_LOOP_STALL_REPEAT_SECONDS = 30.0
 
 logger = logging.getLogger("relay_teams.bootstrap.server")
 FRONTEND_DIST_DIR = get_frontend_dist_dir()
@@ -134,6 +139,84 @@ class FrontendStaticFiles(StaticFiles):
         return response
 
 
+class EventLoopDiagnostics:
+    def __init__(
+        self,
+        starlette_app: Starlette,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        self._starlette_app = starlette_app
+        self._loop = loop
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._heartbeat_task: asyncio.Task[None] | None = None
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop,
+            name="relay-teams-event-loop-watchdog",
+            daemon=True,
+        )
+        self._last_heartbeat = time.monotonic()
+        self._last_stall_log = 0.0
+
+    def start(self) -> None:
+        self._heartbeat_task = self._loop.create_task(self._heartbeat_loop())
+        self._watchdog_thread.start()
+        _log_event(
+            logging.INFO,
+            event="app.event_loop_diagnostics.started",
+            message="Agent Teams event loop diagnostics started",
+            payload={
+                "pid": os.getpid(),
+                "stall_warning_seconds": _EVENT_LOOP_STALL_WARNING_SECONDS,
+                "stall_repeat_seconds": _EVENT_LOOP_STALL_REPEAT_SECONDS,
+            },
+        )
+
+    async def stop(self) -> None:
+        self._stop_event.set()
+        task = self._heartbeat_task
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._watchdog_thread.join(timeout=2.0)
+
+    async def _heartbeat_loop(self) -> None:
+        while not self._stop_event.is_set():
+            with self._lock:
+                self._last_heartbeat = time.monotonic()
+            await asyncio.sleep(_EVENT_LOOP_HEARTBEAT_INTERVAL_SECONDS)
+
+    def _watchdog_loop(self) -> None:
+        while not self._stop_event.wait(_EVENT_LOOP_HEARTBEAT_INTERVAL_SECONDS):
+            now = time.monotonic()
+            with self._lock:
+                last_heartbeat = self._last_heartbeat
+            lag_seconds = now - last_heartbeat
+            if lag_seconds < _EVENT_LOOP_STALL_WARNING_SECONDS:
+                continue
+            if now - self._last_stall_log < _EVENT_LOOP_STALL_REPEAT_SECONDS:
+                continue
+            self._last_stall_log = now
+            snapshot_path = _write_event_loop_stall_snapshot(
+                self._starlette_app,
+                lag_seconds=lag_seconds,
+            )
+            payload = _process_diagnostic_payload(
+                self._starlette_app,
+                lag_seconds=lag_seconds,
+                snapshot_path=snapshot_path,
+            )
+            _log_event(
+                logging.ERROR,
+                event="app.event_loop.stalled",
+                message="Agent Teams event loop heartbeat stalled",
+                payload=payload,
+            )
+
+
 @asynccontextmanager
 async def lifespan(starlette_app: Starlette) -> AsyncIterator[None]:
     config_dir = get_app_config_dir()
@@ -147,6 +230,9 @@ async def lifespan(starlette_app: Starlette) -> AsyncIterator[None]:
     starlette_app.state.hydrated = False
     starlette_app.state.hydration_error = None
     starlette_app.state.components = {"core": "ready", "runtime": "loading"}
+    diagnostics = EventLoopDiagnostics(starlette_app, asyncio.get_running_loop())
+    diagnostics.start()
+    starlette_app.state.event_loop_diagnostics = diagnostics
     hydration_task = asyncio.create_task(_hydrate_runtime(starlette_app, config_dir))
     starlette_app.state.hydration_task = hydration_task
     _log_event(
@@ -158,6 +244,7 @@ async def lifespan(starlette_app: Starlette) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        await diagnostics.stop()
         if hydration_task.done():
             _log_finished_hydration_task_error(hydration_task)
         else:
@@ -182,7 +269,26 @@ app = Starlette(lifespan=lifespan)
 
 
 async def bootstrap_health(request: Request) -> JSONResponse:
-    return JSONResponse(_health_payload(request.app))
+    started = _log_bootstrap_probe_started(request, endpoint="health")
+    try:
+        payload = _health_payload(request.app)
+        response = JSONResponse(payload)
+    except Exception as exc:
+        _log_bootstrap_probe_failed(
+            request,
+            endpoint="health",
+            started=started,
+            exc=exc,
+        )
+        raise
+    _log_bootstrap_probe_completed(
+        request,
+        endpoint="health",
+        started=started,
+        status_code=response.status_code,
+        payload=payload,
+    )
+    return response
 
 
 async def startup_status(request: Request) -> JSONResponse:
@@ -190,19 +296,27 @@ async def startup_status(request: Request) -> JSONResponse:
 
 
 async def bootstrap_live(request: Request) -> JSONResponse:
+    started = _log_bootstrap_probe_started(request, endpoint="live")
     started_at = float(getattr(request.app.state, "started_at", time.time()))
-    return JSONResponse(
-        {
-            "status": "alive",
-            "version": SERVER_VERSION,
-            "pid": os.getpid(),
-            "uptime_seconds": max(0.0, time.time() - started_at),
-            "main_base_url": os.environ.get(
-                "RELAY_TEAMS_CONTROL_PLANE_MAIN_URL",
-                "",
-            ).strip(),
-        }
+    payload: dict[str, object] = {
+        "status": "alive",
+        "version": SERVER_VERSION,
+        "pid": os.getpid(),
+        "uptime_seconds": max(0.0, time.time() - started_at),
+        "main_base_url": os.environ.get(
+            "RELAY_TEAMS_CONTROL_PLANE_MAIN_URL",
+            "",
+        ).strip(),
+    }
+    response = JSONResponse(payload)
+    _log_bootstrap_probe_completed(
+        request,
+        endpoint="live",
+        started=started,
+        status_code=response.status_code,
+        payload=payload,
     )
+    return response
 
 
 async def bootstrap_control_plane(request: Request) -> JSONResponse:
@@ -683,6 +797,128 @@ def _env_int(name: str) -> int | None:
     try:
         return int(raw)
     except ValueError:
+        return None
+
+
+def _log_bootstrap_probe_started(request: Request, *, endpoint: str) -> float:
+    started = time.perf_counter()
+    _log_event(
+        logging.INFO,
+        event=f"app.bootstrap.{endpoint}.started",
+        message="Bootstrap health probe started",
+        payload=_bootstrap_probe_log_payload(request),
+    )
+    return started
+
+
+def _log_bootstrap_probe_completed(
+    request: Request,
+    *,
+    endpoint: str,
+    started: float,
+    status_code: int,
+    payload: dict[str, object],
+) -> None:
+    payload_status = payload.get("status")
+    log_payload = _bootstrap_probe_log_payload(request)
+    log_payload.update(
+        {
+            "status_code": status_code,
+            "payload_status": payload_status if isinstance(payload_status, str) else "",
+        }
+    )
+    _log_event(
+        logging.INFO,
+        event=f"app.bootstrap.{endpoint}.completed",
+        message="Bootstrap health probe completed",
+        duration_ms=int((time.perf_counter() - started) * 1000),
+        payload=log_payload,
+    )
+
+
+def _log_bootstrap_probe_failed(
+    request: Request,
+    *,
+    endpoint: str,
+    started: float,
+    exc: Exception,
+) -> None:
+    _log_event(
+        logging.ERROR,
+        event=f"app.bootstrap.{endpoint}.failed",
+        message="Bootstrap health probe failed",
+        duration_ms=int((time.perf_counter() - started) * 1000),
+        payload=_bootstrap_probe_log_payload(request),
+        exc_info=exc,
+    )
+
+
+def _bootstrap_probe_log_payload(request: Request) -> dict[str, object]:
+    client_host = request.client.host if request.client is not None else ""
+    return {
+        "method": request.method,
+        "path": request.url.path,
+        "client_host": client_host,
+        "pid": os.getpid(),
+        "hydrated": bool(getattr(request.app.state, "hydrated", False)),
+        "startup_phase": str(getattr(request.app.state, "startup_phase", "")),
+    }
+
+
+def _write_event_loop_stall_snapshot(
+    starlette_app: Starlette,
+    *,
+    lag_seconds: float,
+) -> str:
+    config_dir = getattr(starlette_app.state, "config_dir", None)
+    snapshot_dir = config_dir / "log" if isinstance(config_dir, Path) else Path.cwd()
+    snapshot_path = snapshot_dir / f"event-loop-stall-{os.getpid()}.log"
+    try:
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        with snapshot_path.open("a", encoding="utf-8") as stream:
+            stream.write(
+                "\n"
+                f"=== event loop stall pid={os.getpid()} "
+                f"lag_seconds={lag_seconds:.3f} "
+                f"time={time.strftime('%Y-%m-%d %H:%M:%S %z')} ===\n"
+            )
+            faulthandler.dump_traceback(file=stream, all_threads=True)
+            stream.write("\n")
+    except OSError as exc:
+        _log_event(
+            logging.ERROR,
+            event="app.event_loop.stall_snapshot_failed",
+            message="Failed to write event loop stall snapshot",
+            payload={"path": str(snapshot_path)},
+            exc_info=exc,
+        )
+    return str(snapshot_path)
+
+
+def _process_diagnostic_payload(
+    starlette_app: Starlette,
+    *,
+    lag_seconds: float,
+    snapshot_path: str,
+) -> dict[str, object]:
+    return {
+        "pid": os.getpid(),
+        "lag_seconds": round(lag_seconds, 3),
+        "snapshot_path": snapshot_path,
+        "python_executable": sys.executable,
+        "active_thread_count": threading.active_count(),
+        "proc_task_count": _count_proc_entries("task"),
+        "proc_fd_count": _count_proc_entries("fd"),
+        "hydrated": bool(getattr(starlette_app.state, "hydrated", False)),
+        "startup_phase": str(getattr(starlette_app.state, "startup_phase", "")),
+    }
+
+
+def _count_proc_entries(name: str) -> int | None:
+    proc_path = Path("/proc") / str(os.getpid()) / name
+    try:
+        return sum(1 for _ in proc_path.iterdir())
+    except OSError:
         return None
 
 

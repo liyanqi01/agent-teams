@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from relay_teams.workspace import WorkspaceHandle
+from relay_teams.workspace import WorkspaceHandle, WorkspacePathScope
 from relay_teams.workspace.workspace_models import (
     WorkspaceLocations,
     WorkspaceMountProvider,
@@ -209,6 +209,49 @@ def test_resolve_path_rejects_write_outside_workspace_with_allowed_roots(
     assert f"resolved={(tmp_path / 'outside.txt').resolve()}" in message
     assert str(workspace_root.resolve()) in message
     assert str((workspace_root / "tmp").resolve()) in message
+
+
+def test_resolve_workspace_path_can_return_external_directory_for_write(
+    tmp_path: Path,
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    workspace = _build_workspace_handle(
+        workspace_dir=workspace_root,
+        scope_root=workspace_root,
+    )
+    external_file = tmp_path / "outside.txt"
+
+    resolved = workspace.resolve_workspace_path(
+        "../outside.txt",
+        write=True,
+        allow_external_directory=True,
+    )
+
+    assert resolved.scope == WorkspacePathScope.EXTERNAL_DIRECTORY
+    assert resolved.mount_name is None
+    assert resolved.host_bypass is True
+    assert resolved.local_path == external_file.resolve()
+
+
+def test_resolve_workspace_path_can_return_external_directory_for_absolute_write(
+    tmp_path: Path,
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    workspace = _build_workspace_handle(
+        workspace_dir=workspace_root,
+        scope_root=workspace_root,
+    )
+    external_file = tmp_path / "external" / "findings.json"
+
+    resolved = workspace.resolve_workspace_path(
+        str(external_file),
+        write=True,
+        allow_external_directory=True,
+    )
+
+    assert resolved.scope == WorkspacePathScope.EXTERNAL_DIRECTORY
+    assert resolved.mount_name is None
+    assert resolved.local_path == external_file.resolve()
 
 
 def test_resolve_path_routes_tmp_prefix_to_managed_tmp_root(tmp_path: Path) -> None:

@@ -23,6 +23,7 @@ from relay_teams.sessions.runs.run_models import (
 )
 from relay_teams.sessions.runs.run_intent_repo import RunIntentRepository
 from relay_teams.sessions.session_models import SessionMode
+from relay_teams.tools.runtime.policy import ExternalDirectoryPermissionMode
 
 
 def test_run_intent_repo_round_trips_yolo(tmp_path: Path) -> None:
@@ -45,6 +46,27 @@ def test_run_intent_repo_round_trips_yolo(tmp_path: Path) -> None:
     assert record.intent == "ship it"
     assert record.execution_mode == ExecutionMode.AI
     assert record.yolo is True
+
+
+def test_run_intent_repo_round_trips_external_directory_permission(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "run_intent_external_directory.db"
+    repo = RunIntentRepository(db_path)
+
+    repo.upsert(
+        run_id="run-1",
+        session_id="session-1",
+        intent=IntentInput(
+            session_id="session-1",
+            input=content_parts_from_text("ship it"),
+            external_directory_permission=ExternalDirectoryPermissionMode.ALLOW,
+        ),
+    )
+
+    record = repo.get("run-1")
+
+    assert record.external_directory_permission == ExternalDirectoryPermissionMode.ALLOW
 
 
 def test_run_intent_repo_round_trips_display_input(tmp_path: Path) -> None:

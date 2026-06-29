@@ -29,6 +29,7 @@ class _FakeRequest:
         *,
         config_dir: Path | None = None,
         json_payload: object | None = None,
+        path: str = "/bootstrap/health",
     ) -> None:
         self.app = SimpleNamespace(
             state=SimpleNamespace(
@@ -40,6 +41,9 @@ class _FakeRequest:
                 hydration_error=None,
             )
         )
+        self.method = "GET"
+        self.url = SimpleNamespace(path=path)
+        self.client = SimpleNamespace(host="127.0.0.1")
         self._json_payload = json_payload
 
     async def json(self) -> object:
@@ -1645,7 +1649,11 @@ def test_lifespan_finishes_hydration_and_stops_container(
     asyncio.run(run_case())
 
     assert container.stopped is True
-    assert events == ["app.bootstrap.ready", "app.shutdown"]
+    assert events == [
+        "app.event_loop_diagnostics.started",
+        "app.bootstrap.ready",
+        "app.shutdown",
+    ]
 
 
 def test_lifespan_cancels_in_flight_hydration_on_shutdown(

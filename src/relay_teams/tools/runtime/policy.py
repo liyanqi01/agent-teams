@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from relay_teams.computer import ComputerActionRisk
+from enum import Enum
+
 from pydantic import BaseModel, ConfigDict, Field
 
+from relay_teams.computer import ComputerActionRisk
 from relay_teams.tools.runtime.guardrails import RuntimeGuardrailPolicy
 from relay_teams.tools.runtime.models import (
     ToolApprovalDecision,
@@ -11,6 +13,7 @@ from relay_teams.tools.runtime.models import (
     ToolRuntimeDecision,
 )
 
+EXTERNAL_DIRECTORY_SOURCE = "external_directory"
 
 DEFAULT_APPROVAL_REQUIRED_TOOLS = frozenset(
     {
@@ -19,6 +22,7 @@ DEFAULT_APPROVAL_REQUIRED_TOOLS = frozenset(
         "orch_update_task",
         "shell",
         "edit",
+        "notebook_edit",
         "write",
         "write_tmp",
         "webfetch",
@@ -27,11 +31,20 @@ DEFAULT_APPROVAL_REQUIRED_TOOLS = frozenset(
 )
 
 
+class ExternalDirectoryPermissionMode(str, Enum):
+    ASK = "ask"
+    ALLOW = "allow"
+    DENY = "deny"
+
+
 class ToolRuntimePolicy(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     yolo: bool = False
     shell_safety_policy_enabled: bool = True
+    external_directory_permission: ExternalDirectoryPermissionMode = (
+        ExternalDirectoryPermissionMode.ASK
+    )
     approval_required_tools: frozenset[str] = DEFAULT_APPROVAL_REQUIRED_TOOLS
     denied_tools: frozenset[str] = frozenset()
     guardrails: RuntimeGuardrailPolicy = Field(default_factory=RuntimeGuardrailPolicy)
@@ -71,6 +84,27 @@ class ToolRuntimePolicy(BaseModel):
                 runtime_decision=ToolRuntimeDecision.ALLOW,
                 request=request,
             )
+        if request is not None and request.source == EXTERNAL_DIRECTORY_SOURCE:
+            if (
+                self.external_directory_permission
+                == ExternalDirectoryPermissionMode.DENY
+            ):
+                return _runtime_decision(
+                    required=False,
+                    runtime_decision=ToolRuntimeDecision.DENY,
+                    reason="External directory access is denied by runtime policy.",
+                    request=request,
+                )
+            if (
+                self.external_directory_permission
+                == ExternalDirectoryPermissionMode.ALLOW
+            ):
+                return _runtime_decision(
+                    required=False,
+                    runtime_decision=ToolRuntimeDecision.ALLOW,
+                    reason="External directory access is allowed by runtime policy.",
+                    request=request,
+                )
         if request is not None:
             if request.risk_level in {
                 ComputerActionRisk.GUARDED,
@@ -108,6 +142,7 @@ class ToolApprovalPolicy(ToolRuntimePolicy):
         *,
         yolo: bool | None = None,
         shell_safety_policy_enabled: bool | None = None,
+        external_directory_permission: ExternalDirectoryPermissionMode | None = None,
     ) -> ToolApprovalPolicy:
         next_yolo = self.yolo if yolo is None else yolo
         next_shell_safety_policy_enabled = (
@@ -115,14 +150,21 @@ class ToolApprovalPolicy(ToolRuntimePolicy):
             if shell_safety_policy_enabled is None
             else shell_safety_policy_enabled
         )
+        next_external_directory_permission = (
+            self.external_directory_permission
+            if external_directory_permission is None
+            else external_directory_permission
+        )
         if (
             next_yolo == self.yolo
             and next_shell_safety_policy_enabled == self.shell_safety_policy_enabled
+            and next_external_directory_permission == self.external_directory_permission
         ):
             return self
         return ToolApprovalPolicy(
             yolo=next_yolo,
             shell_safety_policy_enabled=next_shell_safety_policy_enabled,
+            external_directory_permission=next_external_directory_permission,
             approval_required_tools=self.approval_required_tools,
             denied_tools=self.denied_tools,
             guardrails=self.guardrails,

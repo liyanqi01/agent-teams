@@ -1084,4 +1084,5 @@ class SessionPromptMixin(AgentLlmSessionMixinBase):
         return self._tool_approval_policy.with_runtime_overrides(
             yolo=intent.yolo,
             shell_safety_policy_enabled=intent.shell_safety_policy_enabled,
+            external_directory_permission=intent.external_directory_permission,
         )
