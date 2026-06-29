@@ -12,6 +12,7 @@ from relay_teams.agents.execution.session_runtime import SessionRuntimeMixin
 from relay_teams.agents.execution.session_support import SessionSupportMixin
 from relay_teams.tools.runtime.policy import (
     ExternalDirectoryPermissionMode,
+    ExternalDirectoryRule,
     ToolApprovalPolicy,
 )
 
@@ -43,6 +44,12 @@ class _RunIntentRepo:
             yolo=True,
             shell_safety_policy_enabled=False,
             external_directory_permission=ExternalDirectoryPermissionMode.DENY,
+            external_directory_rules=(
+                ExternalDirectoryRule(
+                    path="/tmp/shared/**",
+                    permission=ExternalDirectoryPermissionMode.ALLOW,
+                ),
+            ),
         )
 
 
@@ -60,3 +67,9 @@ async def test_session_prompt_resolves_shell_safety_policy_from_run_intent() -> 
     assert policy.yolo is True
     assert policy.shell_safety_policy_enabled is False
     assert policy.external_directory_permission == ExternalDirectoryPermissionMode.DENY
+    assert policy.external_directory_rules == (
+        ExternalDirectoryRule(
+            path="/tmp/shared/**",
+            permission=ExternalDirectoryPermissionMode.ALLOW,
+        ),
+    )

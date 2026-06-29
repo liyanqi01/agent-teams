@@ -29,7 +29,10 @@ from relay_teams.sessions.runs.run_models import (
     RunTopologySnapshot,
 )
 from relay_teams.sessions.session_models import SessionMode
-from relay_teams.tools.runtime.policy import ExternalDirectoryPermissionMode
+from relay_teams.tools.runtime.policy import (
+    ExternalDirectoryPermissionMode,
+    ExternalDirectoryRule,
+)
 from relay_teams.validation import normalize_persisted_text
 
 LOGGER = get_logger(__name__)
@@ -39,6 +42,7 @@ _RUN_INTENT_TITLE_MAX_CHARS = 120
 type _ThinkingEffort = Literal["minimal", "low", "medium", "high"] | None
 _MediaGenerationConfigAdapter = TypeAdapter(MediaGenerationConfig)
 _SkillsAdapter = TypeAdapter(tuple[str, ...])
+_ExternalDirectoryRulesAdapter = TypeAdapter(tuple[ExternalDirectoryRule, ...])
 _RUN_INTENT_SELECT_COLUMNS = """
     session_id,
     intent,
@@ -50,6 +54,7 @@ _RUN_INTENT_SELECT_COLUMNS = """
     yolo,
     shell_safety_policy_enabled,
     external_directory_permission,
+    external_directory_rules_json,
     reuse_root_instance,
     thinking_enabled,
     thinking_effort,
@@ -73,6 +78,7 @@ _RUN_INTENT_UPSERT_SQL = """
         yolo,
         shell_safety_policy_enabled,
         external_directory_permission,
+        external_directory_rules_json,
         reuse_root_instance,
         thinking_enabled,
         thinking_effort,
@@ -85,7 +91,7 @@ _RUN_INTENT_UPSERT_SQL = """
         created_at,
         updated_at
     )
-    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(run_id)
     DO UPDATE SET
         session_id=excluded.session_id,
@@ -98,6 +104,7 @@ _RUN_INTENT_UPSERT_SQL = """
         yolo=excluded.yolo,
         shell_safety_policy_enabled=excluded.shell_safety_policy_enabled,
         external_directory_permission=excluded.external_directory_permission,
+        external_directory_rules_json=excluded.external_directory_rules_json,
         reuse_root_instance=excluded.reuse_root_instance,
         thinking_enabled=excluded.thinking_enabled,
         thinking_effort=excluded.thinking_effort,
@@ -132,6 +139,7 @@ class RunIntentRepository(SharedSqliteRepository):
                     yolo           TEXT NOT NULL DEFAULT 'false',
                     shell_safety_policy_enabled TEXT NOT NULL DEFAULT 'true',
                     external_directory_permission TEXT NOT NULL DEFAULT 'ask',
+                    external_directory_rules_json TEXT NOT NULL DEFAULT '[]',
                     reuse_root_instance TEXT NOT NULL DEFAULT 'true',
                     thinking_enabled TEXT NOT NULL DEFAULT 'false',
                     thinking_effort TEXT,
@@ -168,6 +176,12 @@ class RunIntentRepository(SharedSqliteRepository):
                 self._conn.execute(
                     """
                     ALTER TABLE run_intents ADD COLUMN external_directory_permission TEXT NOT NULL DEFAULT 'ask'
+                    """
+                )
+            if "external_directory_rules_json" not in columns:
+                self._conn.execute(
+                    """
+                    ALTER TABLE run_intents ADD COLUMN external_directory_rules_json TEXT NOT NULL DEFAULT '[]'
                     """
                 )
             if "thinking_enabled" not in columns:
@@ -626,6 +640,9 @@ def _run_intent_upsert_params(
         "true" if intent.yolo else "false",
         "true" if intent.shell_safety_policy_enabled else "false",
         intent.external_directory_permission.value,
+        _ExternalDirectoryRulesAdapter.dump_json(
+            intent.external_directory_rules
+        ).decode("utf-8"),
         "true" if intent.reuse_root_instance else "false",
         "true" if intent.thinking.enabled else "false",
         intent.thinking.effort,
@@ -672,6 +689,9 @@ def _intent_input_from_row(
         ),
         external_directory_permission=_coerce_external_directory_permission(
             row["external_directory_permission"]
+        ),
+        external_directory_rules=_coerce_external_directory_rules(
+            row["external_directory_rules_json"]
         ),
         reuse_root_instance=(
             str(row["reuse_root_instance"]).strip().lower() != "false"
@@ -731,6 +751,18 @@ def _coerce_external_directory_permission(
             if normalized == mode.value:
                 return mode
     return ExternalDirectoryPermissionMode.ASK
+
+
+def _coerce_external_directory_rules(
+    value: object,
+) -> tuple[ExternalDirectoryRule, ...]:
+    if not isinstance(value, str) or not value.strip():
+        return ()
+    try:
+        return _ExternalDirectoryRulesAdapter.validate_json(value)
+    except ValidationError:
+        LOGGER.warning("Ignoring invalid persisted external directory rules")
+        return ()
 
 
 def _coerce_topology(value: object) -> RunTopologySnapshot | None:

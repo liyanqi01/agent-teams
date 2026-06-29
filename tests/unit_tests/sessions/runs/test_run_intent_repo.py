@@ -23,7 +23,10 @@ from relay_teams.sessions.runs.run_models import (
 )
 from relay_teams.sessions.runs.run_intent_repo import RunIntentRepository
 from relay_teams.sessions.session_models import SessionMode
-from relay_teams.tools.runtime.policy import ExternalDirectoryPermissionMode
+from relay_teams.tools.runtime.policy import (
+    ExternalDirectoryPermissionMode,
+    ExternalDirectoryRule,
+)
 
 
 def test_run_intent_repo_round_trips_yolo(tmp_path: Path) -> None:
@@ -53,6 +56,16 @@ def test_run_intent_repo_round_trips_external_directory_permission(
 ) -> None:
     db_path = tmp_path / "run_intent_external_directory.db"
     repo = RunIntentRepository(db_path)
+    external_directory_rules = (
+        ExternalDirectoryRule(
+            path="/tmp/shared/**",
+            permission=ExternalDirectoryPermissionMode.ALLOW,
+        ),
+        ExternalDirectoryRule(
+            path="/tmp/shared/private/**",
+            permission=ExternalDirectoryPermissionMode.DENY,
+        ),
+    )
 
     repo.upsert(
         run_id="run-1",
@@ -61,12 +74,14 @@ def test_run_intent_repo_round_trips_external_directory_permission(
             session_id="session-1",
             input=content_parts_from_text("ship it"),
             external_directory_permission=ExternalDirectoryPermissionMode.ALLOW,
+            external_directory_rules=external_directory_rules,
         ),
     )
 
     record = repo.get("run-1")
 
     assert record.external_directory_permission == ExternalDirectoryPermissionMode.ALLOW
+    assert record.external_directory_rules == external_directory_rules
 
 
 def test_run_intent_repo_round_trips_display_input(tmp_path: Path) -> None:

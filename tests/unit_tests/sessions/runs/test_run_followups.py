@@ -33,7 +33,10 @@ from relay_teams.sessions.runs.run_runtime_repo import RunRuntimeRecord
 from relay_teams.sessions.runs.user_question_repository import UserQuestionRepository
 from relay_teams.sessions.session_repository import SessionRepository
 from relay_teams.tools.runtime.approval_ticket_repo import ApprovalTicketRepository
-from relay_teams.tools.runtime.policy import ExternalDirectoryPermissionMode
+from relay_teams.tools.runtime.policy import (
+    ExternalDirectoryPermissionMode,
+    ExternalDirectoryRule,
+)
 from relay_teams.media import content_parts_from_text
 
 
@@ -379,6 +382,12 @@ async def test_spawn_system_followup_run_async_inherits_source_shell_policy(
 ) -> None:
     session_repo = _RecordingSessionRepo()
     run_intent_repo = RunIntentRepository(tmp_path / "run-intents.db")
+    external_directory_rules = (
+        ExternalDirectoryRule(
+            path="/tmp/shared/**",
+            permission=ExternalDirectoryPermissionMode.DENY,
+        ),
+    )
     await run_intent_repo.upsert_async(
         run_id="run-source",
         session_id="session-1",
@@ -388,6 +397,7 @@ async def test_spawn_system_followup_run_async_inherits_source_shell_policy(
             yolo=True,
             shell_safety_policy_enabled=False,
             external_directory_permission=ExternalDirectoryPermissionMode.ALLOW,
+            external_directory_rules=external_directory_rules,
         ),
     )
     router = _RecordingRunFollowupRouter(
@@ -409,6 +419,9 @@ async def test_spawn_system_followup_run_async_inherits_source_shell_policy(
     assert router.created_intents[0].external_directory_permission == (
         ExternalDirectoryPermissionMode.ALLOW
     )
+    assert (
+        router.created_intents[0].external_directory_rules == external_directory_rules
+    )
 
 
 def test_spawn_system_followup_run_inherits_source_shell_policy(
@@ -416,6 +429,12 @@ def test_spawn_system_followup_run_inherits_source_shell_policy(
 ) -> None:
     session_repo = _RecordingSessionRepo()
     run_intent_repo = RunIntentRepository(tmp_path / "run-intents.db")
+    external_directory_rules = (
+        ExternalDirectoryRule(
+            path="/tmp/shared/**",
+            permission=ExternalDirectoryPermissionMode.ALLOW,
+        ),
+    )
     run_intent_repo.upsert(
         run_id="run-source",
         session_id="session-1",
@@ -425,6 +444,7 @@ def test_spawn_system_followup_run_inherits_source_shell_policy(
             yolo=True,
             shell_safety_policy_enabled=False,
             external_directory_permission=ExternalDirectoryPermissionMode.DENY,
+            external_directory_rules=external_directory_rules,
         ),
     )
     router = _RecordingRunFollowupRouter(
@@ -445,6 +465,9 @@ def test_spawn_system_followup_run_inherits_source_shell_policy(
     assert router.created_intents[0].shell_safety_policy_enabled is False
     assert router.created_intents[0].external_directory_permission == (
         ExternalDirectoryPermissionMode.DENY
+    )
+    assert (
+        router.created_intents[0].external_directory_rules == external_directory_rules
     )
 
 

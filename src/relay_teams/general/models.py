@@ -3,7 +3,10 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict
 
-from relay_teams.tools.runtime.policy import ExternalDirectoryPermissionMode
+from relay_teams.tools.runtime.policy import (
+    ExternalDirectoryPermissionMode,
+    ExternalDirectoryRule,
+)
 
 
 class GeneralConfig(BaseModel):
@@ -13,6 +16,7 @@ class GeneralConfig(BaseModel):
     external_directory_permission: ExternalDirectoryPermissionMode = (
         ExternalDirectoryPermissionMode.ASK
     )
+    external_directory_rules: tuple[ExternalDirectoryRule, ...] = ()
 
 
 class GeneralConfigUpdate(GeneralConfig):

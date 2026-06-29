@@ -576,6 +576,7 @@ class ExternalAcpHostToolBridge:
                 yolo=intent.yolo,
                 shell_safety_policy_enabled=intent.shell_safety_policy_enabled,
                 external_directory_permission=intent.external_directory_permission,
+                external_directory_rules=intent.external_directory_rules,
             )
         workspace = await self._workspace_manager.resolve_async(
             session_id=request.session_id,

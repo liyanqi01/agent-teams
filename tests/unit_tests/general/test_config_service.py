@@ -7,7 +7,10 @@ import pytest
 
 from relay_teams.general import GeneralConfigUpdate
 from relay_teams.general.config_service import GeneralConfigService
-from relay_teams.tools.runtime.policy import ExternalDirectoryPermissionMode
+from relay_teams.tools.runtime.policy import (
+    ExternalDirectoryPermissionMode,
+    ExternalDirectoryRule,
+)
 
 
 def test_general_config_service_returns_default_when_file_is_missing(
@@ -19,6 +22,7 @@ def test_general_config_service_returns_default_when_file_is_missing(
 
     assert config.shell_safety_policy_enabled is True
     assert config.external_directory_permission == ExternalDirectoryPermissionMode.ASK
+    assert config.external_directory_rules == ()
 
 
 @pytest.mark.parametrize(
@@ -41,6 +45,7 @@ def test_general_config_service_returns_default_for_invalid_saved_config(
 
     assert config.shell_safety_policy_enabled is True
     assert config.external_directory_permission == ExternalDirectoryPermissionMode.ASK
+    assert config.external_directory_rules == ()
 
 
 def test_general_config_service_saves_and_reads_shell_policy(tmp_path: Path) -> None:
@@ -50,11 +55,13 @@ def test_general_config_service_saves_and_reads_shell_policy(tmp_path: Path) -> 
 
     assert config.shell_safety_policy_enabled is False
     assert config.external_directory_permission == ExternalDirectoryPermissionMode.ASK
+    assert config.external_directory_rules == ()
     assert service.get_config().shell_safety_policy_enabled is False
     assert (tmp_path / "general.json").read_text(encoding="utf-8") == (
         "{\n"
         '  "shell_safety_policy_enabled": false,\n'
-        '  "external_directory_permission": "ask"\n'
+        '  "external_directory_permission": "ask",\n'
+        '  "external_directory_rules": []\n'
         "}\n"
     )
 
@@ -75,3 +82,29 @@ def test_general_config_service_saves_external_directory_policy(
     assert service.get_config().external_directory_permission == (
         ExternalDirectoryPermissionMode.ALLOW
     )
+
+
+def test_general_config_service_saves_external_directory_rules(
+    tmp_path: Path,
+) -> None:
+    service = GeneralConfigService(config_dir=tmp_path)
+    rules = (
+        ExternalDirectoryRule(
+            path="/tmp/shared/**",
+            permission=ExternalDirectoryPermissionMode.ALLOW,
+        ),
+        ExternalDirectoryRule(
+            path="/tmp/shared/private/**",
+            permission=ExternalDirectoryPermissionMode.DENY,
+        ),
+    )
+
+    config = service.save_config(
+        GeneralConfigUpdate(
+            external_directory_permission=ExternalDirectoryPermissionMode.ASK,
+            external_directory_rules=rules,
+        )
+    )
+
+    assert config.external_directory_rules == rules
+    assert service.get_config().external_directory_rules == rules

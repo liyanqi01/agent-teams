@@ -153,7 +153,10 @@ from relay_teams.skills.skill_market_models import (
     ClawHubSkillMarketUninstallResponse,
 )
 from relay_teams.skills.skill_models import Skill, SkillMetadata, SkillSource
-from relay_teams.tools.runtime.policy import ExternalDirectoryPermissionMode
+from relay_teams.tools.runtime.policy import (
+    ExternalDirectoryPermissionMode,
+    ExternalDirectoryRule,
+)
 from relay_teams.hooks import HookRuntimeView, HooksConfig
 from relay_teams.notifications.models import NotificationConfig
 from relay_teams.agents.orchestration.settings_models import OrchestrationSettings
@@ -1514,6 +1517,7 @@ def test_get_general_config() -> None:
     assert response.json() == {
         "shell_safety_policy_enabled": False,
         "external_directory_permission": "ask",
+        "external_directory_rules": [],
     }
 
 
@@ -2130,6 +2134,12 @@ def test_save_general_config() -> None:
             "config": {
                 "shell_safety_policy_enabled": False,
                 "external_directory_permission": "allow",
+                "external_directory_rules": [
+                    {
+                        "path": "/tmp/shared/**",
+                        "permission": "deny",
+                    }
+                ],
             }
         },
     )
@@ -2138,11 +2148,23 @@ def test_save_general_config() -> None:
     assert response.json() == {"status": "ok"}
     assert service.saved_general_config == {
         "shell_safety_policy_enabled": False,
-        "external_directory_permission": ExternalDirectoryPermissionMode.ALLOW,
+        "external_directory_permission": "allow",
+        "external_directory_rules": [
+            {
+                "path": "/tmp/shared/**",
+                "permission": "deny",
+            }
+        ],
     }
     assert service.general_config.shell_safety_policy_enabled is False
     assert service.general_config.external_directory_permission == (
         ExternalDirectoryPermissionMode.ALLOW
+    )
+    assert service.general_config.external_directory_rules == (
+        ExternalDirectoryRule(
+            path="/tmp/shared/**",
+            permission=ExternalDirectoryPermissionMode.DENY,
+        ),
     )
 
 

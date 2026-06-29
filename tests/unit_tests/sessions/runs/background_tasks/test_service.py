@@ -50,7 +50,10 @@ from relay_teams.sessions.runs.run_runtime_repo import (
     RunRuntimeRepository,
     RunRuntimeStatus,
 )
-from relay_teams.tools.runtime.policy import ExternalDirectoryPermissionMode
+from relay_teams.tools.runtime.policy import (
+    ExternalDirectoryPermissionMode,
+    ExternalDirectoryRule,
+)
 from relay_teams.hooks import (
     HookDecisionBundle,
     HookDecisionType,
@@ -532,6 +535,12 @@ def _parent_intent() -> IntentInput:
         execution_mode=ExecutionMode.AI,
         shell_safety_policy_enabled=False,
         external_directory_permission=ExternalDirectoryPermissionMode.ALLOW,
+        external_directory_rules=(
+            ExternalDirectoryRule(
+                path="/tmp/shared/**",
+                permission=ExternalDirectoryPermissionMode.DENY,
+            ),
+        ),
         thinking=RunThinkingConfig(enabled=True, effort="medium"),
         session_mode=SessionMode.NORMAL,
     )
@@ -557,6 +566,12 @@ def test_background_task_service_subagent_intent_inherits_shell_policy() -> None
     assert subagent_intent.shell_safety_policy_enabled is False
     assert subagent_intent.external_directory_permission == (
         ExternalDirectoryPermissionMode.ALLOW
+    )
+    assert subagent_intent.external_directory_rules == (
+        ExternalDirectoryRule(
+            path="/tmp/shared/**",
+            permission=ExternalDirectoryPermissionMode.DENY,
+        ),
     )
 
 

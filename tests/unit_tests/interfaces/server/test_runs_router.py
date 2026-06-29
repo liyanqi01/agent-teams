@@ -28,7 +28,10 @@ from relay_teams.sessions.runs.run_models import RunEvent
 from relay_teams.sessions.runs.run_service import SessionRunService
 from relay_teams.sessions.runs.enums import RunEventType
 from relay_teams.sessions.runs.user_question_models import UserQuestionAnswer
-from relay_teams.tools.runtime.policy import ExternalDirectoryPermissionMode
+from relay_teams.tools.runtime.policy import (
+    ExternalDirectoryPermissionMode,
+    ExternalDirectoryRule,
+)
 
 
 class _FakeRunService:
@@ -524,10 +527,12 @@ class _FakeGeneralConfigService:
         external_directory_permission: ExternalDirectoryPermissionMode = (
             ExternalDirectoryPermissionMode.ASK
         ),
+        external_directory_rules: tuple[ExternalDirectoryRule, ...] = (),
     ) -> None:
         self._config = GeneralConfig(
             shell_safety_policy_enabled=enabled,
             external_directory_permission=external_directory_permission,
+            external_directory_rules=external_directory_rules,
         )
 
     def get_config(self) -> GeneralConfig:
@@ -708,11 +713,18 @@ def test_create_run_route_accepts_yolo() -> None:
 
 def test_create_run_route_uses_saved_general_shell_policy_by_default() -> None:
     fake_service = _FakeRunService()
+    external_directory_rules = (
+        ExternalDirectoryRule(
+            path="/tmp/shared/**",
+            permission=ExternalDirectoryPermissionMode.ALLOW,
+        ),
+    )
     client = _create_client(
         fake_service,
         fake_general_config_service=_FakeGeneralConfigService(
             enabled=False,
             external_directory_permission=ExternalDirectoryPermissionMode.DENY,
+            external_directory_rules=external_directory_rules,
         ),
     )
 
@@ -730,6 +742,7 @@ def test_create_run_route_uses_saved_general_shell_policy_by_default() -> None:
     assert created.shell_safety_policy_enabled is False
     assert created.shell_safety_policy_override_provided is False
     assert created.external_directory_permission == ExternalDirectoryPermissionMode.DENY
+    assert created.external_directory_rules == external_directory_rules
 
 
 def test_create_run_route_allows_explicit_shell_policy_override() -> None:

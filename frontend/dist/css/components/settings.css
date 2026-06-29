@@ -3064,6 +3064,44 @@
     text-align: right;
 }
 
+.external-directory-rules-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 0.65rem;
+}
+
+.external-directory-rules-header,
+.external-directory-rule-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(7rem, 9rem) auto;
+    align-items: center;
+    gap: 0.6rem;
+}
+
+.external-directory-rules-header {
+    grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.external-directory-rule-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+}
+
+.external-directory-rule-path,
+.external-directory-rule-permission {
+    width: 100%;
+    min-width: 0;
+}
+
+.external-directory-rule-delete {
+    min-height: 32px;
+}
+
+.external-directory-rules-note {
+    text-align: left;
+}
+
 .proxy-form-grid,
 .proxy-probe-grid {
     display: flex;
@@ -3642,6 +3680,12 @@ body.dark-theme .notification-toggle input[type="checkbox"]:checked + .notificat
 
     .general-setting-inline-note {
         text-align: left;
+    }
+
+    .external-directory-rules-header,
+    .external-directory-rule-row {
+        grid-template-columns: 1fr;
+        align-items: stretch;
     }
 
     .notification-row {

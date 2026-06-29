@@ -1252,6 +1252,7 @@ Returns saved General settings that apply to future runs started from the web UI
 Fields:
 - `shell_safety_policy_enabled`
 - `external_directory_permission`: `ask`, `allow`, or `deny`
+- `external_directory_rules`: ordered rule list. Each rule has `path` and `permission`; the last matching rule wins.
 
 ### `PUT /system/configs/general`
 
@@ -1260,6 +1261,7 @@ Replaces saved General settings.
 Fields:
 - `shell_safety_policy_enabled`
 - `external_directory_permission`: `ask`, `allow`, or `deny`
+- `external_directory_rules`: ordered rule list. Each rule has `path` and `permission`; `path` supports absolute paths, `~`, `$HOME`, and simple `*`, `?`, `[]` glob patterns.
 
 ### `GET /system/configs/orchestration`
 
@@ -2004,6 +2006,12 @@ Request:
     "yolo": false,
     "shell_safety_policy_enabled": true,
     "external_directory_permission": "ask",
+    "external_directory_rules": [
+      {
+        "path": "~/projects/personal/**",
+        "permission": "allow"
+      }
+    ],
     "target_role_id": "Architect",
   "thinking": {
     "enabled": false,
@@ -2055,6 +2063,7 @@ Notes:
 - `external_directory_permission: ask` turns a write outside the workspace into a normal tool approval request instead of failing path resolution immediately.
 - `external_directory_permission: allow` allows workspace-external file access through the same tool path without an external-directory approval prompt.
 - `external_directory_permission: deny` blocks workspace-external file access at runtime policy evaluation.
+- `external_directory_rules` is an ordered list of per-directory overrides. Each rule contains `path` and `permission`; rules match resolved absolute paths, support `~` and `$HOME` expansion plus simple glob patterns, and the last matching rule overrides earlier matches and the global `external_directory_permission`.
 - `yolo: true` still skips human approval, including external-directory approval, while preserving tool-local path and input validation.
 - Shell safety policy and workspace write scope are independent controls. Disabling shell safety does not widen the `write`/`edit` workspace path allowlist.
 - `thinking` is optional.

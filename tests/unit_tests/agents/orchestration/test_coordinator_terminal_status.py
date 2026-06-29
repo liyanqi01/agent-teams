@@ -45,7 +45,10 @@ from relay_teams.sessions.runs.run_models import RunTopologySnapshot
 from relay_teams.agent_runtimes.instances.instance_repository import (
     AgentInstanceRepository,
 )
-from relay_teams.tools.runtime.policy import ExternalDirectoryPermissionMode
+from relay_teams.tools.runtime.policy import (
+    ExternalDirectoryPermissionMode,
+    ExternalDirectoryRule,
+)
 from relay_teams.sessions.runs.event_log import EventLog
 from relay_teams.agents.execution.message_repository import MessageRepository
 from relay_teams.sessions.runs.run_runtime_repo import (
@@ -547,6 +550,12 @@ async def test_verification_tool_policy_uses_persisted_run_intent(
     coordinator, _, _, _, task_execution_service = _build_coordinator(tmp_path)
     run_intent_repo = RunIntentRepository(tmp_path / "verification_intent.db")
     task_execution_service.run_intent_repo = run_intent_repo
+    external_directory_rules = (
+        ExternalDirectoryRule(
+            path="/tmp/shared/**",
+            permission=ExternalDirectoryPermissionMode.DENY,
+        ),
+    )
     await run_intent_repo.upsert_async(
         run_id="run-1",
         session_id="session-1",
@@ -556,6 +565,7 @@ async def test_verification_tool_policy_uses_persisted_run_intent(
             yolo=True,
             shell_safety_policy_enabled=False,
             external_directory_permission=ExternalDirectoryPermissionMode.ALLOW,
+            external_directory_rules=external_directory_rules,
         ),
     )
 
@@ -567,6 +577,7 @@ async def test_verification_tool_policy_uses_persisted_run_intent(
     assert policy.yolo is True
     assert policy.shell_safety_policy_enabled is False
     assert policy.external_directory_permission == ExternalDirectoryPermissionMode.ALLOW
+    assert policy.external_directory_rules == external_directory_rules
 
 
 @pytest.mark.asyncio

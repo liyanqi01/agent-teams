@@ -79,6 +79,8 @@ console.log(JSON.stringify({
     assert "notifications-actions" not in modal_html
     assert 'id="settings-shell-safety-policy-toggle"' in modal_html
     assert 'id="settings-external-directory-permission"' in modal_html
+    assert 'id="settings-add-external-directory-rule"' in modal_html
+    assert 'id="settings-external-directory-rules"' in modal_html
     assert "general-setting-card" in modal_html
     assert "general-setting-card-copy" in modal_html
     assert 'data-i18n="settings.appearance.colors"' in modal_html
@@ -325,12 +327,27 @@ await openSettings("general");
 
 const shellToggle = document.getElementById("settings-shell-safety-policy-toggle");
 const externalDirectorySelect = document.getElementById("settings-external-directory-permission");
+const addRuleButton = document.getElementById("settings-add-external-directory-rule");
 shellToggle.checked = false;
 externalDirectorySelect.value = "deny";
+await addRuleButton.dispatch("click");
+
+const rulesContainer = document.getElementById("settings-external-directory-rules");
+rulesContainer.innerHTML = `
+    <div class="external-directory-rule-row" data-external-directory-rule-index="0">
+        <input class="appearance-text-input external-directory-rule-path" value="C:/shared/**">
+        <select class="appearance-text-input external-directory-rule-permission">
+            <option value="ask">Ask</option>
+            <option value="allow">Allow</option>
+            <option value="deny" selected>Deny</option>
+        </select>
+    </div>
+`;
 
 const beforeSave = {
     shell: globalThis.__savedGeneral.shell,
     externalDirectory: globalThis.__savedGeneral.externalDirectory,
+    externalDirectoryRules: globalThis.__savedGeneral.externalDirectoryRules,
     speech: globalThis.__savedGeneral.speech,
     notifications: globalThis.__savedGeneral.notifications,
 };
@@ -348,6 +365,7 @@ console.log(JSON.stringify({
     assert payload["beforeSave"] == {
         "shell": True,
         "externalDirectory": "ask",
+        "externalDirectoryRules": [],
         "speech": None,
         "notifications": None,
     }
@@ -355,6 +373,9 @@ console.log(JSON.stringify({
     assert after_save["shell"] is False
     assert after_save["savedShell"] is False
     assert after_save["externalDirectory"] == "deny"
+    assert after_save["externalDirectoryRules"] == [
+        {"path": "C:/shared/**", "permission": "deny"}
+    ]
     assert isinstance(after_save["speech"], dict)
     assert isinstance(after_save["notifications"], dict)
     notifications = cast(dict[str, JsonValue], after_save["notifications"])
@@ -1222,6 +1243,13 @@ export function t(key) {
         'settings.general.external_directory_ask': 'Ask',
         'settings.general.external_directory_allow': 'Allow',
         'settings.general.external_directory_deny': 'Deny',
+        'settings.general.external_directory_rules': 'Directory rules',
+        'settings.general.external_directory_rules_state': 'Rules match resolved absolute paths. The last matching rule wins.',
+        'settings.general.external_directory_add_rule': 'Add Rule',
+        'settings.general.external_directory_rules_empty': 'No directory rules configured.',
+        'settings.general.external_directory_path': 'Directory path',
+        'settings.general.external_directory_path_placeholder': '/path/to/directory/**',
+        'settings.general.external_directory_rule_permission': 'Rule permission',
         'settings.general.saved': 'General Settings Saved',
         'settings.general.saved_message': 'General settings were saved and will apply to new runs.',
         'settings.general.save_failed': 'Failed to save general settings',
@@ -1274,6 +1302,7 @@ export async function fetchGeneralConfig() {
     return {
         shell_safety_policy_enabled: globalThis.__savedGeneral.savedShell,
         external_directory_permission: globalThis.__savedGeneral.externalDirectory,
+        external_directory_rules: globalThis.__savedGeneral.externalDirectoryRules,
     };
 }
 
@@ -1285,6 +1314,7 @@ export async function saveGeneralConfig(payload) {
     globalThis.__savedGeneral.savedShell = payload.shell_safety_policy_enabled !== false;
     globalThis.__savedGeneral.shell = payload.shell_safety_policy_enabled !== false;
     globalThis.__savedGeneral.externalDirectory = payload.external_directory_permission;
+    globalThis.__savedGeneral.externalDirectoryRules = payload.external_directory_rules;
     return { status: 'ok' };
 }
 
@@ -1412,9 +1442,9 @@ function createClassList(element) {{
 }}
 
 function createElement(tagName = "div") {{
-    const element = {{
-        tagName,
-        id: "",
+        const element = {{
+            tagName,
+            id: "",
         style: {{}},
         dataset: {{}},
         children: [],
@@ -1430,19 +1460,20 @@ function createElement(tagName = "div") {{
         addEventListener(type, listener) {{
             this._listeners.set(type, listener);
         }},
-        dispatch(type) {{
-            const listener = this._listeners.get(type);
-            if (listener) {{
-                return listener({{ target: this }});
+            dispatch(type) {{
+                const listener = this._listeners.get(type);
+                if (listener) {{
+                    return listener({{ target: this }});
             }}
             if (type === "click" && typeof this.onclick === "function") {{
                 return this.onclick({{ target: this }});
-            }}
-            return undefined;
-        }},
-        querySelectorAll(selector) {{
-            if (selector !== ".settings-action") {{
-                return [];
+                }}
+                return undefined;
+            }},
+            focus() {{}},
+            querySelectorAll(selector) {{
+                if (selector !== ".settings-action") {{
+                    return [];
             }}
             const matches = [];
             for (const match of this.innerHTML.matchAll(/class="[^"]*settings-action[^"]*"[^>]*id="([^"]+)"/g)) {{
@@ -1493,9 +1524,9 @@ function createElement(tagName = "div") {{
         }}
     }}
 
-    function parseInnerHtml(target) {{
-        tabs.length = 0;
-        panels.length = 0;
+        function parseInnerHtml(target) {{
+            tabs.length = 0;
+            panels.length = 0;
 
         const html = target.innerHTML;
 
@@ -1515,9 +1546,36 @@ function createElement(tagName = "div") {{
             panel.id = match[1];
             panel.style.display = html.includes(`id="${{match[1]}}" style="display:none;"`) ? "none" : "block";
             panels.push(panel);
-            elements.set(match[1], panel);
+                elements.set(match[1], panel);
+            }}
         }}
-    }}
+
+        function createExternalDirectoryRuleRows() {{
+            const container = elements.get("settings-external-directory-rules");
+            const html = String(container?.innerHTML || "");
+            const rows = [];
+            for (const match of html.matchAll(/<div class="external-directory-rule-row"[^>]*>[\\s\\S]*?<\\/div>/g)) {{
+                const rowHtml = match[0];
+                const pathMatch = rowHtml.match(/class="[^"]*external-directory-rule-path[^"]*"[^>]*value="([^"]*)"/);
+                const selectedMatch = rowHtml.match(/<option value="(ask|allow|deny)" selected>/);
+                const row = createElement("div");
+                row.querySelector = (selector) => {{
+                    if (selector === ".external-directory-rule-path") {{
+                        const input = createElement("input");
+                        input.value = pathMatch?.[1] || "";
+                        return input;
+                    }}
+                    if (selector === ".external-directory-rule-permission") {{
+                        const select = createElement("select");
+                        select.value = selectedMatch?.[1] || "allow";
+                        return select;
+                    }}
+                    return null;
+                }};
+                rows.push(row);
+            }}
+            return rows;
+        }}
 
     const originalAppendChild = body.appendChild.bind(body);
     body.appendChild = (child) => {{
@@ -1546,12 +1604,20 @@ function createElement(tagName = "div") {{
             if (selector === ".settings-tab") {{
                 return tabs;
             }}
-            if (selector === ".settings-panel") {{
-                return panels;
-            }}
-            return [];
-        }},
-    }};
+                if (selector === ".settings-panel") {{
+                    return panels;
+                }}
+                if (selector === "#settings-external-directory-rules .external-directory-rule-row") {{
+                    return createExternalDirectoryRuleRows();
+                }}
+                if (selector === "#settings-external-directory-rules .external-directory-rule-path") {{
+                    return createExternalDirectoryRuleRows()
+                        .map(row => row.querySelector(".external-directory-rule-path"))
+                        .filter(Boolean);
+                }}
+                return [];
+            }},
+        }};
 }}
 
     globalThis.__bindCalls = {{
@@ -1602,6 +1668,7 @@ function createElement(tagName = "div") {{
     globalThis.__savedGeneral = {{
         savedShell: true,
         externalDirectory: "ask",
+        externalDirectoryRules: [],
         shell: null,
         speech: null,
         notifications: null,

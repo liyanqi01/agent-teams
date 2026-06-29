@@ -366,6 +366,7 @@ async def create_run(
             external_directory_permission=(
                 general_config.external_directory_permission
             ),
+            external_directory_rules=general_config.external_directory_rules,
             thinking=req.thinking,
             target_role_id=req.target_role_id,
             skills=resolved_skills,
@@ -390,6 +391,9 @@ async def create_run(
                     "shell_safety_policy_enabled": shell_safety_policy_enabled,
                     "external_directory_permission": (
                         general_config.external_directory_permission.value
+                    ),
+                    "external_directory_rule_count": len(
+                        general_config.external_directory_rules
                     ),
                 },
             )

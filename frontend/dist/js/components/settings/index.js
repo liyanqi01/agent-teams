@@ -73,6 +73,7 @@ let panelLoadRequestId = 0;
 let settingsWarmupPromise = null;
 
 const EXTERNAL_DIRECTORY_PERMISSION_VALUES = new Set(['ask', 'allow', 'deny']);
+const DEFAULT_EXTERNAL_DIRECTORY_RULE_PERMISSION = 'allow';
 
 const TAB_METADATA = {
     appearance: {
@@ -254,6 +255,22 @@ function renderGeneralSettingsPanelMarkup() {
                                 <label for="settings-external-directory-permission" data-i18n="settings.general.external_directory_mode">Workspace-external writes</label>
                                 <span class="general-setting-inline-note" data-i18n="settings.general.external_directory_state">Ask prompts for approval, allow skips prompts, deny blocks access outside the workspace.</span>
                             </div>
+                            <div class="external-directory-rules-panel">
+                                <div class="external-directory-rules-header">
+                                    <span class="settings-field-label" data-i18n="settings.general.external_directory_rules">Directory rules</span>
+                                    <button
+                                        class="secondary-btn section-action-btn external-directory-rule-add"
+                                        id="settings-add-external-directory-rule"
+                                        type="button"
+                                        data-i18n="settings.general.external_directory_add_rule"
+                                    >Add Rule</button>
+                                </div>
+                                <div
+                                    class="external-directory-rule-list"
+                                    id="settings-external-directory-rules"
+                                ></div>
+                                <span class="general-setting-inline-note external-directory-rules-note" data-i18n="settings.general.external_directory_rules_state">Rules match resolved absolute paths. The last matching rule wins.</span>
+                            </div>
                         </div>
                     </section>
                     ${renderSpeechSettingsSectionMarkup()}
@@ -274,6 +291,16 @@ function bindGeneralSettingsHandlers() {
         saveBtn.dataset.bound = 'true';
         saveBtn.addEventListener('click', () => handleSaveGeneralSettings());
     }
+    const addRuleBtn = document.getElementById('settings-add-external-directory-rule');
+    if (addRuleBtn && addRuleBtn.dataset.bound !== 'true') {
+        addRuleBtn.dataset.bound = 'true';
+        addRuleBtn.addEventListener('click', () => handleAddExternalDirectoryRule());
+    }
+    const rulesContainer = document.getElementById('settings-external-directory-rules');
+    if (rulesContainer && rulesContainer.dataset.bound !== 'true') {
+        rulesContainer.dataset.bound = 'true';
+        rulesContainer.addEventListener('click', handleExternalDirectoryRulesClick);
+    }
 }
 
 function normalizeExternalDirectoryPermission(value) {
@@ -286,14 +313,134 @@ function readExternalDirectoryPermission() {
     return normalizeExternalDirectoryPermission(select?.value);
 }
 
+function normalizeExternalDirectoryRules(value, options = {}) {
+    if (!Array.isArray(value)) {
+        return [];
+    }
+    const includeBlank = options.includeBlank === true;
+    return value
+        .map(rule => ({
+            path: String(rule?.path || '').trim(),
+            permission: normalizeExternalDirectoryPermission(
+                rule?.permission || DEFAULT_EXTERNAL_DIRECTORY_RULE_PERMISSION,
+            ),
+        }))
+        .filter(rule => includeBlank || rule.path);
+}
+
+function readExternalDirectoryRules(options = {}) {
+    const rows = Array.from(
+        document.querySelectorAll('#settings-external-directory-rules .external-directory-rule-row'),
+    );
+    const includeBlank = options.includeBlank === true;
+    return rows
+        .map(row => {
+            const pathInput = row.querySelector('.external-directory-rule-path');
+            const permissionSelect = row.querySelector('.external-directory-rule-permission');
+            return {
+                path: String(pathInput?.value || '').trim(),
+                permission: normalizeExternalDirectoryPermission(
+                    permissionSelect?.value || DEFAULT_EXTERNAL_DIRECTORY_RULE_PERMISSION,
+                ),
+            };
+        })
+        .filter(rule => includeBlank || rule.path);
+}
+
+function renderExternalDirectoryRules(rules) {
+    const container = document.getElementById('settings-external-directory-rules');
+    if (!container) {
+        return;
+    }
+    const normalizedRules = normalizeExternalDirectoryRules(rules, { includeBlank: true });
+    if (normalizedRules.length === 0) {
+        container.innerHTML = `
+            <div class="settings-empty-state settings-empty-state-compact external-directory-rules-empty">
+                <p>${escapeHtml(t('settings.general.external_directory_rules_empty'))}</p>
+            </div>
+        `;
+        return;
+    }
+    container.innerHTML = normalizedRules
+        .map((rule, index) => renderExternalDirectoryRuleRow(rule, index))
+        .join('');
+}
+
+function renderExternalDirectoryRuleRow(rule, index) {
+    const permission = normalizeExternalDirectoryPermission(rule.permission);
+    return `
+        <div class="external-directory-rule-row" data-external-directory-rule-index="${index}">
+            <input
+                class="appearance-text-input external-directory-rule-path"
+                type="text"
+                value="${escapeHtml(rule.path)}"
+                placeholder="${escapeHtml(t('settings.general.external_directory_path_placeholder'))}"
+                aria-label="${escapeHtml(t('settings.general.external_directory_path'))}"
+                spellcheck="false"
+            >
+            <select
+                class="appearance-text-input external-directory-rule-permission"
+                aria-label="${escapeHtml(t('settings.general.external_directory_rule_permission'))}"
+            >
+                <option value="ask"${permission === 'ask' ? ' selected' : ''}>${escapeHtml(t('settings.general.external_directory_ask'))}</option>
+                <option value="allow"${permission === 'allow' ? ' selected' : ''}>${escapeHtml(t('settings.general.external_directory_allow'))}</option>
+                <option value="deny"${permission === 'deny' ? ' selected' : ''}>${escapeHtml(t('settings.general.external_directory_deny'))}</option>
+            </select>
+            <button
+                class="settings-inline-action settings-list-action settings-danger-action external-directory-rule-delete"
+                type="button"
+                data-external-directory-rule-delete="${index}"
+            >${escapeHtml(t('settings.action.delete'))}</button>
+        </div>
+    `;
+}
+
+function handleAddExternalDirectoryRule() {
+    const rules = readExternalDirectoryRules({ includeBlank: true });
+    rules.push({
+        path: '',
+        permission: DEFAULT_EXTERNAL_DIRECTORY_RULE_PERMISSION,
+    });
+    renderExternalDirectoryRules(rules);
+    const inputs = document.querySelectorAll(
+        '#settings-external-directory-rules .external-directory-rule-path',
+    );
+    const lastInput = inputs[inputs.length - 1];
+    if (lastInput) {
+        lastInput.focus();
+    }
+}
+
+function handleExternalDirectoryRulesClick(event) {
+    if (!(event.target instanceof Element)) {
+        return;
+    }
+    const deleteButton = event.target.closest('[data-external-directory-rule-delete]');
+    if (!deleteButton) {
+        return;
+    }
+    const deleteIndex = Number.parseInt(
+        deleteButton.getAttribute('data-external-directory-rule-delete') || '',
+        10,
+    );
+    const rules = readExternalDirectoryRules({ includeBlank: true });
+    if (Number.isNaN(deleteIndex) || deleteIndex < 0 || deleteIndex >= rules.length) {
+        return;
+    }
+    rules.splice(deleteIndex, 1);
+    renderExternalDirectoryRules(rules);
+}
+
 async function handleSaveGeneralSettings() {
     const toggle = document.getElementById('settings-shell-safety-policy-toggle');
     const nextShellSafetyPolicyEnabled = toggle?.checked !== false;
     const nextExternalDirectoryPermission = readExternalDirectoryPermission();
+    const nextExternalDirectoryRules = readExternalDirectoryRules();
     try {
         await saveGeneralConfig({
             shell_safety_policy_enabled: nextShellSafetyPolicyEnabled,
             external_directory_permission: nextExternalDirectoryPermission,
+            external_directory_rules: nextExternalDirectoryRules,
         });
     } catch (error) {
         const message = error?.message || t('settings.general.save_failed');
@@ -365,10 +512,21 @@ async function loadGeneralSettingsPanel() {
     if (externalDirectorySelect) {
         externalDirectorySelect.value = externalDirectoryPermission;
     }
+    renderExternalDirectoryRules(generalConfig?.external_directory_rules);
     return Promise.all([
         loadSpeechSettingsPanel(),
         loadNotificationSettingsPanel(),
     ]);
+}
+
+function escapeHtml(value) {
+    return String(value ?? '').replace(/[&<>"']/g, char => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;',
+    }[char] || char));
 }
 
 function mergeNotificationConfig(currentConfig, panelConfig) {

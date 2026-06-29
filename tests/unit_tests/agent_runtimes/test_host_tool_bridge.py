@@ -25,6 +25,7 @@ from relay_teams.sessions.runs.injection_queue import RunInjectionManager
 from relay_teams.sessions.runs.run_models import RunEvent
 from relay_teams.tools.runtime.policy import (
     ExternalDirectoryPermissionMode,
+    ExternalDirectoryRule,
     ToolApprovalPolicy,
 )
 
@@ -60,8 +61,14 @@ class _FakeToolApprovalPolicy:
         yolo: bool | None = None,
         shell_safety_policy_enabled: bool | None = None,
         external_directory_permission: ExternalDirectoryPermissionMode | None = None,
+        external_directory_rules: tuple[ExternalDirectoryRule, ...] | None = None,
     ) -> "_FakeToolApprovalPolicy":
-        _ = (yolo, shell_safety_policy_enabled, external_directory_permission)
+        _ = (
+            yolo,
+            shell_safety_policy_enabled,
+            external_directory_permission,
+            external_directory_rules,
+        )
         return self
 
 
@@ -72,11 +79,13 @@ class _RunIntentRepo:
         yolo: bool,
         shell_safety_policy_enabled: bool,
         external_directory_permission: ExternalDirectoryPermissionMode,
+        external_directory_rules: tuple[ExternalDirectoryRule, ...] = (),
     ) -> None:
         self._intent = SimpleNamespace(
             yolo=yolo,
             shell_safety_policy_enabled=shell_safety_policy_enabled,
             external_directory_permission=external_directory_permission,
+            external_directory_rules=external_directory_rules,
         )
 
     async def get_async(self, _run_id: str) -> object:
@@ -363,6 +372,12 @@ async def test_build_tool_deps_applies_shell_safety_policy_from_run_intent() -> 
         system_prompt="system",
         user_prompt="hello",
     )
+    external_directory_rules = (
+        ExternalDirectoryRule(
+            path="/tmp/shared/**",
+            permission=ExternalDirectoryPermissionMode.ALLOW,
+        ),
+    )
     bridge.__dict__.update(
         {
             "_task_repo": object(),
@@ -385,6 +400,7 @@ async def test_build_tool_deps_applies_shell_safety_policy_from_run_intent() -> 
                 yolo=True,
                 shell_safety_policy_enabled=False,
                 external_directory_permission=ExternalDirectoryPermissionMode.DENY,
+                external_directory_rules=external_directory_rules,
             ),
             "_get_role_registry": lambda: object(),
             "_get_skill_registry": lambda: object(),
@@ -411,6 +427,9 @@ async def test_build_tool_deps_applies_shell_safety_policy_from_run_intent() -> 
     assert deps.tool_approval_policy.shell_safety_policy_enabled is False
     assert deps.tool_approval_policy.external_directory_permission == (
         ExternalDirectoryPermissionMode.DENY
+    )
+    assert (
+        deps.tool_approval_policy.external_directory_rules == external_directory_rules
     )
 
 
