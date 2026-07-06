@@ -673,10 +673,12 @@ async def test_maybe_recover_from_tool_args_parse_failure_raises_terminal_error_
     session.__dict__["_generate_async"] = lambda *args, **kwargs: (_ for _ in ()).throw(
         AssertionError("recovery exhaustion should not retry")
     )
-    session.__dict__["_raise_assistant_run_error"] = lambda **kwargs: (
-        raised_errors.append(kwargs),
-        (_ for _ in ()).throw(RuntimeError("terminal")),
-    )
+
+    async def _raise_assistant_run_error(**kwargs: object) -> None:
+        raised_errors.append(kwargs)
+        raise RuntimeError("terminal")
+
+    session.__dict__["_raise_assistant_run_error"] = _raise_assistant_run_error
 
     with pytest.raises(RuntimeError, match="terminal"):
         await AgentLlmSession._maybe_recover_from_tool_args_parse_failure(

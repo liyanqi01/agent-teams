@@ -48,12 +48,12 @@ _ENTERPRISE_PROXY_BLOCK_MARKERS = (
 
 
 class FailureMessageRepository(Protocol):
-    def prune_conversation_history_to_safe_boundary(
+    async def prune_conversation_history_to_safe_boundary_async(
         self,
         conversation_id: str,
     ) -> None: ...
 
-    def append(
+    async def append_async(
         self,
         *,
         session_id: str,
@@ -63,12 +63,22 @@ class FailureMessageRepository(Protocol):
         instance_id: str,
         task_id: str,
         trace_id: str,
-        messages: list[ModelResponse],
+        messages: Sequence[ModelResponse],
     ) -> None: ...
 
 
 class RunEventPublisher(Protocol):
     def publish(self, event: RunEvent) -> None: ...
+
+
+class AssistantRunErrorRaiser(Protocol):
+    async def __call__(
+        self,
+        *,
+        request: LLMRequest,
+        error_code: str | None,
+        error_message: str | None,
+    ) -> None: ...
 
 
 class FailureHandlingService:
@@ -110,7 +120,7 @@ class FailureHandlingService:
             )
         )
 
-    def raise_assistant_run_error(
+    async def raise_assistant_run_error(
         self,
         *,
         request: LLMRequest,
@@ -125,10 +135,10 @@ class FailureHandlingService:
             error_message=error_message,
         )
         resolved_conversation_id = conversation_id(request)
-        self._message_repo.prune_conversation_history_to_safe_boundary(
+        await self._message_repo.prune_conversation_history_to_safe_boundary_async(
             resolved_conversation_id
         )
-        self._message_repo.append(
+        await self._message_repo.append_async(
             session_id=request.session_id,
             workspace_id=workspace_id(request),
             conversation_id=resolved_conversation_id,
@@ -265,7 +275,7 @@ class FailureHandlingService:
             payload=payload,
         )
 
-    def raise_terminal_model_api_failure(
+    async def raise_terminal_model_api_failure(
         self,
         *,
         request: LLMRequest,
@@ -276,7 +286,7 @@ class FailureHandlingService:
         error_message: str,
         fallback_status: FallbackAttemptStatus,
         handle_retry_exhausted: Callable[..., None],
-        raise_assistant_run_error: Callable[..., None],
+        raise_assistant_run_error: AssistantRunErrorRaiser,
     ) -> None:
         if retry_error is not None and retry_error.retryable:
             if (
@@ -290,12 +300,12 @@ class FailureHandlingService:
                     total_attempts=total_attempts,
                     error=retry_error,
                 )
-            raise_assistant_run_error(
+            await raise_assistant_run_error(
                 request=request,
                 error_code=retry_error.error_code,
                 error_message=error_message,
             )
-        raise_assistant_run_error(
+        await raise_assistant_run_error(
             request=request,
             error_code=(
                 retry_error.error_code
@@ -305,7 +315,7 @@ class FailureHandlingService:
             error_message=error_message,
         )
 
-    def raise_terminal_generic_failure(
+    async def raise_terminal_generic_failure(
         self,
         *,
         request: LLMRequest,
@@ -316,7 +326,7 @@ class FailureHandlingService:
         fallback_status: FallbackAttemptStatus,
         log_provider_request_failed: Callable[..., None],
         handle_retry_exhausted: Callable[..., None],
-        raise_assistant_run_error: Callable[..., None],
+        raise_assistant_run_error: AssistantRunErrorRaiser,
     ) -> None:
         if retry_error is not None:
             log_provider_request_failed(request=request, error=error)
@@ -331,12 +341,12 @@ class FailureHandlingService:
                     total_attempts=total_attempts,
                     error=retry_error,
                 )
-            raise_assistant_run_error(
+            await raise_assistant_run_error(
                 request=request,
                 error_code=retry_error.error_code,
                 error_message=retry_error.message,
             )
-        raise_assistant_run_error(
+        await raise_assistant_run_error(
             request=request,
             error_code="internal_execution_error",
             error_message=str(error) or error.__class__.__name__,

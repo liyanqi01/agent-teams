@@ -564,7 +564,7 @@ class AgentLlmSessionMixinBase:  # pragma: no cover
     ) -> AttemptRecoveryOutcome:
         raise NotImplementedError
 
-    def _raise_terminal_model_api_failure(
+    async def _raise_terminal_model_api_failure(
         self,
         *,
         request: LLMRequest,
@@ -577,7 +577,7 @@ class AgentLlmSessionMixinBase:  # pragma: no cover
     ) -> None:
         raise NotImplementedError
 
-    def _raise_terminal_generic_failure(
+    async def _raise_terminal_generic_failure(
         self,
         *,
         request: LLMRequest,
@@ -732,7 +732,7 @@ class AgentLlmSessionMixinBase:  # pragma: no cover
     ) -> None:
         raise NotImplementedError
 
-    def _raise_assistant_run_error(
+    async def _raise_assistant_run_error(
         self,
         *,
         request: LLMRequest,

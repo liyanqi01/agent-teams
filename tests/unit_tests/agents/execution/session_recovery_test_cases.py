@@ -607,7 +607,8 @@ async def test_maybe_fallback_after_non_retryable_quota_error_switches_profile()
     assert result.status == _FallbackAttemptStatus.RECOVERED
 
 
-def test_raise_assistant_run_error_persists_error_response_and_publishes_delta() -> (
+@pytest.mark.asyncio
+async def test_raise_assistant_run_error_persists_error_response_and_publishes_delta() -> (
     None
 ):
     session = object.__new__(AgentLlmSession)
@@ -621,7 +622,7 @@ def test_raise_assistant_run_error_persists_error_response_and_publishes_delta()
     )
 
     with pytest.raises(AssistantRunError) as exc_info:
-        AgentLlmSession._raise_assistant_run_error(
+        await AgentLlmSession._raise_assistant_run_error(
             session,
             request=_build_request(),
             error_code="network_timeout",
@@ -638,7 +639,8 @@ def test_raise_assistant_run_error_persists_error_response_and_publishes_delta()
     assert "timed out" in exc_info.value.payload.assistant_message
 
 
-def test_raise_terminal_model_api_failure_emits_retry_exhausted_before_terminal_error() -> (
+@pytest.mark.asyncio
+async def test_raise_terminal_model_api_failure_emits_retry_exhausted_before_terminal_error() -> (
     None
 ):
     session = object.__new__(AgentLlmSession)
@@ -648,15 +650,17 @@ def test_raise_terminal_model_api_failure_emits_retry_exhausted_before_terminal_
     session.__dict__["_handle_retry_exhausted"] = lambda **kwargs: (
         retry_exhausted_calls.append(kwargs)
     )
-    session.__dict__["_raise_assistant_run_error"] = lambda **kwargs: (
-        raised_errors.append(kwargs),
-        (_ for _ in ()).throw(RuntimeError("terminal")),
-    )
+
+    async def _raise_assistant_run_error(**kwargs: object) -> None:
+        raised_errors.append(kwargs)
+        raise RuntimeError("terminal")
+
+    session.__dict__["_raise_assistant_run_error"] = _raise_assistant_run_error
 
     error = ModelAPIError("gpt-test", "rate limited")
 
     with pytest.raises(RuntimeError, match="terminal"):
-        AgentLlmSession._raise_terminal_model_api_failure(
+        await AgentLlmSession._raise_terminal_model_api_failure(
             session,
             request=_build_request(),
             error=error,
@@ -678,7 +682,8 @@ def test_raise_terminal_model_api_failure_emits_retry_exhausted_before_terminal_
     assert raised_errors[0]["error_code"] == "rate_limited"
 
 
-def test_raise_terminal_model_api_failure_skips_retry_exhausted_after_fallback_exhausted() -> (
+@pytest.mark.asyncio
+async def test_raise_terminal_model_api_failure_skips_retry_exhausted_after_fallback_exhausted() -> (
     None
 ):
     session = object.__new__(AgentLlmSession)
@@ -688,15 +693,17 @@ def test_raise_terminal_model_api_failure_skips_retry_exhausted_after_fallback_e
     session.__dict__["_handle_retry_exhausted"] = lambda **kwargs: (
         retry_exhausted_calls.append(kwargs)
     )
-    session.__dict__["_raise_assistant_run_error"] = lambda **kwargs: (
-        raised_errors.append(kwargs),
-        (_ for _ in ()).throw(RuntimeError("terminal")),
-    )
+
+    async def _raise_assistant_run_error(**kwargs: object) -> None:
+        raised_errors.append(kwargs)
+        raise RuntimeError("terminal")
+
+    session.__dict__["_raise_assistant_run_error"] = _raise_assistant_run_error
 
     error = ModelAPIError("gpt-test", "rate limited")
 
     with pytest.raises(RuntimeError, match="terminal"):
-        AgentLlmSession._raise_terminal_model_api_failure(
+        await AgentLlmSession._raise_terminal_model_api_failure(
             session,
             request=_build_request(),
             error=error,

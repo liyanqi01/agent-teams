@@ -400,7 +400,7 @@ class SessionRecoveryMixin(AgentLlmSessionMixinBase):
             generate_async=self._generate_async,
         )
 
-    def _raise_terminal_model_api_failure(
+    async def _raise_terminal_model_api_failure(
         self,
         *,
         request: LLMRequest,
@@ -411,7 +411,7 @@ class SessionRecoveryMixin(AgentLlmSessionMixinBase):
         error_message: str,
         fallback_status: FallbackAttemptStatus,
     ) -> None:
-        self._failure_handling_service().raise_terminal_model_api_failure(
+        await self._failure_handling_service().raise_terminal_model_api_failure(
             request=request,
             error=error,
             retry_error=retry_error,
@@ -423,7 +423,7 @@ class SessionRecoveryMixin(AgentLlmSessionMixinBase):
             raise_assistant_run_error=self._raise_assistant_run_error,
         )
 
-    def _raise_terminal_generic_failure(
+    async def _raise_terminal_generic_failure(
         self,
         *,
         request: LLMRequest,
@@ -433,7 +433,7 @@ class SessionRecoveryMixin(AgentLlmSessionMixinBase):
         total_attempts: int,
         fallback_status: FallbackAttemptStatus,
     ) -> None:
-        self._failure_handling_service().raise_terminal_generic_failure(
+        await self._failure_handling_service().raise_terminal_generic_failure(
             request=request,
             error=error,
             retry_error=retry_error,
@@ -522,14 +522,14 @@ class SessionRecoveryMixin(AgentLlmSessionMixinBase):
             error_message=error_message,
         )
 
-    def _raise_assistant_run_error(
+    async def _raise_assistant_run_error(
         self,
         *,
         request: LLMRequest,
         error_code: str | None,
         error_message: str | None,
     ) -> None:
-        self._failure_handling_service().raise_assistant_run_error(
+        await self._failure_handling_service().raise_assistant_run_error(
             request=request,
             error_code=error_code,
             error_message=error_message,
