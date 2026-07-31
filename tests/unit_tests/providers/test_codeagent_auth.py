@@ -1,10 +1,9 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import Self, cast
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -15,8 +14,9 @@ from relay_teams.providers.codeagent_auth import (
     CodeAgentOAuthError,
     CodeAgentOAuthTokenResult,
     CodeAgentTokenService,
-    build_codeagent_request_headers,
     build_codeagent_authorization_url,
+    build_codeagent_model_catalog_headers,
+    build_codeagent_request_headers,
     clear_codeagent_oauth_session_store,
     clear_codeagent_token_service_cache,
     create_codeagent_oauth_session,
@@ -30,12 +30,12 @@ from relay_teams.providers.maas_auth import (
     MaaSLoginError,
 )
 from relay_teams.providers.model_config import (
-    CodeAgentAuthMethod,
-    CodeAgentAuthConfig,
     DEFAULT_CODEAGENT_BASE_URL,
     DEFAULT_CODEAGENT_CLIENT_ID,
     DEFAULT_CODEAGENT_SCOPE,
     DEFAULT_CODEAGENT_SCOPE_RESOURCE,
+    CodeAgentAuthConfig,
+    CodeAgentAuthMethod,
     ModelEndpointConfig,
     ProviderType,
 )
@@ -105,7 +105,7 @@ async def test_poll_token_posts_client_code_json(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     class _FakeHttpClient:
-        async def __aenter__(self) -> "_FakeHttpClient":
+        async def __aenter__(self) -> Self:
             return self
 
         async def __aexit__(self, *exc_info: object) -> None:
@@ -161,7 +161,7 @@ async def test_poll_token_returns_none_until_token_available(monkeypatch) -> Non
     )
 
     class _FakeHttpClient:
-        async def __aenter__(self) -> "_FakeHttpClient":
+        async def __aenter__(self) -> Self:
             return self
 
         async def __aexit__(self, *exc_info: object) -> None:
@@ -204,7 +204,7 @@ async def test_poll_token_raises_for_http_error_response(monkeypatch) -> None:
     )
 
     class _FakeHttpClient:
-        async def __aenter__(self) -> "_FakeHttpClient":
+        async def __aenter__(self) -> Self:
             return self
 
         async def __aexit__(self, *exc_info: object) -> None:
@@ -471,7 +471,7 @@ async def test_codeagent_token_service_refreshes_with_rotated_refresh_token(
     )
 
     class _FakeHttpClient:
-        async def __aenter__(self) -> "_FakeHttpClient":
+        async def __aenter__(self) -> Self:
             return self
 
         async def __aexit__(self, *exc_info: object) -> None:
@@ -556,7 +556,7 @@ async def test_codeagent_token_service_persists_rotated_tokens_for_secret_owner(
             )
 
     class _FakeHttpClient:
-        async def __aenter__(self) -> "_FakeHttpClient":
+        async def __aenter__(self) -> Self:
             return self
 
         async def __aexit__(self, *exc_info: object) -> None:
@@ -633,7 +633,7 @@ def test_codeagent_auth_config_forces_builtin_oauth_values() -> None:
     assert auth_config.scope_resource == DEFAULT_CODEAGENT_SCOPE_RESOURCE
 
 
-def test_codeagent_endpoint_config_forces_builtin_base_url() -> None:
+def test_codeagent_endpoint_config_preserves_configured_base_url() -> None:
     config = ModelEndpointConfig(
         provider=ProviderType.CODEAGENT,
         model="codeagent-chat",
@@ -641,7 +641,7 @@ def test_codeagent_endpoint_config_forces_builtin_base_url() -> None:
         codeagent_auth=CodeAgentAuthConfig(refresh_token="refresh-token"),
     )
 
-    assert config.base_url == DEFAULT_CODEAGENT_BASE_URL
+    assert config.base_url == "https://custom.example/codeAgentPro"
 
 
 def test_is_codeagent_chat_completion_request_matches_sdk_path() -> None:
@@ -661,7 +661,7 @@ def test_build_codeagent_request_headers_uses_access_token() -> None:
     )
 
     assert headers["X-Auth-Token"] == "access-token"
-    assert headers["app-id"] == "CodeAgent2.0"
+    assert headers["app-id"] == "com.huawei.devmind.codebot.apibot"
     assert headers["User-Agent"] == "AgentKernel/1.0"
     assert headers["gray"] == "false"
     assert headers["oc-heartbeat"] == "1"
@@ -669,6 +669,18 @@ def test_build_codeagent_request_headers_uses_access_token() -> None:
     assert headers["Accept"] == "text/event-stream"
     assert headers["X-snap-traceid"]
     assert headers["X-session-id"].startswith("ses_")
+
+
+def test_build_codeagent_model_catalog_headers_uses_relayagent_identity() -> None:
+    headers = build_codeagent_model_catalog_headers(token="access-token")
+
+    assert headers == {
+        "X-Auth-Token": "access-token",
+        "app-id": "com.huawei.devmind.codebot.apibot",
+        "User-Agent": "RelayAgent/1.0",
+        "gray": "true",
+        "plugin-version": "cli-1.2605.02-IN.1.",
+    }
 
 
 @pytest.mark.asyncio
@@ -832,7 +844,7 @@ async def test_codeagent_token_service_get_token_result_rechecks_async_cache_ins
     )
 
     class _PrimingAsyncLock:
-        async def __aenter__(self) -> "_PrimingAsyncLock":
+        async def __aenter__(self) -> Self:
             service._tokens[cache_key] = codeagent_auth_module._CodeAgentTokenRecord(
                 token_result=token_result
             )
@@ -927,7 +939,7 @@ async def test_codeagent_token_service_refresh_token_async_posts_refresh_payload
     captured: dict[str, object] = {}
 
     class _FakeAsyncHttpClient:
-        async def __aenter__(self) -> "_FakeAsyncHttpClient":
+        async def __aenter__(self) -> Self:
             return self
 
         async def __aexit__(self, *exc_info: object) -> None:
@@ -1051,7 +1063,13 @@ async def test_codeagent_request_auth_async_flow_retries_after_unauthorized() ->
     request = httpx.Request(
         "POST",
         "https://codeagent.example/codeAgentPro/chat/completions",
-        content=b'{"model":"codeagent-chat"}',
+        headers={
+            "Authorization": "Bearer stale-token",
+            "app-id": "stale-app",
+            "plugin-version": "stale-plugin",
+            "X-Auth-Token": "stale-token",
+        },
+        content=b'{"model":"codeagent-chat","stream":false}',
     )
     auth = codeagent_auth_module.CodeAgentRequestAuth(
         base_url=DEFAULT_CODEAGENT_BASE_URL,
@@ -1066,6 +1084,14 @@ async def test_codeagent_request_auth_async_flow_retries_after_unauthorized() ->
     retry_request = await flow.asend(httpx.Response(403, request=first_request))
 
     assert first_request.headers["X-Auth-Token"] == "initial-token"
+    assert first_request.headers["app-id"] == "com.huawei.devmind.codebot.apibot"
+    assert first_request.headers["User-Agent"] == "AgentKernel/1.0"
+    assert first_request.headers["gray"] == "false"
+    assert first_request.headers["oc-heartbeat"] == "1"
+    assert first_request.headers["Accept"] == "text/event-stream"
+    assert "Authorization" not in first_request.headers
+    assert "plugin-version" not in first_request.headers
+    assert first_request.content == b'{"model":"codeagent-chat","stream":false}'
     assert retry_request.headers["X-Auth-Token"] == "retry-token"
     assert calls == [False, True]
 
@@ -1420,7 +1446,7 @@ async def test_poll_token_posts_client_code_json_async(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     class _FakeAsyncHttpClient:
-        async def __aenter__(self) -> _FakeAsyncHttpClient:
+        async def __aenter__(self) -> Self:
             return self
 
         async def __aexit__(self, *exc_info: object) -> None:

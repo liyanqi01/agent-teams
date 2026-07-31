@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 from enum import StrEnum
@@ -131,7 +130,7 @@ class CodeAgentAuthConfig(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def _sync_configured_flags(self) -> "CodeAgentAuthConfig":
+    def _sync_configured_flags(self) -> CodeAgentAuthConfig:
         self.client_id = DEFAULT_CODEAGENT_CLIENT_ID
         self.scope = DEFAULT_CODEAGENT_SCOPE
         self.scope_resource = DEFAULT_CODEAGENT_SCOPE_RESOURCE
@@ -153,7 +152,7 @@ class CodeAgentAuthConfig(BaseModel):
         *,
         config_dir: Path,
         owner_id: str,
-    ) -> "CodeAgentAuthConfig":
+    ) -> CodeAgentAuthConfig:
         copied = self.model_copy()
         copied._secret_config_dir = config_dir
         copied._secret_owner_id = owner_id
@@ -268,7 +267,7 @@ class ModelRequestHeader(BaseModel):
         return normalized or None
 
     @model_validator(mode="after")
-    def _sync_configured_flag(self) -> "ModelRequestHeader":
+    def _sync_configured_flag(self) -> ModelRequestHeader:
         if self.value is not None:
             self.configured = True
         return self
@@ -331,7 +330,7 @@ class ModelEndpointConfig(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def _require_auth_source(self) -> "ModelEndpointConfig":
+    def _require_auth_source(self) -> ModelEndpointConfig:
         if self.provider == ProviderType.MAAS:
             self.base_url = DEFAULT_MAAS_BASE_URL
             if self.maas_auth is None:
@@ -346,7 +345,6 @@ class ModelEndpointConfig(BaseModel):
                 )
             return self
         if self.provider == ProviderType.CODEAGENT:
-            self.base_url = DEFAULT_CODEAGENT_BASE_URL
             if self.codeagent_auth is None:
                 raise ValueError(
                     "CodeAgent model endpoint config requires codeagent_auth configuration."
@@ -381,7 +379,7 @@ class ModelEndpointConfig(BaseModel):
         )
 
     @model_validator(mode="after")
-    def _sync_capabilities(self) -> "ModelEndpointConfig":
+    def _sync_capabilities(self) -> ModelEndpointConfig:
         from relay_teams.providers.model_capabilities import resolve_model_capabilities
 
         self.capabilities = resolve_model_capabilities(
@@ -439,7 +437,7 @@ class ModelProfileConfigPayload(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def _validate_base_url_for_provider(self) -> "ModelProfileConfigPayload":
+    def _validate_base_url_for_provider(self) -> ModelProfileConfigPayload:
         if self.provider in {
             ProviderType.MAAS,
             ProviderType.CODEAGENT,
@@ -468,7 +466,7 @@ class ProviderModelInfo(BaseModel):
     input_modalities: tuple[MediaModality, ...] = ()
 
     @model_validator(mode="after")
-    def _sync_capabilities(self) -> "ProviderModelInfo":
+    def _sync_capabilities(self) -> ProviderModelInfo:
         from relay_teams.providers.model_capabilities import resolve_model_capabilities
 
         capabilities = resolve_model_capabilities(
@@ -524,7 +522,7 @@ class ModelFallbackConfig(BaseModel):
     policies: tuple[ModelFallbackPolicy, ...] = ()
 
     @model_validator(mode="after")
-    def _validate_unique_policy_ids(self) -> "ModelFallbackConfig":
+    def _validate_unique_policy_ids(self) -> ModelFallbackConfig:
         seen_ids: set[str] = set()
         for policy in self.policies:
             normalized_id = policy.policy_id.casefold()

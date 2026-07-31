@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import asyncio
@@ -22,9 +21,9 @@ from relay_teams.providers.maas_auth import (
     get_maas_token_service,
 )
 from relay_teams.providers.model_config import (
-    CodeAgentAuthMethod,
-    CodeAgentAuthConfig,
     DEFAULT_CODEAGENT_SSO_BASE_URL,
+    CodeAgentAuthConfig,
+    CodeAgentAuthMethod,
 )
 from relay_teams.secrets import get_secret_store
 
@@ -36,9 +35,10 @@ __all__ = [
     "CodeAgentOAuthSession",
     "CodeAgentOAuthTokenResult",
     "CodeAgentTokenService",
-    "build_codeagent_request_headers",
     "build_codeagent_authorization_url",
+    "build_codeagent_model_catalog_headers",
     "build_codeagent_openai_client",
+    "build_codeagent_request_headers",
     "clear_codeagent_oauth_session_store",
     "clear_codeagent_token_service_cache",
     "codeagent_access_token_secret_field_name",
@@ -62,6 +62,10 @@ _CODEAGENT_TOKEN_TTL = timedelta(hours=1)
 _CODEAGENT_REFRESH_SKEW = timedelta(minutes=5)
 _CODEAGENT_OAUTH_SESSION_TTL = timedelta(minutes=30)
 _MODEL_PROFILE_SECRET_NAMESPACE = "model_profile"
+_CODEAGENT_APP_ID = "com.huawei.devmind.codebot.apibot"
+_CODEAGENT_RUNTIME_USER_AGENT = "AgentKernel/1.0"
+_CODEAGENT_CATALOG_USER_AGENT = "RelayAgent/1.0"
+_CODEAGENT_PLUGIN_VERSION = "cli-1.2605.02-IN.1."
 
 
 class CodeAgentOAuthTokenResult(BaseModel):
@@ -238,7 +242,7 @@ class CodeAgentTokenService:
         )
 
     # noinspection PyMethodMayBeStatic
-    async def poll_token(  # noqa: PLR6301
+    async def poll_token(
         self,
         *,
         session: CodeAgentOAuthSession,
@@ -739,7 +743,7 @@ def _refresh_token_payload(auth_config: CodeAgentAuthConfig) -> dict[str, str]:
 def _generate_client_code() -> str:
     try:
         return uuid4().hex
-    except Exception:
+    except (OSError, RuntimeError):
         return token_hex(16)
 
 
@@ -772,8 +776,8 @@ def build_codeagent_request_headers(
 ) -> dict[str, str]:
     headers = {
         "X-Auth-Token": token,
-        "app-id": "CodeAgent2.0",
-        "User-Agent": "AgentKernel/1.0",
+        "app-id": _CODEAGENT_APP_ID,
+        "User-Agent": _CODEAGENT_RUNTIME_USER_AGENT,
         "gray": "false",
         "oc-heartbeat": "1",
         "X-snap-traceid": str(uuid4()),
@@ -784,6 +788,16 @@ def build_codeagent_request_headers(
     if accept is not None:
         headers["Accept"] = accept
     return headers
+
+
+def build_codeagent_model_catalog_headers(*, token: str) -> dict[str, str]:
+    return {
+        "X-Auth-Token": token,
+        "app-id": _CODEAGENT_APP_ID,
+        "User-Agent": _CODEAGENT_CATALOG_USER_AGENT,
+        "gray": "true",
+        "plugin-version": _CODEAGENT_PLUGIN_VERSION,
+    }
 
 
 def _build_token_result(
@@ -896,6 +910,7 @@ def _strip_reserved_headers(headers: dict[str, str]) -> dict[str, str]:
             "oc-heartbeat",
             "x-snap-traceid",
             "x-session-id",
+            "plugin-version",
         }
     }
 

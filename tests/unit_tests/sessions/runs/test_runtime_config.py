@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import json
@@ -11,16 +10,15 @@ from relay_teams.providers.codeagent_auth import (
     codeagent_password_secret_field_name,
     codeagent_refresh_token_secret_field_name,
 )
-from relay_teams.providers.model_header_utils import model_header_secret_field_name
 from relay_teams.providers.maas_auth import maas_password_secret_field_name
 from relay_teams.providers.model_config import (
     DEFAULT_ANTHROPIC_BASE_URL,
-    DEFAULT_CODEAGENT_BASE_URL,
     DEFAULT_LLM_CONNECT_TIMEOUT_SECONDS,
     DEFAULT_MAAS_BASE_URL,
 )
+from relay_teams.providers.model_header_utils import model_header_secret_field_name
 from relay_teams.secrets import get_secret_store
-import relay_teams.sessions.runs.runtime_config as runtime_config
+from relay_teams.sessions.runs import runtime_config
 
 
 def test_load_runtime_config_uses_project_config_dir_by_default(
@@ -650,7 +648,9 @@ def test_load_llm_configs_resolves_codeagent_tokens_from_secret_store(
     profiles = runtime_config.load_llm_configs(tmp_path, {})
 
     assert profiles["codeagent-profile"].provider.value == "codeagent"
-    assert profiles["codeagent-profile"].base_url == DEFAULT_CODEAGENT_BASE_URL
+    assert profiles["codeagent-profile"].base_url == (
+        "https://codeagent.example/codeAgentPro"
+    )
     assert profiles["codeagent-profile"].api_key is None
     assert profiles["codeagent-profile"].codeagent_auth is not None
     assert (
